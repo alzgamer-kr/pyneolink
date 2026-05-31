@@ -1,0 +1,39 @@
+# Python caches and build output
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+.env
+.env.*
+.idea/
+.vscode/
+.dockerconfig/
+
+# Local camera configuration and runtime state
+config.json
+config.local.json
+.pyneolink_state.json
+
+# Captured media/output files
+*.h264
+*.h265
+*.mp4
+*.mkv
+downloads/
+
+# Local reference checkouts and research artifacts
+neolink/
+.upstream-neolink/
+.upstream-tree.json
+.upstream-neolink.zip

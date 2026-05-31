@@ -1,0 +1,13 @@
+{
+  "bind": "0.0.0.0",
+  "bind_port": 8554,
+  "cameras": [
+    {
+      "name": "Scherbaka 41 - Front",
+      "username": "admin",
+      "password": "change-me",
+      "uid": "95270006R5KDROXI",
+      "discovery": "relay"
+    }
+  ]
+}
