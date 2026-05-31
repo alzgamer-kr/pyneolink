@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+import socket
+import struct
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+
+from .crypto import Cipher
+
+MAGIC = 0x0ABCDEF0
+MAGIC_REV = 0x0FEDCBA0
+CLASS_LEGACY = 0x6514
+CLASS_MODERN_REPLY = 0x6614
+CLASS_MODERN = 0x6414
+CLASS_MODERN_ZERO = 0x0000
+
+MSG_LOGIN = 1
+MSG_LOGOUT = 2
+MSG_VIDEO = 3
+MSG_VIDEO_STOP = 4
+MSG_REBOOT = 23
+MSG_VERSION = 80
+MSG_SNAP = 109
+MSG_UID = 114
+MSG_GET_LED = 208
+MSG_SET_LED = 209
+MSG_BATTERY = 253
+
+
+class ProtocolError(RuntimeError):
+    pass
+
+
+@dataclass
+class Header:
+    msg_id: int
+    body_len: int
+    channel_id: int
+    stream_type: int
+    msg_num: int
+    response_code: int
+    msg_class: int
+    payload_offset: int | None = None
+
+    @property
+    def has_payload_offset(self) -> bool:
+        return self.msg_class in (CLASS_MODERN, CLASS_MODERN_ZERO)
+
+    @property
+    def is_modern(self) -> bool:
+        return self.msg_class != CLASS_LEGACY
+
+    def pack(self) -> bytes:
+        header = struct.pack(
+            "<III BB HH",
+            MAGIC,
+            self.msg_id,
+            self.body_len,
+            self.channel_id,
+            self.stream_type,
+            self.msg_num,
+            self.response_code,
+        )
+        header += struct.pack("<H", self.msg_class)
+        if self.has_payload_offset:
+            header += struct.pack("<I", self.payload_offset or 0)
+        return header
+
+    @classmethod
+    def unpack_from(cls, data: bytes) -> "Header":
+        if len(data) < 20:
+            raise ProtocolError("Short Baichuan header")
+        magic, msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class = struct.unpack(
+            "<III BB HHH", data[:20]
+        )
+        if magic not in (MAGIC, MAGIC_REV):
+            raise ProtocolError(f"Invalid Baichuan magic 0x{magic:08x}")
+        payload_offset = None
+        if msg_class in (CLASS_MODERN, CLASS_MODERN_ZERO):
+            if len(data) < 24:
+                return cls(msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class, None)
+            payload_offset = struct.unpack("<I", data[20:24])[0]
+        return cls(msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class, payload_offset)
+
+
+@dataclass
+class Message:
+    header: Header
+    extension: bytes = b""
+    payload: bytes = b""
+
+    @property
+    def xml_text(self) -> str | None:
+        if not self.payload:
+            return None
+        try:
+            return self.payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+
+    @property
+    def xml_root(self) -> ET.Element | None:
+        text = self.xml_text
+        if not text:
+            return None
+        return ET.fromstring(text)
+
+
+def xml_document(inner: str) -> bytes:
+    return f'<?xml version="1.0" encoding="UTF-8" ?>\n<body>\n{inner}\n</body>'.encode("utf-8")
+
+
+def extension_xml(binary: bool = False, channel_id: int | None = None) -> bytes:
+    bits = ['<?xml version="1.0" encoding="UTF-8" ?>', '<Extension version="1.1">']
+    if channel_id is not None:
+        bits.append(f"<channelId>{channel_id}</channelId>")
+    if binary:
+        bits.append("<binaryData>1</binaryData>")
+    bits.append("</Extension>")
+    return "\n".join(bits).encode("utf-8")
+
+
+def encode_modern(
+    msg_id: int,
+    msg_num: int,
+    payload: bytes = b"",
+    *,
+    extension: bytes = b"",
+    channel_id: int = 0,
+    stream_type: int = 0,
+    response_code: int = 0,
+    msg_class: int = CLASS_MODERN,
+    cipher: Cipher | None = None,
+) -> bytes:
+    cipher = cipher or Cipher("bc")
+    wire_cipher = Cipher("bc") if msg_id == MSG_LOGIN and cipher.name == "aes" else cipher
+    enc_ext = wire_cipher.encrypt(channel_id, extension) if extension else b""
+    enc_payload = wire_cipher.encrypt(channel_id, payload) if payload else b""
+    body = enc_ext + enc_payload
+    payload_offset = len(enc_ext) if msg_class in (CLASS_MODERN, CLASS_MODERN_ZERO) else None
+    return Header(msg_id, len(body), channel_id, stream_type, msg_num, response_code, msg_class, payload_offset).pack() + body
+
+
+def encode_legacy_login(msg_num: int, *, max_encryption: str = "aes", channel_id: int = 0) -> bytes:
+    enc = {"none": 0xDC00, "bc": 0xDC01, "aes": 0xDC12}.get(max_encryption, 0xDC12)
+    return Header(MSG_LOGIN, 0, channel_id, 0, msg_num, enc, CLASS_LEGACY).pack()
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise EOFError("Camera closed the connection")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def recv_message(sock: socket.socket, cipher: Cipher, *, timeout: float | None = None, binary_msg_nums: set[int] | None = None) -> Message:
+    if timeout is not None:
+        sock.settimeout(timeout)
+    first = recv_exact(sock, 20)
+    partial = Header.unpack_from(first)
+    if partial.has_payload_offset:
+        first += recv_exact(sock, 4)
+    header = Header.unpack_from(first)
+    body = recv_exact(sock, header.body_len) if header.body_len else b""
+    ext_len = header.payload_offset or 0
+    ext_raw = body[:ext_len]
+    payload_raw = body[ext_len:]
+    reply_cipher = cipher
+    if header.msg_id == MSG_LOGIN and (header.response_code >> 8) == 0xDD:
+        reply_cipher = Cipher("none" if (header.response_code & 0xFF) == 0 else "bc")
+    elif header.msg_id == MSG_LOGIN and cipher.name == "aes":
+        reply_cipher = Cipher("bc")
+    extension = reply_cipher.decrypt(header.channel_id, ext_raw) if ext_raw else b""
+    in_binary = b"<binaryData>1</binaryData>" in extension
+    is_binary = in_binary or (binary_msg_nums is not None and header.msg_num in binary_msg_nums)
+    payload = payload_raw if is_binary else reply_cipher.decrypt(header.channel_id, payload_raw)
+    return Message(header, extension, payload)
+
+
+def find_text(root: ET.Element | None, tag: str) -> str | None:
+    if root is None:
+        return None
+    found = root.find(f".//{tag}")
+    return found.text if found is not None else None
