@@ -68,9 +68,13 @@ class Cipher:
             raise RuntimeError("AES cipher selected without a key")
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher as AesCipher
-            from cryptography.hazmat.primitives.ciphers import algorithms, modes
+            from cryptography.hazmat.primitives.ciphers import algorithms
+            try:
+                from cryptography.hazmat.decrepit.ciphers import modes as cipher_modes
+            except ImportError:
+                from cryptography.hazmat.primitives.ciphers import modes as cipher_modes
         except ImportError as exc:
-            raise RuntimeError("Install pyneolink[aes] to use AES encrypted cameras") from exc
-        cipher = AesCipher(algorithms.AES(self.key), modes.CFB(AES_IV))
+            raise RuntimeError("Install dependencies with: python -m pip install -r requirements.txt") from exc
+        cipher = AesCipher(algorithms.AES(self.key), cipher_modes.CFB(AES_IV))
         ctx = cipher.encryptor() if encrypt else cipher.decryptor()
         return ctx.update(data) + ctx.finalize()

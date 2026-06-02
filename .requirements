@@ -1,1 +1,2 @@
--e .[aes]
+cryptography>=42
+python-dotenv>=1.0

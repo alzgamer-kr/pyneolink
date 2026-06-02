@@ -1,7 +1,13 @@
-from pyneolink.bc import Header, encode_modern, xml_document
-from pyneolink.crypto import bc_xor, make_aes_key, md5_hex, udp_xor
-from pyneolink.discovery import decode_discovery_packet, encode_discovery_xml
-from pyneolink.media import MediaParser
+from pyneolink import Camera, DangerousSdCardOperation
+from pyneolink.sd_card import SdCard
+from pyneolink.core.bc import CLASS_MODERN, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
+from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
+from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
+from pyneolink.core.media import MediaParser
+from datetime import datetime
+
+from pyneolink.sd_card import _download_queries, _download_raw, _playback_download_payload, _replay_download_payload, _xml_file_size
+from pyneolink.core.udp_transport import UdpBcConnection, decode_udp_packet, encode_udp_ack
 
 
 def test_bc_xor_roundtrip():
@@ -24,10 +30,92 @@ def test_modern_packet_header_roundtrip():
     assert header.payload_offset == 0
 
 
+def test_full_aes_binary_keeps_raw_tail_after_encrypt_len():
+    class FakeSocket:
+        def __init__(self, data):
+            self.data = bytearray(data)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self, size):
+            chunk = bytes(self.data[:size])
+            del self.data[:size]
+            return chunk
+
+    cipher = Cipher("aes", b"0123456789abcdef", full_media=True)
+    extension = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<Extension version="1.1"><binaryData>1</binaryData><encryptLen>4</encryptLen></Extension>"""
+    prefix = b"1002"
+    raw_tail = b"raw-media-tail"
+    ext_raw = cipher.encrypt(0, extension)
+    payload_raw = cipher.encrypt(0, prefix) + raw_tail
+    header = Header(8, len(ext_raw) + len(payload_raw), 0, 0, 7, 200, CLASS_MODERN, len(ext_raw))
+    msg = recv_message(FakeSocket(header.pack() + ext_raw + payload_raw), cipher)
+    assert msg.payload == prefix + raw_tail
+    assert msg.raw_payload_len == len(payload_raw)
+    assert msg.encrypted_len == 4
+
+
+def test_replay_timestamp_header_has_payload_offset():
+    packet = bytes.fromhex("f0debc0a050000001a55000018000000619082646a000000")
+    header = Header.unpack_from(packet)
+    assert header.msg_id == 5
+    assert header.response_code == 0x9061
+    assert header.msg_class == 0x6482
+    assert header.payload_offset == 0x6A
+    assert header.has_payload_offset
+
+
+def test_invalid_magic_preserves_consumed_bytes():
+    data = b"\x5d\x84\x3e\x93" + b"x" * 16
+    try:
+        Header.unpack_from(data)
+    except InvalidMagicError as exc:
+        assert exc.magic == 0x933E845D
+        assert exc.data == data
+    else:
+        raise AssertionError("invalid magic should raise")
+
+
 def test_discovery_packet_roundtrip():
     xml = "<P2P><C2D_S><to><port>12345</port></to></C2D_S></P2P>"
     packet = encode_discovery_xml(123, xml)
     assert decode_discovery_packet(packet) == (123, xml)
+
+
+def test_udp_ack_packet_roundtrip():
+    packet = encode_udp_ack(7, 5, b"\0\1\1", maybe_latency=42)
+    assert decode_udp_packet(packet) == ("ack", 7, 0, 5, 42, b"\0\1\1")
+
+
+def test_udp_ack_state_reports_missing_packets():
+    connection = UdpBcConnection.__new__(UdpBcConnection)
+    connection.next_recv_id = 10
+    connection.recv_chunks = {11: b"a", 12: b"b", 14: b"c"}
+    packet_id, payload, group_id = connection._ack_state()
+    assert packet_id == 9
+    assert payload == b"\0\1\1\0\1"
+    assert group_id == 0
+
+
+def test_udp_heartbeat_reuses_connection_tid():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendto(self, data, addr):
+            self.sent.append((data, addr))
+
+    sock = FakeSocket()
+    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, heartbeat_tid=77)
+    connection._send_heartbeat()
+    tid, xml = decode_discovery_packet(sock.sent[0][0])
+    assert tid == 77
+    assert "<C2D_HB>" in xml
 
 
 def test_media_info_packet():
@@ -39,7 +127,160 @@ def test_media_info_packet():
     assert packets[0].fps == 15
 
 
+def test_media_video_packet_all_channels():
+    raw = b"10dcH264"
+    raw += (4).to_bytes(4, "little")
+    raw += (4).to_bytes(4, "little")
+    raw += (123).to_bytes(4, "little")
+    raw += (0).to_bytes(4, "little")
+    raw += (456).to_bytes(4, "little")
+    raw += b"\0\0\0\1"
+    raw += b"\0\0\0\0"
+    packets = list(MediaParser().feed(raw))
+    assert packets[0].kind == "iframe"
+    assert packets[0].codec == "H264"
+    assert packets[0].data == b"\0\0\0\1"
+
+
+def test_download_query_order_prefers_direct_download_before_replay():
+    raw = {
+        "name": "abc",
+        "startTime": {"year": 2026, "month": 6, "day": 2, "hour": 0, "minute": 0, "second": 0},
+        "endTime": {"year": 2026, "month": 6, "day": 2, "hour": 0, "minute": 0, "second": 30},
+    }
+    queries = _download_queries(0, "abc", raw)
+    labels = [query.label for query in queries[:4]]
+    assert labels == [
+        "download13/id/class6482",
+        "playback143/range-mainStream/bcmedia",
+        "playback143/range-subStream/bcmedia",
+        "download8/id/class6482",
+    ]
+
+
+def test_playback_download_payload_matches_reolink_range_shape():
+    payload = _playback_download_payload(
+        0,
+        datetime(2026, 6, 2, 7, 35, 0),
+        datetime(2026, 6, 2, 7, 35, 35),
+        "subStream",
+    )
+    assert b"<logicChnBitmap>255</logicChnBitmap>" in payload
+    assert b"<supportSub>1</supportSub>" in payload
+    assert b"<streamType>subStream</streamType>" in payload
+    assert b"<startTime>" in payload
+    assert b"<endTime>" in payload
+
+
+def test_xml_file_size_reads_playback_size_words():
+    xml = """<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<sizeL>847663</sizeL>
+<sizeH>0</sizeH>
+<FileCount>1</FileCount>
+</FileInfo>
+</FileInfoList>
+</body>"""
+    assert _xml_file_size(xml) == 847663
+
+
+def test_replay_download_payload_uses_minimal_start_query():
+    payload = _replay_download_payload(
+        0,
+        {
+            "name": "ignored.mp4",
+            "startTime": {"year": 2026, "month": 6, "day": 2, "hour": 0, "minute": 0, "second": 0},
+            "endTime": {"year": 2026, "month": 6, "day": 2, "hour": 0, "minute": 1, "second": 0},
+        },
+    )
+    assert b"<startTime>" in payload
+    assert b"<playSpeed>1</playSpeed>" in payload
+    assert b"<name>" not in payload
+    assert b"<endTime>" not in payload
+
+
+def test_download_raw_enriches_normalized_file_fields_for_replay():
+    raw = _download_raw(
+        {
+            "file_name": "clip.mp4",
+            "path": "/mnt/sda/Mp4Record/clip.mp4",
+            "start_time": "2026-06-02T00:18:27",
+            "end_time": "2026-06-02T00:18:57",
+            "stream_type": "mainStream",
+            "raw": {},
+        }
+    )
+    queries = _download_queries(0, raw["Id"], raw)
+    assert raw["startTime"] == "2026-06-02T00:18:27"
+    labels = [query.label for query in queries[:5]]
+    assert "playback143/range-mainStream/bcmedia" in labels
+    assert "playback143/range-subStream/bcmedia" in labels
+    assert "replay5/start/bcmedia" in labels
+
+
 def test_hash_shapes():
     assert len(md5_hex("adminnonce")) == 31
     assert "\0" not in md5_hex("adminnonce")
     assert len(make_aes_key("nonce", "password")) == 16
+
+
+def test_public_camera_constructor_accepts_uuid_alias():
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    assert camera.config.uid == "95270006R5KDROXI"
+    assert camera.config.password == "secret"
+
+
+def test_camera_sd_card_api_is_available():
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    sd_card = camera.sd_card()
+    assert hasattr(sd_card, "list")
+    assert hasattr(sd_card, "filter")
+    assert hasattr(sd_card, "download")
+    assert hasattr(sd_card, "remove")
+    assert hasattr(sd_card, "format")
+
+
+def test_sd_card_filter_and_danger_guards():
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    sd_card = camera.sd_card()
+    files = [
+        {"file_name": "front_2026-06-01.mp4", "start_time": "2026-06-01T10:00:00", "end_time": "2026-06-01T10:05:00"},
+        {"file_name": "front_2026-06-02.mp4", "start_time": "2026-06-02T10:00:00", "end_time": "2026-06-02T10:05:00"},
+    ]
+    assert len(sd_card.filter(files, start="2026-06-02", end="2026-06-02")) == 1
+    try:
+        sd_card.format()
+    except DangerousSdCardOperation:
+        pass
+    else:
+        raise AssertionError("format must require an explicit confirmation")
+
+
+def test_sd_card_list_parses_file_info_reply():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def command(self, msg_id, payload=b"", extension=b""):
+            self.msg_id = msg_id
+            self.payload = payload
+            self.extension = extension
+            xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<fileName>01_20260601120000.mp4</fileName>
+<fileSize>123</fileSize>
+<beginTime><year>2026</year><month>6</month><day>1</day><hour>12</hour><minute>0</minute><second>0</second></beginTime>
+<endTime><year>2026</year><month>6</month><day>1</day><hour>12</hour><minute>5</minute><second>0</second></endTime>
+</FileInfo>
+</FileInfoList>
+</body>"""
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+
+    camera = FakeCamera()
+    files = SdCard(camera).list(start="2026-06-01", end="2026-06-01")
+    assert files[0]["file_name"] == "01_20260601120000.mp4"
+    assert files[0]["size"] == 123
+    assert b"<FileInfoList" in camera.payload

@@ -19,7 +19,7 @@ The Rust `neolink/` checkout is kept in this workspace as the reference implemen
 
 ```powershell
 python -m pip install -r requirements.txt
-python main.py --info --camera "Scherbaka 41 - Front"
+python pyneolink/cli.py --info --camera "Scherbaka 41 - Front"
 ```
 
 With Docker:
@@ -33,6 +33,36 @@ docker run --rm --network host `
 ```
 
 For connection diagnostics, add `--debug` to the same command. The normal `--info` output redacts sensitive camera fields.
+
+Library use:
+
+```python
+from pyneolink import Camera
+
+camera = Camera(uuid="ABCDEF0123456789", password="password")
+info = camera.info()
+camera.close()
+```
+
+The public API lives at the package root. Low-level protocol, crypto, discovery, relay transport, state, media, and XML helpers live in `pyneolink.core`.
+
+SD-card access:
+
+```python
+from pyneolink import Camera
+
+camera = Camera(uuid="ABCDEF0123456789", password="password")
+sd_card = camera.sd_card()
+
+files = sd_card.list(start="2026-06-01", end="2026-06-01")
+motion_files = sd_card.filter(files, name=".mp4")
+saved_path = sd_card.download(motion_files[0], "downloads/")
+camera.close()
+```
+
+When the camera returns a Reolink BCMedia stream for an `.mp4` recording, `download()` converts it to a playable MP4 with `ffmpeg`. If conversion fails, the raw stream is kept as `*.mp4.bcmedia` for debugging.
+
+`remove()` and `format()` are intentionally guarded. `format()` requires both `confirm=True` and `confirmation_text="FORMAT SD CARD"`.
 
 Example `config.json`:
 
