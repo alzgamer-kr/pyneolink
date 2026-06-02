@@ -24,6 +24,7 @@ venv/
 config.json
 config.local.json
 .pyneolink_state.json
+TODO.md
 
 # Captured media/output files
 *.h264
@@ -37,3 +38,4 @@ neolink/
 .upstream-neolink/
 .upstream-tree.json
 .upstream-neolink.zip
+captures/

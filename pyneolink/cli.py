@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import traceback
 
-from .camera import Camera
-from .config import load_config, write_json_config
-from .discovery import local_discover, remote_uid_lookup
-from .media import MediaParser
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from pyneolink.camera import Camera
+    from pyneolink.config import load_config, write_json_config
+    from pyneolink.core.discovery import local_discover, remote_uid_lookup
+    from pyneolink.core.media import MediaParser
+else:
+    from .camera import Camera
+    from .config import load_config, write_json_config
+    from .core.discovery import local_discover, remote_uid_lookup
+    from .core.media import MediaParser
 
 
 def main(argv: list[str] | None = None) -> int:

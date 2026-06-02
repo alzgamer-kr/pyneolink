@@ -12,16 +12,30 @@ MAGIC_REV = 0x0FEDCBA0
 CLASS_LEGACY = 0x6514
 CLASS_MODERN_REPLY = 0x6614
 CLASS_MODERN = 0x6414
+CLASS_FILE_DOWNLOAD = 0x6482
 CLASS_MODERN_ZERO = 0x0000
 
 MSG_LOGIN = 1
 MSG_LOGOUT = 2
 MSG_VIDEO = 3
 MSG_VIDEO_STOP = 4
+MSG_FILE_REPLAY = 5
+MSG_FILE_REPLAY_STOP = 7
+MSG_FILE_DOWNLOAD_VIDEO = 8
+MSG_FILE_DOWNLOAD = 13
+MSG_FILE_INFO_LIST = 14
+MSG_FILE_INFO_LIST_ALT = 15
+MSG_FILE_INFO_LIST_ALT2 = 16
 MSG_REBOOT = 23
 MSG_VERSION = 80
+MSG_HDD_INFO = 102
+MSG_HDD_INIT = 103
 MSG_SNAP = 109
 MSG_UID = 114
+MSG_REPLAY_SEEK = 123
+MSG_DAY_RECORDS = 142
+MSG_FILE_PLAYBACK = 143
+MSG_FILE_PLAYBACK_STOP = 144
 MSG_GET_LED = 208
 MSG_SET_LED = 209
 MSG_BATTERY = 253
@@ -29,6 +43,13 @@ MSG_BATTERY = 253
 
 class ProtocolError(RuntimeError):
     pass
+
+
+class InvalidMagicError(ProtocolError):
+    def __init__(self, magic: int, data: bytes) -> None:
+        super().__init__(f"Invalid Baichuan magic 0x{magic:08x}")
+        self.magic = magic
+        self.data = data
 
 
 @dataclass
@@ -44,7 +65,7 @@ class Header:
 
     @property
     def has_payload_offset(self) -> bool:
-        return self.msg_class in (CLASS_MODERN, CLASS_MODERN_ZERO)
+        return self.msg_class in (CLASS_MODERN, CLASS_FILE_DOWNLOAD, CLASS_MODERN_ZERO) or self.msg_id == MSG_FILE_REPLAY
 
     @property
     def is_modern(self) -> bool:
@@ -74,9 +95,9 @@ class Header:
             "<III BB HHH", data[:20]
         )
         if magic not in (MAGIC, MAGIC_REV):
-            raise ProtocolError(f"Invalid Baichuan magic 0x{magic:08x}")
+            raise InvalidMagicError(magic, data[:20])
         payload_offset = None
-        if msg_class in (CLASS_MODERN, CLASS_MODERN_ZERO):
+        if msg_class in (CLASS_MODERN, CLASS_FILE_DOWNLOAD, CLASS_MODERN_ZERO) or msg_id == MSG_FILE_REPLAY:
             if len(data) < 24:
                 return cls(msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class, None)
             payload_offset = struct.unpack("<I", data[20:24])[0]
@@ -88,6 +109,8 @@ class Message:
     header: Header
     extension: bytes = b""
     payload: bytes = b""
+    raw_payload_len: int = 0
+    encrypted_len: int | None = None
 
     @property
     def xml_text(self) -> str | None:
@@ -177,9 +200,18 @@ def recv_message(sock: socket.socket, cipher: Cipher, *, timeout: float | None =
         reply_cipher = Cipher("bc")
     extension = reply_cipher.decrypt(header.channel_id, ext_raw) if ext_raw else b""
     in_binary = b"<binaryData>1</binaryData>" in extension
+    encrypted_len = _extension_int(extension, "encryptLen") if in_binary else None
     is_binary = in_binary or (binary_msg_nums is not None and header.msg_num in binary_msg_nums)
-    payload = payload_raw if is_binary else reply_cipher.decrypt(header.channel_id, payload_raw)
-    return Message(header, extension, payload)
+    if is_binary:
+        if reply_cipher.name == "aes" and reply_cipher.full_media and encrypted_len is not None:
+            encrypted_part = payload_raw[:encrypted_len]
+            raw_tail = payload_raw[encrypted_len:]
+            payload = reply_cipher.decrypt(header.channel_id, encrypted_part) + raw_tail
+        else:
+            payload = payload_raw
+    else:
+        payload = reply_cipher.decrypt(header.channel_id, payload_raw)
+    return Message(header, extension, payload, raw_payload_len=len(payload_raw), encrypted_len=encrypted_len)
 
 
 def find_text(root: ET.Element | None, tag: str) -> str | None:
@@ -187,3 +219,16 @@ def find_text(root: ET.Element | None, tag: str) -> str | None:
         return None
     found = root.find(f".//{tag}")
     return found.text if found is not None else None
+
+
+def _extension_int(extension: bytes, tag: str) -> int | None:
+    try:
+        text = extension.decode("utf-8", errors="ignore")
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    value = find_text(root, tag)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
