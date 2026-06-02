@@ -143,6 +143,28 @@ def bcmedia_to_mp4(source: str | Path, destination: str | Path) -> None:
         raw_path.unlink(missing_ok=True)
 
 
+def extract_embedded_mp4(source: str | Path, destination: str | Path) -> bool:
+    source_path = Path(source)
+    destination_path = Path(destination)
+    with source_path.open("rb") as fh:
+        head = fh.read(4096)
+        marker = head.find(b"ftyp")
+        if marker < 4:
+            return False
+        start = marker - 4
+        box_size = int.from_bytes(head[start:marker], "big")
+        if box_size < 8 or start + box_size > len(head):
+            return False
+        fh.seek(start)
+        with destination_path.open("wb") as dst:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+    return destination_path.exists() and destination_path.stat().st_size > 0
+
+
 def _contains_codec(path: Path, codec: bytes) -> bool:
     with path.open("rb") as fh:
         while True:
