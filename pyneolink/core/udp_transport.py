@@ -43,6 +43,7 @@ class UdpBcConnection:
         self.buffer = bytearray()
         self.closed = False
         self.last_ack_at = 0.0
+        self.last_ack_packet_id: int | None = None
         self.last_resend_at = 0.0
         self.last_heartbeat_at = 0.0
         self.ack_latency = 0
@@ -124,7 +125,7 @@ class UdpBcConnection:
             self.max_data_packet_id = packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
             self.last_data_at = time.monotonic()
             self._feed_ack_latency()
-            self._send_ack()
+            self._maybe_send_ack()
             while self.next_recv_id in self.recv_chunks:
                 self.buffer.extend(self.recv_chunks.pop(self.next_recv_id))
                 self.next_recv_id += 1
@@ -139,9 +140,28 @@ class UdpBcConnection:
             self.unknown_packets += 1
 
     def _send_ack(self) -> None:
-        self.sock.sendto(encode_udp_ack(self.camera_id, *self._ack_state(), maybe_latency=self.ack_latency), self.addr)
+        packet_id, payload, group_id = self._ack_state()
+        self.sock.sendto(encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=self.ack_latency), self.addr)
+        if packet_id != 0xFFFFFFFF:
+            self.last_ack_packet_id = packet_id
         self.acks_sent += 1
         self.last_ack_at = time.monotonic()
+
+    def _maybe_send_ack(self, *, force: bool = False) -> None:
+        packet_id, payload, _group_id = self._ack_state()
+        if force:
+            self._send_ack()
+            return
+        if payload:
+            self._send_ack()
+            return
+        if packet_id == 0xFFFFFFFF:
+            return
+        if self.last_ack_packet_id is None or packet_id - self.last_ack_packet_id >= 16:
+            self._send_ack()
+            return
+        if time.monotonic() - self.last_ack_at >= 0.15:
+            self._send_ack()
 
     def _ack_state(self) -> tuple[int, bytes, int]:
         if self.next_recv_id == 0:
@@ -166,8 +186,8 @@ class UdpBcConnection:
 
     def _maintenance(self) -> None:
         now = time.monotonic()
-        if now - self.last_ack_at >= 0.01:
-            self._send_ack()
+        if now - self.last_ack_at >= 0.2:
+            self._maybe_send_ack(force=True)
         if self.sent_chunks and now - self.last_resend_at >= 0.5:
             for packet_id, chunk in list(self.sent_chunks.items()):
                 self.sock.sendto(encode_udp_data(self.camera_id, packet_id, chunk), self.addr)

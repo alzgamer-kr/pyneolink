@@ -3,10 +3,17 @@ from pyneolink.sd_card import SdCard
 from pyneolink.core.bc import CLASS_MODERN, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
-from pyneolink.core.media import MediaParser
+from pyneolink.core.media import MediaParser, extract_embedded_mp4
 from datetime import datetime
 
-from pyneolink.sd_card import _download_queries, _download_raw, _playback_download_payload, _replay_download_payload, _xml_file_size
+from pyneolink.sd_card import (
+    _download_queries,
+    _download_raw,
+    _normalize_download_stream_type,
+    _playback_download_payload,
+    _replay_download_payload,
+    _xml_file_size,
+)
 from pyneolink.core.udp_transport import UdpBcConnection, decode_udp_packet, encode_udp_ack
 
 
@@ -142,6 +149,15 @@ def test_media_video_packet_all_channels():
     assert packets[0].data == b"\0\0\0\1"
 
 
+def test_extract_embedded_mp4_after_bcmedia_info_header(tmp_path):
+    source = tmp_path / "clip.bcmedia"
+    destination = tmp_path / "clip.mp4"
+    mp4 = b"\x00\x00\x00\x18ftypiso4\x00\x00\x00\x01iso4hvc1" + b"payload"
+    source.write_bytes(b"1002" + (32).to_bytes(4, "little") + b"\0" * 24 + mp4)
+    assert extract_embedded_mp4(source, destination)
+    assert destination.read_bytes() == mp4
+
+
 def test_download_query_order_prefers_direct_download_before_replay():
     raw = {
         "name": "abc",
@@ -156,6 +172,28 @@ def test_download_query_order_prefers_direct_download_before_replay():
         "playback143/range-subStream/bcmedia",
         "download8/id/class6482",
     ]
+
+
+def test_download_query_order_respects_forced_high_quality_stream():
+    raw = {
+        "name": "abc",
+        "streamType": "mainStream",
+        "_streamTypeForced": True,
+        "startTime": {"year": 2026, "month": 6, "day": 2, "hour": 0, "minute": 0, "second": 0},
+        "endTime": {"year": 2026, "month": 6, "day": 2, "hour": 0, "minute": 0, "second": 30},
+    }
+    labels = [query.label for query in _download_queries(0, "abc", raw)]
+    assert labels == [
+        "download13/full-high/class6482",
+        "download8/full-high/class6482",
+    ]
+    assert "playback143/range-subStream/bcmedia" not in labels
+
+
+def test_download_quality_aliases_map_to_reolink_streams():
+    assert _normalize_download_stream_type(stream_type=None, quality="high") == "mainStream"
+    assert _normalize_download_stream_type(stream_type=None, quality="low") == "subStream"
+    assert _normalize_download_stream_type(stream_type="mainStream", quality=None) == "mainStream"
 
 
 def test_playback_download_payload_matches_reolink_range_shape():
@@ -284,3 +322,96 @@ def test_sd_card_list_parses_file_info_reply():
     assert files[0]["file_name"] == "01_20260601120000.mp4"
     assert files[0]["size"] == 123
     assert b"<FileInfoList" in camera.payload
+
+
+def test_sd_card_list_sorts_recordings_by_time():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def command(self, msg_id, payload=b"", extension=b""):
+            xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<fileName>new.mp4</fileName>
+<beginTime><year>2026</year><month>6</month><day>2</day><hour>20</hour><minute>0</minute><second>0</second></beginTime>
+<endTime><year>2026</year><month>6</month><day>2</day><hour>20</hour><minute>1</minute><second>0</second></endTime>
+</FileInfo>
+<FileInfo>
+<fileName>old.mp4</fileName>
+<beginTime><year>2026</year><month>6</month><day>2</day><hour>10</hour><minute>0</minute><second>0</second></beginTime>
+<endTime><year>2026</year><month>6</month><day>2</day><hour>10</hour><minute>1</minute><second>0</second></endTime>
+</FileInfo>
+</FileInfoList>
+</body>"""
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+
+    sd_card = SdCard(FakeCamera())
+    asc = sd_card.list(start="2026-06-02", end="2026-06-02")
+    desc = sd_card.list(start="2026-06-02", end="2026-06-02", sort="desc")
+    assert [item["file_name"] for item in asc] == ["old.mp4", "new.mp4"]
+    assert [item["file_name"] for item in desc] == ["new.mp4", "old.mp4"]
+
+
+def test_sd_card_list_reads_all_handle_pages():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.detail_calls = 0
+
+        def command(self, msg_id, payload=b"", extension=b""):
+            if b"<DayRecords" in payload:
+                xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body><DayRecords version="1.1" /></body>"""
+            elif b"<handle>" not in payload:
+                xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo><channelId>0</channelId><handle>1</handle></FileInfo>
+</FileInfoList>
+</body>"""
+            else:
+                self.detail_calls += 1
+                if self.detail_calls == 1:
+                    xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<fileName>page1-a.mp4</fileName>
+<beginTime><year>2026</year><month>6</month><day>2</day><hour>10</hour><minute>0</minute><second>0</second></beginTime>
+<endTime><year>2026</year><month>6</month><day>2</day><hour>10</hour><minute>1</minute><second>0</second></endTime>
+</FileInfo>
+<FileInfo>
+<fileName>page1-b.mp4</fileName>
+<beginTime><year>2026</year><month>6</month><day>2</day><hour>10</hour><minute>2</minute><second>0</second></beginTime>
+<endTime><year>2026</year><month>6</month><day>2</day><hour>10</hour><minute>3</minute><second>0</second></endTime>
+</FileInfo>
+</FileInfoList>
+</body>"""
+                elif self.detail_calls == 2:
+                    xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<fileName>page2-a.mp4</fileName>
+<beginTime><year>2026</year><month>6</month><day>2</day><hour>11</hour><minute>0</minute><second>0</second></beginTime>
+<endTime><year>2026</year><month>6</month><day>2</day><hour>11</hour><minute>1</minute><second>0</second></endTime>
+</FileInfo>
+</FileInfoList>
+</body>"""
+                else:
+                    xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body><FileInfoList version="1.1" /></body>"""
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+
+    sd_card = SdCard(FakeCamera())
+    files = sd_card.list(start="2026-06-02", end="2026-06-02")
+    assert [item["file_name"] for item in files] == ["page1-a.mp4", "page1-b.mp4", "page2-a.mp4"]
+    assert [item["label"] for item in sd_card.last_successes] == [
+        "day-records/range",
+        "handle/mainStream",
+        "files/handle-1",
+        "files/handle-1/page-2",
+        "files/handle-1/page-3",
+    ]

@@ -56,11 +56,14 @@ sd_card = camera.sd_card()
 
 files = sd_card.list(start="2026-06-01", end="2026-06-01")
 motion_files = sd_card.filter(files, name=".mp4")
-saved_path = sd_card.download(motion_files[0], "downloads/")
+saved_path = sd_card.download(motion_files[-1], "downloads/", quality="high")
 camera.close()
 ```
 
+`list()` sorts recordings by time ascending by default, so `files[-1]` is the newest recording. Use `sort="desc"` for newest first or `sort=None` to keep the camera response order.
+
 When the camera returns a Reolink BCMedia stream for an `.mp4` recording, `download()` converts it to a playable MP4 with `ffmpeg`. If conversion fails, the raw stream is kept as `*.mp4.bcmedia` for debugging.
+Use `quality="high"`/`quality="low"` or `stream_type="mainStream"`/`stream_type="subStream"` to choose the recording stream.
 
 `remove()` and `format()` are intentionally guarded. `format()` requires both `confirm=True` and `confirmation_text="FORMAT SD CARD"`.
 

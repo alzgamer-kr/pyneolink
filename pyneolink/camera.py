@@ -218,23 +218,25 @@ class Camera(AbstractContextManager["Camera"]):
         extension: bytes = b"",
         binary_reply: bool = False,
         msg_class: int = CLASS_MODERN,
+        channel_id: int | None = None,
+        msg_num: int | None = None,
     ) -> int:
         self.ensure_connected()
-        msg_num = self._next_msg()
+        sent_msg_num = self._next_msg() if msg_num is None else msg_num
         if binary_reply:
-            self.binary_msg_nums.add(msg_num)
+            self.binary_msg_nums.add(sent_msg_num)
         self._send(
             encode_modern(
                 msg_id,
-                msg_num,
+                sent_msg_num,
                 payload,
                 extension=extension,
-                channel_id=self.config.channel_id,
+                channel_id=self.config.channel_id if channel_id is None else channel_id,
                 msg_class=msg_class,
                 cipher=self.cipher,
             )
         )
-        return msg_num
+        return sent_msg_num
 
     def start_stream(self, stream: str = "mainStream"):
         self.ensure_connected()
