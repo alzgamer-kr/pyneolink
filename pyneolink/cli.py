@@ -72,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
     serve.add_argument("--buffer-seconds", type=float, default=1.0)
+    serve.add_argument("--hls-buffer-mb", type=int, default=100)
+    serve.add_argument("--hls-segment-seconds", type=float, default=2.0)
 
     convert = sub.add_parser("convert-config")
     add_common_options(convert)
@@ -101,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
                 state_path=getattr(args, "state", ".pyneolink_state.json"),
                 debug=getattr(args, "debug", False),
                 buffer_seconds=args.buffer_seconds,
+                hls_buffer_mb=args.hls_buffer_mb,
+                hls_segment_seconds=args.hls_segment_seconds,
             )
         except KeyboardInterrupt:
             print("stopped")

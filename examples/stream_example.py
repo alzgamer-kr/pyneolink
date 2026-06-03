@@ -26,6 +26,8 @@ HOST = os.environ.get("PYNEOLINK_HOST")
 PORT = int(os.environ["PYNEOLINK_PORT"]) if os.environ.get("PYNEOLINK_PORT") else None
 DEBUG = os.environ.get("PYNEOLINK_DEBUG", "").lower() in ("1", "true", "yes", "on")
 BUFFER_SECONDS = float(os.environ.get("PYNEOLINK_BUFFER_SECONDS", "1.0"))
+HLS_BUFFER_MB = int(os.environ.get("PYNEOLINK_HLS_BUFFER_MB", "100"))
+HLS_SEGMENT_SECONDS = float(os.environ.get("PYNEOLINK_HLS_SEGMENT_SECONDS", "2.0"))
 
 
 def load_stream_config() -> dict[str, Any]:
@@ -45,6 +47,8 @@ def stream_example() -> None:
         state_path=STATE_PATH,
         debug=DEBUG,
         buffer_seconds=BUFFER_SECONDS,
+        hls_buffer_mb=HLS_BUFFER_MB,
+        hls_segment_seconds=HLS_SEGMENT_SECONDS,
     ).serve_forever()
 
 

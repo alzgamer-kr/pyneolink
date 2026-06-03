@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
 from urllib.parse import quote, unquote, urlparse
@@ -13,6 +15,8 @@ from .core.media import MediaParser, MediaPacket
 
 _STREAM_END = object()
 _STREAM_QUEUE_TIMEOUT = 0.25
+_DEFAULT_HLS_BUFFER_MB = 100
+_DEFAULT_HLS_SEGMENT_SECONDS = 2.0
 
 
 class StreamServer:
@@ -25,6 +29,8 @@ class StreamServer:
         state_path: str | None = ".pyneolink_state.json",
         debug: bool = False,
         buffer_seconds: float = 1.0,
+        hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
+        hls_segment_seconds: float = _DEFAULT_HLS_SEGMENT_SECONDS,
     ) -> None:
         self.config = _coerce_config(config)
         self.host = host if host is not None else self.config.bind
@@ -32,6 +38,8 @@ class StreamServer:
         self.state_path = state_path
         self.debug = debug
         self.buffer_seconds = max(buffer_seconds, 0.0)
+        self.hls_buffer_bytes = max(int(hls_buffer_mb), 1) * 1024 * 1024
+        self.hls_segment_seconds = max(hls_segment_seconds, 0.5)
 
     def urls(self, *, host: str | None = None) -> list[str]:
         display_host = host or _display_host(self.host)
@@ -40,6 +48,8 @@ class StreamServer:
             encoded_name = quote(camera.name, safe="")
             urls.append(f"http://{display_host}:{self.port}/{encoded_name}/high")
             urls.append(f"http://{display_host}:{self.port}/{encoded_name}/low")
+            urls.append(f"http://{display_host}:{self.port}/{encoded_name}/high/hls.m3u8")
+            urls.append(f"http://{display_host}:{self.port}/{encoded_name}/low/hls.m3u8")
         return urls
 
     def serve_forever(self) -> None:
@@ -48,6 +58,10 @@ class StreamServer:
         server.state_path = self.state_path
         server.debug = self.debug
         server.buffer_seconds = self.buffer_seconds
+        server.hls_buffer_bytes = self.hls_buffer_bytes
+        server.hls_segment_seconds = self.hls_segment_seconds
+        server.hls_sessions = {}
+        server.hls_sessions_lock = threading.Lock()
         print(f"Serving camera streams on http://{self.host}:{self.port}/")
         display_host = _display_host(self.host)
         if display_host != self.host:
@@ -65,6 +79,8 @@ def serve_streams(
     state_path: str | None = ".pyneolink_state.json",
     debug: bool = False,
     buffer_seconds: float = 1.0,
+    hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
+    hls_segment_seconds: float = _DEFAULT_HLS_SEGMENT_SECONDS,
 ) -> None:
     StreamServer(
         config_path,
@@ -73,6 +89,8 @@ def serve_streams(
         state_path=state_path,
         debug=debug,
         buffer_seconds=buffer_seconds,
+        hls_buffer_mb=hls_buffer_mb,
+        hls_segment_seconds=hls_segment_seconds,
     ).serve_forever()
 
 
@@ -90,6 +108,10 @@ class _StreamServer(ThreadingHTTPServer):
     state_path: str | None
     debug: bool
     buffer_seconds: float
+    hls_buffer_bytes: int
+    hls_segment_seconds: float
+    hls_sessions: dict[tuple[str, str], "HlsSession"]
+    hls_sessions_lock: threading.Lock
 
 
 class _StreamHandler(BaseHTTPRequestHandler):
@@ -100,15 +122,33 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if not parts:
             self._send_index()
             return
-        if len(parts) != 2:
-            self.send_error(404, "Use /{camera}/{quality}")
+        if len(parts) not in (2, 3, 4):
+            self.send_error(404, "Use /{camera}/{quality} or /{camera}/{quality}/hls.m3u8")
             return
-        camera_name, quality = parts
+        camera_name, quality = parts[0], parts[1]
         try:
             camera_config = _find_camera(self.server.config, camera_name)
             stream = _quality_to_stream(quality)
         except ValueError as exc:
             self.send_error(404, str(exc))
+            return
+
+        if len(parts) == 3:
+            if parts[2] not in ("hls.m3u8", "playlist.m3u8"):
+                self.send_error(404, "Use /{camera}/{quality}/hls.m3u8")
+                return
+            self._serve_hls_playlist(camera_config, stream)
+            return
+        if len(parts) == 4:
+            if parts[2] != "segments" or not parts[3].endswith(".ts"):
+                self.send_error(404, "Use /{camera}/{quality}/segments/{sequence}.ts")
+                return
+            try:
+                sequence = int(parts[3][:-3])
+            except ValueError:
+                self.send_error(404, "Invalid HLS segment sequence")
+                return
+            self._serve_hls_segment(camera_config, stream, sequence)
             return
 
         camera = Camera(camera_config, state_path=self.server.state_path, debug=self.server.debug)
@@ -149,12 +189,59 @@ class _StreamHandler(BaseHTTPRequestHandler):
             encoded_name = quote(camera.name, safe="")
             lines.append(f"/{encoded_name}/high")
             lines.append(f"/{encoded_name}/low")
+            lines.append(f"/{encoded_name}/high/hls.m3u8")
+            lines.append(f"/{encoded_name}/low/hls.m3u8")
         body = ("\n".join(lines) + "\n").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_hls_playlist(self, camera_config, stream: str) -> None:
+        session = self._hls_session(camera_config, stream)
+        try:
+            playlist = session.playlist()
+        except Exception as exc:
+            self.send_error(502, str(exc))
+            return
+        body = playlist.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_hls_segment(self, camera_config, stream: str, sequence: int) -> None:
+        session = self._hls_session(camera_config, stream)
+        segment = session.segment(sequence)
+        if segment is None:
+            self.send_error(404, "HLS segment is no longer available")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "video/MP2T")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(segment.data)))
+        self.end_headers()
+        self.wfile.write(segment.data)
+
+    def _hls_session(self, camera_config, stream: str) -> "HlsSession":
+        key = (camera_config.name, stream)
+        with self.server.hls_sessions_lock:
+            session = self.server.hls_sessions.get(key)
+            if session is None:
+                session = HlsSession(
+                    camera_config,
+                    stream,
+                    state_path=self.server.state_path,
+                    debug=self.server.debug,
+                    buffer_bytes=self.server.hls_buffer_bytes,
+                    segment_seconds=self.server.hls_segment_seconds,
+                )
+                self.server.hls_sessions[key] = session
+            session.start()
+            return session
 
     def _serve_raw(
         self,
@@ -246,9 +333,7 @@ class MpegTsMuxer:
 
     def feed(self, packet: MediaPacket) -> Iterable[bytes]:
         if not self.tables_written:
-            yield from self._packetize(self.PAT_PID, b"\x00" + _pat_section(self.PMT_PID), start=True)
-            yield from self._packetize(self.PMT_PID, b"\x00" + _pmt_section(self.codec, self.VIDEO_PID, self.AUDIO_PID), start=True)
-            self.tables_written = True
+            yield from self.table_packets()
 
         if packet.kind in ("iframe", "pframe"):
             if packet.timestamp_us is not None:
@@ -262,6 +347,13 @@ class MpegTsMuxer:
             pes = _pes_packet(0xC0, self.audio_pts, packet.data)
             self.audio_pts += _aac_duration_90k(packet.data)
             yield from self._packetize(self.AUDIO_PID, pes, start=True)
+
+    def table_packets(self) -> list[bytes]:
+        packets: list[bytes] = []
+        packets.extend(self._packetize(self.PAT_PID, b"\x00" + _pat_section(self.PMT_PID), start=True))
+        packets.extend(self._packetize(self.PMT_PID, b"\x00" + _pmt_section(self.codec, self.VIDEO_PID, self.AUDIO_PID), start=True))
+        self.tables_written = True
+        return packets
 
     def _packetize(self, pid: int, payload: bytes, *, start: bool = False, pcr: int | None = None) -> Iterable[bytes]:
         offset = 0
@@ -297,6 +389,150 @@ class MpegTsMuxer:
             packet = header + adaptation + chunk
             yield packet + (b"\xff" * (188 - len(packet)))
             first = False
+
+
+@dataclass
+class HlsSegment:
+    sequence: int
+    duration: float
+    data: bytes
+    created_at: float
+
+
+class HlsSession:
+    def __init__(
+        self,
+        camera_config,
+        stream: str,
+        *,
+        state_path: str | None,
+        debug: bool,
+        buffer_bytes: int,
+        segment_seconds: float,
+    ) -> None:
+        self.camera_config = camera_config
+        self.stream = stream
+        self.state_path = state_path
+        self.debug = debug
+        self.buffer_bytes = buffer_bytes
+        self.segment_seconds = segment_seconds
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.segments: list[HlsSegment] = []
+        self.total_bytes = 0
+        self.next_sequence = 0
+        self.started = False
+        self.error: BaseException | None = None
+
+    def start(self) -> None:
+        with self.lock:
+            if self.started:
+                return
+            self.started = True
+            thread = threading.Thread(target=self._run, daemon=True)
+            thread.start()
+
+    def playlist(self, *, timeout: float = 15.0) -> str:
+        self.start()
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while not self.segments and self.error is None and time.monotonic() < deadline:
+                self.condition.wait(timeout=0.25)
+            if self.error and not self.segments:
+                raise self.error
+            segments = list(self.segments)
+        return _hls_playlist(segments, self.segment_seconds)
+
+    def segment(self, sequence: int) -> HlsSegment | None:
+        self.start()
+        with self.lock:
+            for segment in self.segments:
+                if segment.sequence == sequence:
+                    return segment
+        return None
+
+    def _run(self) -> None:
+        camera = Camera(self.camera_config, state_path=self.state_path, debug=self.debug)
+        parser = MediaParser()
+        try:
+            camera.__enter__()
+            payloads = camera.read_stream_payloads(self.stream)
+            first_packets, codec, fps = _read_until_keyframe(payloads, parser)
+            if codec not in ("H264", "H265"):
+                raise RuntimeError("HLS requires H264 or H265 camera video")
+            first_packets = _packets_from_first_keyframe(first_packets)
+            muxer = MpegTsMuxer(codec, fps=fps)
+            current = bytearray()
+            started_at = time.monotonic()
+            saw_video = False
+
+            def add_packet(packet: MediaPacket) -> None:
+                nonlocal current, started_at, saw_video
+                now = time.monotonic()
+                if (
+                    packet.kind == "iframe"
+                    and saw_video
+                    and current
+                    and now - started_at >= self.segment_seconds
+                ):
+                    self._append_segment(bytes(current), now - started_at)
+                    current = bytearray()
+                    started_at = now
+                if not current:
+                    for table_chunk in muxer.table_packets():
+                        current.extend(table_chunk)
+                for chunk in muxer.feed(packet):
+                    current.extend(chunk)
+                if packet.kind in ("iframe", "pframe"):
+                    saw_video = True
+
+            for packet in first_packets:
+                add_packet(packet)
+            for payload in payloads:
+                for packet in parser.feed(payload):
+                    add_packet(packet)
+        except BaseException as exc:
+            with self.condition:
+                self.error = exc
+                self.condition.notify_all()
+        finally:
+            camera.close()
+
+    def _append_segment(self, data: bytes, duration: float) -> None:
+        if not data:
+            return
+        with self.condition:
+            segment = HlsSegment(self.next_sequence, max(duration, 0.001), data, time.monotonic())
+            self.next_sequence += 1
+            self.segments.append(segment)
+            self.total_bytes += len(data)
+            while self.segments and self.total_bytes > self.buffer_bytes:
+                removed = self.segments.pop(0)
+                self.total_bytes -= len(removed.data)
+            self.condition.notify_all()
+
+
+def _packets_from_first_keyframe(packets: list[MediaPacket]) -> list[MediaPacket]:
+    for index, packet in enumerate(packets):
+        if packet.kind == "iframe":
+            return packets[index:]
+    return packets
+
+
+def _hls_playlist(segments: list[HlsSegment], segment_seconds: float) -> str:
+    target = max(1, int(max([segment.duration for segment in segments], default=segment_seconds) + 0.999))
+    media_sequence = segments[0].sequence if segments else 0
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f"#EXT-X-TARGETDURATION:{target}",
+        f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+    ]
+    for segment in segments:
+        lines.append(f"#EXTINF:{segment.duration:.3f},")
+        lines.append(f"segments/{segment.sequence}.ts")
+    return "\n".join(lines) + "\n"
 
 
 def _produce_mpegts_chunks(
