@@ -35,10 +35,19 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--state", default=argparse.SUPPRESS)
         p.add_argument("--debug", action="store_true", default=argparse.SUPPRESS)
 
-    for name in ("status", "info", "uid", "battery", "reboot"):
+    for name in ("status", "info", "uid", "reboot"):
         p = sub.add_parser(name)
         add_common_options(p)
         p.add_argument("--camera")
+
+    battery = sub.add_parser("battery")
+    add_common_options(battery)
+    battery.add_argument("--camera")
+    battery.add_argument("--raw", action="store_true", help="Print raw battery XML")
+    battery.add_argument("--watch", action="store_true", help="Repeat the battery request")
+    battery.add_argument("--interval", type=float, default=60.0, help="Seconds between repeated battery requests")
+    battery.add_argument("--count", type=int, help="Number of battery requests before exiting")
+    battery.add_argument("--mode", choices=["reconnect", "online"], default="reconnect")
 
     led = sub.add_parser("led")
     add_common_options(led)
@@ -121,7 +130,18 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "uid":
                 print(cam.get_uid() or "")
             elif args.command == "battery":
-                print(cam.battery() or "")
+                if args.raw:
+                    print(cam.battery().raw(mode=args.mode) or "")
+                elif args.watch:
+                    with cam.battery().info(
+                        interval=args.interval,
+                        count=args.count,
+                        mode=args.mode,
+                    ) as updates:
+                        for item in updates:
+                            print(json.dumps(item, indent=2, ensure_ascii=False), flush=True)
+                else:
+                    print(json.dumps(cam.battery().info(mode=args.mode), indent=2, ensure_ascii=False))
             elif args.command == "reboot":
                 cam.reboot()
                 print(f"{cam_cfg.name}: reboot command sent")

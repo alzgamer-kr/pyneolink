@@ -24,6 +24,7 @@ from .core.bc import (
     recv_message,
     xml_document,
 )
+from .battery import Battery
 from .core.crypto import Cipher, make_aes_key, md5_hex
 from .core.discovery import local_discover, remote_uid_lookup
 from .core.state import ConnectionState
@@ -74,6 +75,7 @@ class Camera(AbstractContextManager["Camera"]):
         self.connected_address: tuple[str, int] | None = None
         self.login_xml = ""
         self.debug = debug
+        self._online_required = 0
 
     def __enter__(self) -> "Camera":
         self.connect()
@@ -127,6 +129,28 @@ class Camera(AbstractContextManager["Camera"]):
             self.sock.close()
             self.sock = None
         self.login_xml = ""
+
+    def reconnect(self) -> None:
+        self.close()
+        self.connect()
+        self.login()
+
+    @property
+    def online_required(self) -> bool:
+        return self._online_required > 0
+
+    def require_online(self):
+        return _CameraOnlineLease(self)
+
+    def keepalive(self, *, timeout: float = 0.05) -> str:
+        self.ensure_connected()
+        if hasattr(self.sock, "maintain"):
+            self.sock.maintain()
+        try:
+            msg = self._recv(timeout=timeout)
+        except TimeoutError:
+            return "timeout"
+        return f"msg_id={msg.header.msg_id} msg_num={msg.header.msg_num} response={msg.header.response_code}"
 
     def login(self, max_encryption: str = "aes") -> str:
         if self.sock is None:
@@ -192,9 +216,17 @@ class Camera(AbstractContextManager["Camera"]):
         self.command(MSG_SET_LED, payload)
         return None
 
-    def battery(self) -> str | None:
-        self.ensure_connected()
-        return self.command(MSG_BATTERY).xml_text
+    def battery(self) -> Battery:
+        return Battery(self)
+
+    def battery_xml(self, *, mode: str = "reconnect") -> str | None:
+        return self.battery().raw(mode=mode)
+
+    def battery_info(self, *, mode: str = "reconnect") -> dict:
+        return self.battery().info(mode=mode)
+
+    def watch_battery(self, interval: float = 60.0, *, count: int | None = None, mode: str = "reconnect"):
+        yield from self.battery().watch(interval=interval, count=count, mode=mode)
 
     def command(self, msg_id: int, payload: bytes = b"", *, extension: bytes = b""):
         self.ensure_connected()
@@ -203,6 +235,8 @@ class Camera(AbstractContextManager["Camera"]):
         while True:
             msg = self._recv()
             if msg.header.msg_num == msg_num:
+                if hasattr(self.sock, "discard_sent"):
+                    self.sock.discard_sent()
                 return msg
             if self.debug:
                 print(
@@ -302,26 +336,27 @@ class Camera(AbstractContextManager["Camera"]):
                 return
 
     def read_stream_payloads(self, stream: str = "mainStream"):
-        msg_num = self.start_stream(stream)
-        next_keepalive_at = time.monotonic() + 0.75
-        try:
-            while True:
-                now = time.monotonic()
-                if now >= next_keepalive_at:
-                    self.send(MSG_UDP_KEEPALIVE, channel_id=0, msg_num=0)
-                    next_keepalive_at = now + 0.75
-                try:
-                    msg = self._recv(timeout=1.0)
-                except TimeoutError:
-                    continue
-                if msg.header.msg_id == MSG_VIDEO and msg.header.msg_num == msg_num and msg.payload:
-                    yield msg.payload
-        finally:
+        with self.require_online():
+            msg_num = self.start_stream(stream)
+            next_keepalive_at = time.monotonic() + 0.75
             try:
-                self.stop_stream(stream, msg_num)
-            except Exception as exc:
-                if self.debug:
-                    print(f"[pyneolink] Stream stop failed during close: {type(exc).__name__}: {exc}")
+                while True:
+                    now = time.monotonic()
+                    if now >= next_keepalive_at:
+                        self.send(MSG_UDP_KEEPALIVE, channel_id=0, msg_num=0)
+                        next_keepalive_at = now + 0.75
+                    try:
+                        msg = self._recv(timeout=1.0)
+                    except TimeoutError:
+                        continue
+                    if msg.header.msg_id == MSG_VIDEO and msg.header.msg_num == msg_num and msg.payload:
+                        yield msg.payload
+            finally:
+                try:
+                    self.stop_stream(stream, msg_num)
+                except Exception as exc:
+                    if self.debug:
+                        print(f"[pyneolink] Stream stop failed during close: {type(exc).__name__}: {exc}")
 
     def _resolve_address(self) -> tuple[str, int] | tuple[str, int, str]:
         if self.config.address:
@@ -367,7 +402,7 @@ class Camera(AbstractContextManager["Camera"]):
         if self.sock is None:
             raise RuntimeError("Camera is not connected")
         msg = recv_message(self.sock, self.cipher, timeout=self.timeout if timeout is None else timeout, binary_msg_nums=self.binary_msg_nums)
-        if msg.header.msg_id == MSG_UDP_KEEPALIVE and msg.header.response_code != 200:
+        if msg.header.msg_id == MSG_UDP_KEEPALIVE:
             self._reply_keepalive(msg)
         return msg
 
@@ -375,16 +410,18 @@ class Camera(AbstractContextManager["Camera"]):
         if self.sock is None:
             return
         try:
-            self._send(
-                encode_modern(
-                    MSG_UDP_KEEPALIVE,
-                    msg.header.msg_num,
-                    channel_id=msg.header.channel_id,
-                    stream_type=msg.header.stream_type,
-                    response_code=200,
-                    cipher=self.cipher,
-                )
+            data = encode_modern(
+                MSG_UDP_KEEPALIVE,
+                msg.header.msg_num,
+                channel_id=msg.header.channel_id,
+                stream_type=msg.header.stream_type,
+                response_code=200,
+                cipher=self.cipher,
             )
+            if hasattr(self.sock, "send_untracked"):
+                self.sock.send_untracked(data)
+            else:
+                self._send(data)
         except Exception as exc:
             if self.debug:
                 print(f"[pyneolink] Failed to reply to stream keepalive: {type(exc).__name__}: {exc}")
@@ -395,6 +432,23 @@ def _split_address(address: str) -> tuple[str, int]:
         host, port = address.rsplit(":", 1)
         return host, int(port)
     return address, 9000
+
+
+class _CameraOnlineLease:
+    def __init__(self, camera: Camera) -> None:
+        self.camera = camera
+        self.active = False
+
+    def __enter__(self) -> Camera:
+        if not self.active:
+            self.camera._online_required += 1
+            self.active = True
+        return self.camera
+
+    def __exit__(self, *exc: object) -> None:
+        if self.active:
+            self.camera._online_required = max(0, self.camera._online_required - 1)
+            self.active = False
 
 
 def _stream_params(stream: str) -> tuple[str, int, int]:

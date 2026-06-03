@@ -68,6 +68,39 @@ Use `quality="high"`/`quality="low"` or `stream_type="mainStream"`/`stream_type=
 
 `remove()` and `format()` are intentionally guarded. `format()` requires both `confirm=True` and `confirmation_text="FORMAT SD CARD"`.
 
+Battery status:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", password="password") as camera:
+    battery = camera.battery()
+
+    with battery.info() as info:
+        print(info["level_percent"], info["is_charging"], info["adapter_status"])
+
+    with battery.info(interval=60, count=3, mode="reconnect") as updates:
+        for update in updates:
+            print(update["level_percent"], update["adapter_status"])
+
+    with battery.info(interval=60, mode="online") as updates:
+        for update in updates:
+            print(update["level_percent"], update["adapter_status"])
+```
+
+From CLI:
+
+```powershell
+python pyneolink/cli.py battery --camera "Scherbaka 41 - Front"
+python pyneolink/cli.py battery --camera "Scherbaka 41 - Front" --watch --interval 60
+python pyneolink/cli.py battery --camera "Scherbaka 41 - Front" --watch --interval 60 --mode online
+python pyneolink/cli.py battery --camera "Scherbaka 41 - Front" --raw
+```
+
+Battery polling defaults to `mode="reconnect"` to avoid keeping battery cameras awake. Use `mode="online"` only when frequent updates are more important than power saving, or when another component already keeps the camera online.
+
+See [examples/battery_example.py](examples/battery_example.py) for `battery_info_example()`, `reconnect_mode_example()`, and `online_mode_example()`.
+
 Live view:
 
 ```powershell

@@ -76,6 +76,13 @@ class UdpBcConnection:
             self.next_send_id += 1
         self.last_resend_at = time.monotonic()
 
+    def send_untracked(self, data: bytes) -> None:
+        for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
+            packet_id = self.next_send_id
+            packet = encode_udp_data(self.camera_id, packet_id, chunk)
+            self.sock.sendto(packet, self.addr)
+            self.next_send_id += 1
+
     def recv(self, size: int) -> bytes:
         deadline = time.monotonic() + self.timeout
         while len(self.buffer) < size:
@@ -100,6 +107,12 @@ class UdpBcConnection:
     def close(self) -> None:
         self.closed = True
         self.sock.close()
+
+    def maintain(self) -> None:
+        self._maintenance()
+
+    def discard_sent(self) -> None:
+        self.sent_chunks.clear()
 
     def _recv_one(self) -> None:
         try:
