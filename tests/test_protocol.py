@@ -1,6 +1,7 @@
 from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, StreamServer, config_from_dict
+from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
 from pyneolink.sd_card import SdCard
-from pyneolink.core.bc import CLASS_MODERN, MSG_UDP_KEEPALIVE, MSG_VIDEO, MSG_VIDEO_STOP, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
+from pyneolink.core.bc import CLASS_MODERN, MSG_BATTERY, MSG_UDP_KEEPALIVE, MSG_VIDEO, MSG_VIDEO_STOP, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
@@ -362,6 +363,168 @@ def test_public_camera_constructor_accepts_uuid_alias():
     assert camera.config.password == "secret"
 
 
+def test_battery_xml_parses_status_fields():
+    xml = """<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<BatteryList version="1.1">
+<BatteryInfo>
+<channelId>0</channelId>
+<chargeStatus>charging</chargeStatus>
+<adapterStatus>solarPanel</adapterStatus>
+<voltage>4083</voltage>
+<current>-396</current>
+<temperature>32</temperature>
+<batteryPercent>87</batteryPercent>
+<lowPower>0</lowPower>
+<batteryVersion>2</batteryVersion>
+</BatteryInfo>
+</BatteryList>
+</body>"""
+    info = parse_battery_xml(xml)
+    assert info["level_percent"] == 87
+    assert info["is_charging"] is True
+    assert info["charge_type"] == "solar_panel"
+    assert info["charge_type_label"] == "Сонячна панель"
+    assert info["low_power"] is False
+    assert info["raw"]["adapterStatus"] == "solarPanel"
+
+
+def test_camera_battery_info_requests_channel_extension():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+            self.discarded = 0
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+        def discard_sent(self):
+            self.discarded += 1
+
+    payload = xml_document(
+        "<BatteryInfo>"
+        "<channelId>2</channelId>"
+        "<chargeStatus>none</chargeStatus>"
+        "<adapterStatus>none</adapterStatus>"
+        "<batteryPercent>64</batteryPercent>"
+        "</BatteryInfo>"
+    )
+    reply = encode_modern(MSG_BATTERY, 1, payload, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", channel_id=2, state_path=None)
+    camera.sock = FakeSocket(reply)
+    camera.login_xml = "<logged-in />"
+    camera.cipher = Cipher("none")
+    with camera.battery().info(mode="online") as info:
+        assert info["level_percent"] == 64
+        assert info["charge_type"] == "none"
+    sent = bytes(camera.sock.sent)
+    header = Header.unpack_from(sent[:24])
+    extension = sent[24 : 24 + (header.payload_offset or 0)]
+    assert header.msg_id == MSG_BATTERY
+    assert b"<channelId>2</channelId>" in extension
+    assert camera.sock.discarded == 1
+
+
+def test_battery_refresh_reconnects_after_timeout():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.commands = 0
+            self.reconnects = 0
+
+        def command(self, msg_id, payload=b"", extension=b""):
+            self.commands += 1
+            if self.commands == 1:
+                raise TimeoutError("Timed out waiting for UDP Baichuan data")
+            xml = xml_document(
+                "<BatteryInfo>"
+                "<channelId>0</channelId>"
+                "<chargeStatus>charging</chargeStatus>"
+                "<adapterStatus>solarPanel</adapterStatus>"
+                "<batteryPercent>99</batteryPercent>"
+                "</BatteryInfo>"
+            )
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+
+        def reconnect(self):
+            self.reconnects += 1
+
+        def close(self):
+            pass
+
+    camera = FakeCamera()
+    info = Battery(camera).refresh()
+    assert info["level_percent"] == 99
+    assert camera.commands == 2
+    assert camera.reconnects == 1
+
+
+def test_battery_reconnect_mode_closes_only_when_not_online_required():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.closed = 0
+            self._online_required = 0
+
+        @property
+        def online_required(self):
+            return self._online_required > 0
+
+        def command(self, msg_id, payload=b"", extension=b""):
+            xml = xml_document(
+                "<BatteryInfo>"
+                "<channelId>0</channelId>"
+                "<chargeStatus>charging</chargeStatus>"
+                "<adapterStatus>solarPanel</adapterStatus>"
+                "<batteryPercent>98</batteryPercent>"
+                "</BatteryInfo>"
+            )
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+
+        def close(self):
+            self.closed += 1
+
+    camera = FakeCamera()
+    assert Battery(camera).refresh(mode="reconnect")["level_percent"] == 98
+    assert camera.closed == 2
+
+    camera._online_required = 1
+    assert Battery(camera).refresh(mode="reconnect")["level_percent"] == 98
+    assert camera.closed == 2
+
+
+def test_battery_watch_sends_keepalive_between_updates():
+    class FakeBattery:
+        def __init__(self):
+            self.keepalives = 0
+            self.refreshes = 0
+            self.camera = type("Camera", (), {"reconnect": lambda self: None})()
+
+        def refresh(self, mode="reconnect"):
+            self.refreshes += 1
+            return {"level_percent": self.refreshes}
+
+        def keepalive(self):
+            self.keepalives += 1
+
+    battery = FakeBattery()
+    updates = BatteryInfoUpdates(battery, interval=0.001, count=2, mode="online", keepalive_interval=0.001)
+    assert next(updates)["level_percent"] == 1
+    assert next(updates)["level_percent"] == 2
+    assert battery.keepalives >= 1
+
+
 def test_camera_start_stream_uses_neolink_substream_preview():
     class FakeSocket:
         def __init__(self, reply):
@@ -434,12 +597,16 @@ def test_camera_replies_to_incoming_keepalive():
         def __init__(self, reply):
             self.reply = bytearray(reply)
             self.sent = bytearray()
+            self.untracked = bytearray()
 
         def settimeout(self, _timeout):
             pass
 
         def sendall(self, data):
             self.sent.extend(data)
+
+        def send_untracked(self, data):
+            self.untracked.extend(data)
 
         def recv(self, size):
             chunk = bytes(self.reply[:size])
@@ -451,13 +618,48 @@ def test_camera_replies_to_incoming_keepalive():
     camera.sock = FakeSocket(incoming)
     camera.cipher = Cipher("none")
     msg = camera._recv()
-    sent = bytes(camera.sock.sent)
+    sent = bytes(camera.sock.untracked)
     header = Header.unpack_from(sent[:24])
     assert msg.header.msg_id == MSG_UDP_KEEPALIVE
+    assert bytes(camera.sock.sent) == b""
     assert header.msg_id == MSG_UDP_KEEPALIVE
     assert header.msg_num == 9
     assert header.channel_id == 3
     assert header.stream_type == 1
+    assert header.response_code == 200
+
+
+def test_camera_replies_to_keepalive_even_when_response_is_200():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.untracked = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, _data):
+            raise AssertionError("keepalive replies should not be tracked for resend")
+
+        def send_untracked(self, data):
+            self.untracked.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    incoming = encode_modern(MSG_UDP_KEEPALIVE, 0, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    camera.sock = FakeSocket(incoming)
+    camera.cipher = Cipher("none")
+    msg = camera._recv()
+    sent = bytes(camera.sock.untracked)
+    header = Header.unpack_from(sent[:24])
+    assert msg.header.msg_id == MSG_UDP_KEEPALIVE
+    assert msg.header.response_code == 200
+    assert header.msg_id == MSG_UDP_KEEPALIVE
+    assert header.msg_num == 0
     assert header.response_code == 200
 
 

@@ -3,6 +3,7 @@
 Small library-use examples for PyNeolink.
 
 - [sd_card_example.py](sd_card_example.py) shows SD-card `list`, `download`, `remove`, and `format` calls.
+- [battery_example.py](battery_example.py) shows one-shot battery status plus `reconnect` and `online` polling.
 - [stream_example.py](stream_example.py) starts a live stream HTTP server from a dict config.
 
 Live stream development:
