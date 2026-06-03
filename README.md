@@ -117,7 +117,20 @@ http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high
 http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low
 ```
 
+Open the HLS timeshift stream with:
+
+```text
+http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high/hls.m3u8
+http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low/hls.m3u8
+```
+
 The endpoint muxes H264/H265 video and AAC audio into MPEG-TS for VLC/ffplay. ADPCM audio is currently ignored because it needs a transcoding step. Short camera stalls are bridged with MPEG-TS null packets so players are less likely to close the stream while waiting for the camera to resume. This is a lightweight first step toward Neolink-style viewing; RTSP/HLS wrapping can be added on top later.
+
+HLS keeps a sliding in-memory timeshift window. By default it stores up to 100 MB and cuts segments around 2 seconds, starting each segment on a keyframe when possible. Tune it from CLI with:
+
+```powershell
+python pyneolink/cli.py serve --config config.json --hls-buffer-mb 100 --hls-segment-seconds 2
+```
 
 Library use:
 
@@ -138,11 +151,11 @@ config = {
     ],
 }
 
-server = StreamServer(config, debug=True, buffer_seconds=1.5)
+server = StreamServer(config, debug=True, buffer_seconds=1.5, hls_buffer_mb=100, hls_segment_seconds=2)
 server.serve_forever()
 ```
 
-`examples/stream_example.py` is a small development runner for live streams. It parses `config.json` into a dict and passes that dict to `StreamServer`. You can override values with environment variables such as `PYNEOLINK_CONFIG`, `PYNEOLINK_HOST`, `PYNEOLINK_PORT`, `PYNEOLINK_DEBUG`, `PYNEOLINK_BUFFER_SECONDS`, `CAMERA_NAME`, `CAMERA_UID`, `CAMERA_USERNAME`, and `CAMERA_PASSWORD`.
+`examples/stream_example.py` is a small development runner for live streams. It parses `config.json` into a dict and passes that dict to `StreamServer`. You can override values with environment variables such as `PYNEOLINK_CONFIG`, `PYNEOLINK_HOST`, `PYNEOLINK_PORT`, `PYNEOLINK_DEBUG`, `PYNEOLINK_BUFFER_SECONDS`, `PYNEOLINK_HLS_BUFFER_MB`, `PYNEOLINK_HLS_SEGMENT_SECONDS`, `CAMERA_NAME`, `CAMERA_UID`, `CAMERA_USERNAME`, and `CAMERA_PASSWORD`.
 
 Example `config.json`:
 

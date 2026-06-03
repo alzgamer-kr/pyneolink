@@ -9,11 +9,14 @@ import queue
 import threading
 
 from pyneolink.stream_server import (
+    HlsSegment,
     MpegTsMuxer,
     _STREAM_END,
     _buffer_initial_video,
     _find_camera,
+    _hls_playlist,
     _mpegts_null_packet,
+    _packets_from_first_keyframe,
     _produce_mpegts_chunks,
     _read_until_keyframe,
 )
@@ -256,6 +259,27 @@ def test_mpegts_producer_queues_chunks_and_end_marker():
     assert any((((item[1] & 0x1F) << 8) | item[2]) == MpegTsMuxer.VIDEO_PID for item in queued)
 
 
+def test_hls_playlist_lists_sliding_segments():
+    segments = [
+        HlsSegment(7, 2.0, b"one", 1.0),
+        HlsSegment(8, 2.25, b"two", 2.0),
+    ]
+    playlist = _hls_playlist(segments, 2.0)
+    assert "#EXT-X-MEDIA-SEQUENCE:7" in playlist
+    assert "#EXT-X-TARGETDURATION:3" in playlist
+    assert "#EXTINF:2.000," in playlist
+    assert "segments/8.ts" in playlist
+
+
+def test_hls_start_discards_packets_before_keyframe():
+    packets = [
+        type("Packet", (), {"kind": "aac"})(),
+        type("Packet", (), {"kind": "iframe"})(),
+        type("Packet", (), {"kind": "pframe"})(),
+    ]
+    assert [packet.kind for packet in _packets_from_first_keyframe(packets)] == ["iframe", "pframe"]
+
+
 def test_stream_server_buffers_initial_video_packets():
     iframe = b"00dcH264"
     iframe += (4).to_bytes(4, "little")
@@ -295,6 +319,8 @@ def test_public_stream_server_builds_encoded_urls():
     assert server.urls() == [
         "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high",
         "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low",
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high/hls.m3u8",
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low/hls.m3u8",
     ]
 
 
@@ -310,6 +336,8 @@ def test_stream_server_accepts_dict_config():
     assert server.urls() == [
         "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high",
         "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low",
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high/hls.m3u8",
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low/hls.m3u8",
     ]
 
 
