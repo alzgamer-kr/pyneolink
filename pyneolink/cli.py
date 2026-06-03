@@ -12,11 +12,13 @@ if __package__ in (None, ""):
     from pyneolink.config import load_config, write_json_config
     from pyneolink.core.discovery import local_discover, remote_uid_lookup
     from pyneolink.core.media import MediaParser
+    from pyneolink.stream_server import serve_streams
 else:
     from .camera import Camera
     from .config import load_config, write_json_config
     from .core.discovery import local_discover, remote_uid_lookup
     from .core.media import MediaParser
+    from .stream_server import serve_streams
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,6 +58,12 @@ def main(argv: list[str] | None = None) -> int:
     raw.add_argument("--output", required=True)
     raw.add_argument("--packets", type=int, default=0, help="Stop after N video packets; 0 means keep running")
 
+    serve = sub.add_parser("serve")
+    add_common_options(serve)
+    serve.add_argument("--host")
+    serve.add_argument("--port", type=int)
+    serve.add_argument("--buffer-seconds", type=float, default=1.0)
+
     convert = sub.add_parser("convert-config")
     add_common_options(convert)
     convert.add_argument("--from", dest="source", default="config.toml")
@@ -73,6 +81,20 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.source)
         write_json_config(cfg, args.target)
         print(f"wrote {args.target}")
+        return 0
+
+    if args.command == "serve":
+        try:
+            serve_streams(
+                args.config,
+                host=args.host,
+                port=args.port,
+                state_path=getattr(args, "state", ".pyneolink_state.json"),
+                debug=getattr(args, "debug", False),
+                buffer_seconds=args.buffer_seconds,
+            )
+        except KeyboardInterrupt:
+            print("stopped")
         return 0
 
     if args.command == "discover":

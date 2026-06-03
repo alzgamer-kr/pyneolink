@@ -1,8 +1,9 @@
 """Python API for Reolink/Neolink cameras."""
 
 from .camera import Camera
-from .config import CameraConfig, Config, load_config
+from .config import CameraConfig, Config, config_from_dict, load_config
 from .sd_card import DangerousSdCardOperation, DownloadSizeMismatch, SdCard, SdCardFile
+from .stream_server import StreamServer, serve_streams
 
 __all__ = [
     "Camera",
@@ -12,7 +13,10 @@ __all__ = [
     "DownloadSizeMismatch",
     "SdCard",
     "SdCardFile",
+    "StreamServer",
+    "config_from_dict",
     "load_config",
+    "serve_streams",
     "__version__",
 ]
 __version__ = "0.1.0"
