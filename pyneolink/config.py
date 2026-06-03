@@ -44,6 +44,10 @@ def load_config(path: str | Path) -> Config:
         data = json.loads(text)
     else:
         data = tomllib.loads(text)
+    return config_from_dict(data)
+
+
+def config_from_dict(data: dict) -> Config:
     cameras = [
         CameraConfig(
             name=item["name"],

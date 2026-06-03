@@ -1,9 +1,10 @@
-from pyneolink import Camera, DangerousSdCardOperation
+from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, StreamServer, config_from_dict
 from pyneolink.sd_card import SdCard
-from pyneolink.core.bc import CLASS_MODERN, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
+from pyneolink.core.bc import CLASS_MODERN, MSG_UDP_KEEPALIVE, MSG_VIDEO, MSG_VIDEO_STOP, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
+from pyneolink.stream_server import _buffer_initial_video, _ffmpeg_mpegts_cmd, _find_camera, _read_until_keyframe
 from datetime import datetime
 
 from pyneolink.sd_card import (
@@ -158,6 +159,97 @@ def test_extract_embedded_mp4_after_bcmedia_info_header(tmp_path):
     assert destination.read_bytes() == mp4
 
 
+def test_stream_server_generates_timed_mpegts_command():
+    cmd = _ffmpeg_mpegts_cmd("H264", fps=15)
+    assert cmd[cmd.index("-r") + 1] == "15"
+    assert "+genpts+nobuffer" in cmd
+    assert "-flush_packets" in cmd
+
+
+def test_stream_server_reads_fps_before_keyframe():
+    info = b"1002" + (32).to_bytes(4, "little") + (640).to_bytes(4, "little") + (360).to_bytes(4, "little")
+    info += bytes([0, 12, 126, 1, 1, 0, 0, 0, 126, 1, 1, 0, 0, 0]) + b"\0\0"
+    iframe = b"00dcH264"
+    iframe += (4).to_bytes(4, "little")
+    iframe += (4).to_bytes(4, "little")
+    iframe += (123).to_bytes(4, "little")
+    iframe += (0).to_bytes(4, "little")
+    iframe += (456).to_bytes(4, "little")
+    iframe += b"\0\0\0\1"
+    iframe += b"\0\0\0\0"
+    packets, codec, fps = _read_until_keyframe([info + iframe], MediaParser())
+    assert codec == "H264"
+    assert fps == 12
+    assert len(packets) == 1
+
+
+def test_stream_server_buffers_initial_video_packets():
+    iframe = b"00dcH264"
+    iframe += (4).to_bytes(4, "little")
+    iframe += (4).to_bytes(4, "little")
+    iframe += (123).to_bytes(4, "little")
+    iframe += (0).to_bytes(4, "little")
+    iframe += (456).to_bytes(4, "little")
+    iframe += b"\0\0\0\1"
+    iframe += b"\0\0\0\0"
+    pframe = b"01dcH264"
+    pframe += (4).to_bytes(4, "little")
+    pframe += (4).to_bytes(4, "little")
+    pframe += (123).to_bytes(4, "little")
+    pframe += (0).to_bytes(4, "little")
+    pframe += (456).to_bytes(4, "little")
+    pframe += b"\0\0\0\1"
+    pframe += b"\0\0\0\0"
+    first_packets = list(MediaParser().feed(iframe))
+    packets = _buffer_initial_video([pframe + pframe], MediaParser(), first_packets, fps=3, buffer_seconds=1.0)
+    assert [packet.kind for packet in packets] == ["iframe", "pframe", "pframe"]
+
+
+def test_stream_server_camera_lookup_is_whitespace_tolerant():
+    config = Config(cameras=[CameraConfig(name="Scherbaka 41 - Front")])
+    assert _find_camera(config, "  scherbaka   41 - front  ").name == "Scherbaka 41 - Front"
+    try:
+        _find_camera(config, "Shiferna 43 - Front")
+    except ValueError as exc:
+        assert "Available cameras: Scherbaka 41 - Front" in str(exc)
+    else:
+        raise AssertionError("unknown camera should raise")
+
+
+def test_public_stream_server_builds_encoded_urls():
+    config = Config(bind="0.0.0.0", bind_port=8554, cameras=[CameraConfig(name="Scherbaka 41 - Front")])
+    server = StreamServer(config)
+    assert server.urls() == [
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high",
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low",
+    ]
+
+
+def test_stream_server_accepts_dict_config():
+    server = StreamServer(
+        {
+            "bind": "0.0.0.0",
+            "bind_port": 8554,
+            "cameras": [{"name": "Scherbaka 41 - Front", "uid": "abc"}],
+        }
+    )
+    assert server.config.camera("Scherbaka 41 - Front").uid == "abc"
+    assert server.urls() == [
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high",
+        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low",
+    ]
+
+
+def test_config_from_dict_uses_config_defaults():
+    config = config_from_dict({"cameras": [{"name": "Front", "uid": "abc"}]})
+    camera = config.camera("Front")
+    assert config.bind == "0.0.0.0"
+    assert config.bind_port == 8554
+    assert camera.username == "admin"
+    assert camera.password == "123456"
+    assert camera.discovery == "relay"
+
+
 def test_download_query_order_prefers_direct_download_before_replay():
     raw = {
         "name": "abc",
@@ -268,6 +360,105 @@ def test_public_camera_constructor_accepts_uuid_alias():
     camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
     assert camera.config.uid == "95270006R5KDROXI"
     assert camera.config.password == "secret"
+
+
+def test_camera_start_stream_uses_neolink_substream_preview():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    reply = encode_modern(MSG_VIDEO, 1, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    camera.sock = FakeSocket(reply)
+    camera.login_xml = "<logged-in />"
+    camera.cipher = Cipher("none")
+    msg_num = camera.start_stream("low")
+    sent = bytes(camera.sock.sent)
+    header = Header.unpack_from(sent[:24])
+    payload = sent[24:]
+    assert msg_num == 1
+    assert header.msg_id == MSG_VIDEO
+    assert header.stream_type == 1
+    assert b"<handle>256</handle>" in payload
+    assert b"<streamType>subStream</streamType>" in payload
+    assert msg_num in camera.binary_msg_nums
+
+
+def test_camera_stop_stream_ignores_camera_400_reply():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    reply = encode_modern(MSG_VIDEO_STOP, 7, response_code=400, cipher=Cipher("none"))
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    camera.sock = FakeSocket(reply)
+    camera.login_xml = "<logged-in />"
+    camera.cipher = Cipher("none")
+    camera.binary_msg_nums.add(7)
+    camera.stop_stream("low", 7)
+    sent = bytes(camera.sock.sent)
+    header = Header.unpack_from(sent[:24])
+    payload = sent[24:]
+    assert header.msg_id == MSG_VIDEO_STOP
+    assert header.stream_type == 1
+    assert b"<handle>256</handle>" in payload
+    assert 7 not in camera.binary_msg_nums
+
+
+def test_camera_replies_to_incoming_keepalive():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    incoming = encode_modern(MSG_UDP_KEEPALIVE, 9, channel_id=3, stream_type=1, cipher=Cipher("none"))
+    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    camera.sock = FakeSocket(incoming)
+    camera.cipher = Cipher("none")
+    msg = camera._recv()
+    sent = bytes(camera.sock.sent)
+    header = Header.unpack_from(sent[:24])
+    assert msg.header.msg_id == MSG_UDP_KEEPALIVE
+    assert header.msg_id == MSG_UDP_KEEPALIVE
+    assert header.msg_num == 9
+    assert header.channel_id == 3
+    assert header.stream_type == 1
+    assert header.response_code == 200
 
 
 def test_camera_sd_card_api_is_available():
