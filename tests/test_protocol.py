@@ -5,7 +5,7 @@ from pyneolink.core.bc import CLASS_MODERN, MSG_BATTERY, MSG_UDP_KEEPALIVE, MSG_
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
-from pyneolink.stream_server import _buffer_initial_video, _ffmpeg_mpegts_cmd, _find_camera, _read_until_keyframe
+from pyneolink.stream_server import MpegTsMuxer, _buffer_initial_video, _find_camera, _read_until_keyframe
 from datetime import datetime
 
 from pyneolink.sd_card import (
@@ -160,13 +160,6 @@ def test_extract_embedded_mp4_after_bcmedia_info_header(tmp_path):
     assert destination.read_bytes() == mp4
 
 
-def test_stream_server_generates_timed_mpegts_command():
-    cmd = _ffmpeg_mpegts_cmd("H264", fps=15)
-    assert cmd[cmd.index("-r") + 1] == "15"
-    assert "+genpts+nobuffer" in cmd
-    assert "-flush_packets" in cmd
-
-
 def test_stream_server_reads_fps_before_keyframe():
     info = b"1002" + (32).to_bytes(4, "little") + (640).to_bytes(4, "little") + (360).to_bytes(4, "little")
     info += bytes([0, 12, 126, 1, 1, 0, 0, 0, 126, 1, 1, 0, 0, 0]) + b"\0\0"
@@ -181,7 +174,45 @@ def test_stream_server_reads_fps_before_keyframe():
     packets, codec, fps = _read_until_keyframe([info + iframe], MediaParser())
     assert codec == "H264"
     assert fps == 12
-    assert len(packets) == 1
+    assert [packet.kind for packet in packets] == ["info", "iframe"]
+
+
+def test_stream_server_keeps_audio_before_keyframe():
+    info = b"1002" + (32).to_bytes(4, "little") + (640).to_bytes(4, "little") + (360).to_bytes(4, "little")
+    info += bytes([0, 12, 126, 1, 1, 0, 0, 0, 126, 1, 1, 0, 0, 0]) + b"\0\0"
+    audio = b"05wb" + (7).to_bytes(2, "little") + b"\0\0" + b"\xff\xf1\x50\x80\x00\x1f\xfc" + b"\0"
+    iframe = b"00dcH264"
+    iframe += (4).to_bytes(4, "little")
+    iframe += (4).to_bytes(4, "little")
+    iframe += (123).to_bytes(4, "little")
+    iframe += (0).to_bytes(4, "little")
+    iframe += (456).to_bytes(4, "little")
+    iframe += b"\0\0\0\1"
+    iframe += b"\0\0\0\0"
+    packets, codec, fps = _read_until_keyframe([info + audio + iframe], MediaParser())
+    assert codec == "H264"
+    assert fps == 12
+    assert [packet.kind for packet in packets] == ["info", "aac", "iframe"]
+
+
+def test_mpegts_muxer_emits_video_and_aac_packets():
+    muxer = MpegTsMuxer("H264", fps=15)
+    iframe = MediaParser().feed(
+        b"00dcH264"
+        + (4).to_bytes(4, "little")
+        + (4).to_bytes(4, "little")
+        + (123).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + (456).to_bytes(4, "little")
+        + b"\0\0\0\1"
+        + b"\0\0\0\0"
+    )
+    chunks = []
+    chunks.extend(muxer.feed(next(iframe)))
+    chunks.extend(muxer.feed(type("Packet", (), {"kind": "aac", "data": b"\xff\xf1\x50\x80\x00\x1f\xfc", "timestamp_us": None})()))
+    assert chunks
+    assert all(len(chunk) == 188 and chunk[0] == 0x47 for chunk in chunks)
+    assert any((((chunk[1] & 0x1F) << 8) | chunk[2]) == MpegTsMuxer.AUDIO_PID for chunk in chunks)
 
 
 def test_stream_server_buffers_initial_video_packets():

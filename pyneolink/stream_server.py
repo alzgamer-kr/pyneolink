@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
 from urllib.parse import quote, unquote, urlparse
@@ -115,7 +112,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
             payloads = camera.read_stream_payloads(stream)
             first_packets, codec, fps = _read_until_keyframe(payloads, parser)
             first_packets = _buffer_initial_video(payloads, parser, first_packets, fps, self.server.buffer_seconds)
-            if shutil.which("ffmpeg") and codec in ("H264", "H265"):
+            if codec in ("H264", "H265"):
                 self._serve_mpegts(payloads, parser, first_packets, codec, fps)
             else:
                 self._serve_raw(payloads, parser, first_packets, codec)
@@ -165,7 +162,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
-        for packet in first_packets:
+        for packet in _video_packets(first_packets):
             self.wfile.write(packet.data)
         self.wfile.flush()
         for payload in payloads:
@@ -181,35 +178,90 @@ class _StreamHandler(BaseHTTPRequestHandler):
         codec: str,
         fps: int,
     ) -> None:
-        process = subprocess.Popen(
-            _ffmpeg_mpegts_cmd(codec, fps),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
-        feeder = threading.Thread(
-            target=_feed_ffmpeg,
-            args=(process, payloads, parser, first_packets),
-            daemon=True,
-        )
-        feeder.start()
         self.send_response(200)
         self.send_header("Content-Type", "video/MP2T")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
-        try:
-            while process.stdout is not None:
-                read = getattr(process.stdout, "read1", process.stdout.read)
-                chunk = read(188 * 16)
-                if not chunk:
-                    break
+        muxer = MpegTsMuxer(codec, fps=fps)
+        for packet in first_packets:
+            for chunk in muxer.feed(packet):
                 self.wfile.write(chunk)
-                self.wfile.flush()
-        finally:
-            _stop_process(process)
-            feeder.join(timeout=2.0)
+        self.wfile.flush()
+        for payload in payloads:
+            for packet in parser.feed(payload):
+                for chunk in muxer.feed(packet):
+                    self.wfile.write(chunk)
+            self.wfile.flush()
+
+
+class MpegTsMuxer:
+    PAT_PID = 0x0000
+    PMT_PID = 0x0100
+    VIDEO_PID = 0x0101
+    AUDIO_PID = 0x0102
+
+    def __init__(self, codec: str, *, fps: int = 15) -> None:
+        self.codec = codec
+        self.fps = max(fps, 1)
+        self.continuity: dict[int, int] = {}
+        self.tables_written = False
+        self.video_pts = 0
+        self.audio_pts = 0
+
+    def feed(self, packet: MediaPacket) -> Iterable[bytes]:
+        if not self.tables_written:
+            yield from self._packetize(self.PAT_PID, b"\x00" + _pat_section(self.PMT_PID), start=True)
+            yield from self._packetize(self.PMT_PID, b"\x00" + _pmt_section(self.codec, self.VIDEO_PID, self.AUDIO_PID), start=True)
+            self.tables_written = True
+
+        if packet.kind in ("iframe", "pframe"):
+            if packet.timestamp_us is not None:
+                self.video_pts = int(packet.timestamp_us * 90_000 / 1_000_000)
+            else:
+                self.video_pts += 90_000 // self.fps
+            pes = _pes_packet(0xE0, self.video_pts, packet.data, unbounded=True)
+            yield from self._packetize(self.VIDEO_PID, pes, start=True, pcr=self.video_pts)
+        elif packet.kind == "aac" and _looks_like_adts(packet.data):
+            self.audio_pts = max(self.audio_pts, self.video_pts)
+            pes = _pes_packet(0xC0, self.audio_pts, packet.data)
+            self.audio_pts += _aac_duration_90k(packet.data)
+            yield from self._packetize(self.AUDIO_PID, pes, start=True)
+
+    def _packetize(self, pid: int, payload: bytes, *, start: bool = False, pcr: int | None = None) -> Iterable[bytes]:
+        offset = 0
+        first = True
+        while offset < len(payload):
+            include_pcr = pcr is not None and first
+            max_payload = 176 if include_pcr else 184
+            chunk = payload[offset : offset + min(len(payload) - offset, max_payload)]
+            offset += len(chunk)
+
+            adaptation = b""
+            if include_pcr or len(chunk) < 184:
+                total_adaptation = 184 - len(chunk)
+                if total_adaptation > 0:
+                    flags = 0x10 if include_pcr else 0x00
+                    body = bytes([flags])
+                    if include_pcr:
+                        body += _encode_pcr(pcr or 0)
+                    stuffing = total_adaptation - 1 - len(body)
+                    adaptation = bytes([len(body) + max(stuffing, 0)]) + body + (b"\xff" * max(stuffing, 0))
+
+            adaptation_control = 0x30 if adaptation else 0x10
+            continuity = self.continuity.get(pid, 0) & 0x0F
+            self.continuity[pid] = (continuity + 1) & 0x0F
+            header = bytes(
+                [
+                    0x47,
+                    (0x40 if first and start else 0x00) | ((pid >> 8) & 0x1F),
+                    pid & 0xFF,
+                    adaptation_control | continuity,
+                ]
+            )
+            packet = header + adaptation + chunk
+            yield packet + (b"\xff" * (188 - len(packet)))
+            first = False
 
 
 def _quality_to_stream(quality: str) -> str:
@@ -248,12 +300,17 @@ def _is_client_disconnect(exc: OSError) -> bool:
 
 def _read_until_keyframe(payloads: Iterable[bytes], parser: MediaParser) -> tuple[list[MediaPacket], str | None, int]:
     fps = 15
+    packets: list[MediaPacket] = []
     for payload in payloads:
         for packet in parser.feed(payload):
             if packet.kind == "info" and packet.fps:
                 fps = packet.fps
+                packets.append(packet)
+            elif packet.kind in ("aac", "adpcm"):
+                packets.append(packet)
             elif packet.kind == "iframe" and packet.codec:
-                return [packet], packet.codec, fps
+                packets.append(packet)
+                return packets, packet.codec, fps
     return [], None, fps
 
 
@@ -265,13 +322,16 @@ def _buffer_initial_video(
     buffer_seconds: float,
 ) -> list[MediaPacket]:
     target_frames = int(max(fps, 1) * max(buffer_seconds, 0.0))
-    if target_frames <= len(packets):
+    video_count = sum(1 for packet in packets if packet.kind in ("iframe", "pframe"))
+    if target_frames <= video_count:
         return packets
     buffered = list(packets)
     for payload in payloads:
-        for packet in _video_packets(parser.feed(payload)):
+        for packet in parser.feed(payload):
             buffered.append(packet)
-            if len(buffered) >= target_frames:
+            if packet.kind in ("iframe", "pframe"):
+                video_count += 1
+            if video_count >= target_frames:
                 return buffered
     return buffered
 
@@ -290,71 +350,98 @@ def _raw_content_type(codec: str | None) -> str:
     return "application/octet-stream"
 
 
-def _ffmpeg_mpegts_cmd(codec: str, fps: int = 15) -> list[str]:
-    input_format = "hevc" if codec == "H265" else "h264"
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-fflags",
-        "+genpts+nobuffer",
-        "-flags",
-        "low_delay",
-        "-r",
-        str(max(fps, 1)),
-        "-f",
-        input_format,
-        "-i",
-        "pipe:0",
-        "-c:v",
-        "copy",
-        "-an",
-        "-muxdelay",
-        "0",
-        "-muxpreload",
-        "0",
-        "-mpegts_flags",
-        "resend_headers",
-        "-flush_packets",
-        "1",
-        "-f",
-        "mpegts",
-        "pipe:1",
+def _pat_section(pmt_pid: int) -> bytes:
+    section = bytearray()
+    section.extend(b"\x00\xb0\x0d")
+    section.extend(b"\x00\x01\xc1\x00\x00")
+    section.extend(b"\x00\x01")
+    section.extend(bytes([0xE0 | ((pmt_pid >> 8) & 0x1F), pmt_pid & 0xFF]))
+    section.extend(_mpeg_crc32(section).to_bytes(4, "big"))
+    return bytes(section)
+
+
+def _pmt_section(codec: str, video_pid: int, audio_pid: int) -> bytes:
+    video_type = 0x24 if codec == "H265" else 0x1B
+    streams = [
+        (video_type, video_pid),
+        (0x0F, audio_pid),
     ]
+    section_length = 9 + (5 * len(streams)) + 4
+    section = bytearray()
+    section.extend(bytes([0x02, 0xB0 | ((section_length >> 8) & 0x0F), section_length & 0xFF]))
+    section.extend(b"\x00\x01\xc1\x00\x00")
+    section.extend(bytes([0xE0 | ((video_pid >> 8) & 0x1F), video_pid & 0xFF]))
+    section.extend(b"\xf0\x00")
+    for stream_type, pid in streams:
+        section.append(stream_type)
+        section.extend(bytes([0xE0 | ((pid >> 8) & 0x1F), pid & 0xFF, 0xF0, 0x00]))
+    section.extend(_mpeg_crc32(section).to_bytes(4, "big"))
+    return bytes(section)
 
 
-def _feed_ffmpeg(
-    process: subprocess.Popen,
-    payloads: Iterable[bytes],
-    parser: MediaParser,
-    first_packets: list[MediaPacket],
-) -> None:
-    try:
-        if process.stdin is None:
-            return
-        for packet in first_packets:
-            process.stdin.write(packet.data)
-        process.stdin.flush()
-        for payload in payloads:
-            for packet in _video_packets(parser.feed(payload)):
-                process.stdin.write(packet.data)
-            process.stdin.flush()
-    except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
-    finally:
-        if process.stdin is not None:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
+def _pes_packet(stream_id: int, pts_90k: int, payload: bytes, *, unbounded: bool = False) -> bytes:
+    header = b"\x80\x80\x05" + _encode_pts(pts_90k)
+    pes_length = 0 if unbounded or len(header) + len(payload) > 0xFFFF else len(header) + len(payload)
+    return b"\x00\x00\x01" + bytes([stream_id]) + pes_length.to_bytes(2, "big") + header + payload
 
 
-def _stop_process(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
+def _encode_pts(value: int) -> bytes:
+    pts = value & ((1 << 33) - 1)
+    return bytes(
+        [
+            0x20 | (((pts >> 30) & 0x07) << 1) | 1,
+            (pts >> 22) & 0xFF,
+            (((pts >> 15) & 0x7F) << 1) | 1,
+            (pts >> 7) & 0xFF,
+            ((pts & 0x7F) << 1) | 1,
+        ]
+    )
+
+
+def _encode_pcr(value: int) -> bytes:
+    base = value & ((1 << 33) - 1)
+    return bytes(
+        [
+            (base >> 25) & 0xFF,
+            (base >> 17) & 0xFF,
+            (base >> 9) & 0xFF,
+            (base >> 1) & 0xFF,
+            ((base & 1) << 7) | 0x7E,
+            0x00,
+        ]
+    )
+
+
+def _mpeg_crc32(data: bytes | bytearray) -> int:
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if crc & 0x80000000 else (crc << 1) & 0xFFFFFFFF
+    return crc
+
+
+def _looks_like_adts(data: bytes) -> bool:
+    return len(data) >= 7 and data[0] == 0xFF and (data[1] & 0xF0) == 0xF0
+
+
+def _aac_duration_90k(data: bytes) -> int:
+    if not _looks_like_adts(data):
+        return 90_000 // 50
+    sample_rate_index = (data[2] >> 2) & 0x0F
+    sample_rate = {
+        0: 96000,
+        1: 88200,
+        2: 64000,
+        3: 48000,
+        4: 44100,
+        5: 32000,
+        6: 24000,
+        7: 22050,
+        8: 16000,
+        9: 12000,
+        10: 11025,
+        11: 8000,
+        12: 7350,
+    }.get(sample_rate_index, 8000)
+    return max(1, int(1024 * 90_000 / sample_rate))

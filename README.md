@@ -117,7 +117,7 @@ http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high
 http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low
 ```
 
-When `ffmpeg` is available, the endpoint remuxes the camera video into MPEG-TS for VLC/ffplay. Without `ffmpeg`, it falls back to raw H264/H265 over HTTP. This is a lightweight first step toward Neolink-style viewing; RTSP/HLS wrapping can be added on top later.
+The endpoint muxes H264/H265 video and AAC audio into MPEG-TS for VLC/ffplay. ADPCM audio is currently ignored because it needs a transcoding step. This is a lightweight first step toward Neolink-style viewing; RTSP/HLS wrapping can be added on top later.
 
 Library use:
 
