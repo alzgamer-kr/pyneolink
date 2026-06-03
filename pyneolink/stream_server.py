@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
 from urllib.parse import quote, unquote, urlparse
@@ -7,6 +9,10 @@ from urllib.parse import quote, unquote, urlparse
 from .camera import Camera
 from .config import Config, config_from_dict, load_config
 from .core.media import MediaParser, MediaPacket
+
+
+_STREAM_END = object()
+_STREAM_QUEUE_TIMEOUT = 0.25
 
 
 class StreamServer:
@@ -178,21 +184,50 @@ class _StreamHandler(BaseHTTPRequestHandler):
         codec: str,
         fps: int,
     ) -> None:
+        chunks: queue.Queue[object] = queue.Queue(maxsize=_stream_queue_size(fps, self.server.buffer_seconds))
+        stop_event = threading.Event()
+        producer = threading.Thread(
+            target=_produce_mpegts_chunks,
+            args=(chunks, stop_event, codec, fps, payloads, parser, first_packets),
+            daemon=True,
+        )
+        producer.start()
         self.send_response(200)
         self.send_header("Content-Type", "video/MP2T")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
-        muxer = MpegTsMuxer(codec, fps=fps)
-        for packet in first_packets:
-            for chunk in muxer.feed(packet):
-                self.wfile.write(chunk)
-        self.wfile.flush()
-        for payload in payloads:
-            for packet in parser.feed(payload):
-                for chunk in muxer.feed(packet):
-                    self.wfile.write(chunk)
-            self.wfile.flush()
+        started = False
+        try:
+            while True:
+                try:
+                    item = chunks.get(timeout=_STREAM_QUEUE_TIMEOUT)
+                except queue.Empty:
+                    if started:
+                        self.wfile.write(_mpegts_null_packet())
+                        self.wfile.flush()
+                    continue
+                if item is _STREAM_END:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                started = True
+                self.wfile.write(item)
+                while True:
+                    try:
+                        item = chunks.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is _STREAM_END:
+                        self.wfile.flush()
+                        return
+                    if isinstance(item, BaseException):
+                        raise item
+                    self.wfile.write(item)
+                self.wfile.flush()
+        finally:
+            stop_event.set()
+            producer.join(timeout=2.0)
 
 
 class MpegTsMuxer:
@@ -262,6 +297,52 @@ class MpegTsMuxer:
             packet = header + adaptation + chunk
             yield packet + (b"\xff" * (188 - len(packet)))
             first = False
+
+
+def _produce_mpegts_chunks(
+    chunks: queue.Queue[object],
+    stop_event: threading.Event,
+    codec: str,
+    fps: int,
+    payloads: Iterable[bytes],
+    parser: MediaParser,
+    first_packets: list[MediaPacket],
+) -> None:
+    muxer = MpegTsMuxer(codec, fps=fps)
+    try:
+        for packet in first_packets:
+            for chunk in muxer.feed(packet):
+                if not _put_stream_item(chunks, stop_event, chunk):
+                    return
+        for payload in payloads:
+            if stop_event.is_set():
+                return
+            for packet in parser.feed(payload):
+                for chunk in muxer.feed(packet):
+                    if not _put_stream_item(chunks, stop_event, chunk):
+                        return
+    except BaseException as exc:
+        _put_stream_item(chunks, stop_event, exc)
+    finally:
+        _put_stream_item(chunks, stop_event, _STREAM_END)
+
+
+def _put_stream_item(chunks: queue.Queue[object], stop_event: threading.Event, item: object) -> bool:
+    while not stop_event.is_set():
+        try:
+            chunks.put(item, timeout=_STREAM_QUEUE_TIMEOUT)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _stream_queue_size(fps: int, buffer_seconds: float) -> int:
+    return max(512, int(max(fps, 1) * max(buffer_seconds, 1.0) * 64))
+
+
+def _mpegts_null_packet() -> bytes:
+    return b"\x47\x1f\xff\x10" + (b"\xff" * 184)
 
 
 def _quality_to_stream(quality: str) -> str:

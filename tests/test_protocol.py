@@ -5,7 +5,18 @@ from pyneolink.core.bc import CLASS_MODERN, MSG_BATTERY, MSG_UDP_KEEPALIVE, MSG_
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
-from pyneolink.stream_server import MpegTsMuxer, _buffer_initial_video, _find_camera, _read_until_keyframe
+import queue
+import threading
+
+from pyneolink.stream_server import (
+    MpegTsMuxer,
+    _STREAM_END,
+    _buffer_initial_video,
+    _find_camera,
+    _mpegts_null_packet,
+    _produce_mpegts_chunks,
+    _read_until_keyframe,
+)
 from datetime import datetime
 
 from pyneolink.sd_card import (
@@ -213,6 +224,36 @@ def test_mpegts_muxer_emits_video_and_aac_packets():
     assert chunks
     assert all(len(chunk) == 188 and chunk[0] == 0x47 for chunk in chunks)
     assert any((((chunk[1] & 0x1F) << 8) | chunk[2]) == MpegTsMuxer.AUDIO_PID for chunk in chunks)
+
+
+def test_mpegts_null_packet_is_valid_stuffing_packet():
+    packet = _mpegts_null_packet()
+    assert len(packet) == 188
+    assert packet[0] == 0x47
+    assert (((packet[1] & 0x1F) << 8) | packet[2]) == 0x1FFF
+
+
+def test_mpegts_producer_queues_chunks_and_end_marker():
+    raw = b"00dcH264"
+    raw += (4).to_bytes(4, "little")
+    raw += (4).to_bytes(4, "little")
+    raw += (123).to_bytes(4, "little")
+    raw += (0).to_bytes(4, "little")
+    raw += (456).to_bytes(4, "little")
+    raw += b"\0\0\0\1"
+    raw += b"\0\0\0\0"
+    first_packets = list(MediaParser().feed(raw))
+    chunks = queue.Queue()
+    _produce_mpegts_chunks(chunks, threading.Event(), "H264", 15, [], MediaParser(), first_packets)
+    queued = []
+    while True:
+        item = chunks.get_nowait()
+        if item is _STREAM_END:
+            break
+        queued.append(item)
+    assert queued
+    assert all(isinstance(item, bytes) and len(item) == 188 for item in queued)
+    assert any((((item[1] & 0x1F) << 8) | item[2]) == MpegTsMuxer.VIDEO_PID for item in queued)
 
 
 def test_stream_server_buffers_initial_video_packets():
