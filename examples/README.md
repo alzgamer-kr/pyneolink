@@ -8,6 +8,7 @@ Small library-use examples for PyNeolink.
 - `motion_example.py`: current motion status and event watch mode.
 - `record_example.py`: local MPEG-TS recording for a fixed duration or until Ctrl+C.
 - `voice_example.py`: play an audio file, use the microphone, send a test tone, and guarded siren helper.
+- `settings_example.py`: PIR and IR status plus guarded setting helpers.
 - `stream_example.py`: live MPEG-TS and HLS timeshift HTTP server from a dict config.
 
 Each example keeps camera settings and tuning values as small constants near the top of the file. Edit those values directly or replace them with your own config loader.
@@ -21,9 +22,10 @@ python examples/battery_example.py
 python examples/motion_example.py
 python examples/record_example.py
 python examples/voice_example.py
+python examples/settings_example.py
 python examples/stream_example.py
 ```
 
-`remove_example()`, `format_example()`, `reboot_example()`, and `siren_example()` are guarded. Keep them that way unless you have selected the exact target and intentionally pass the confirmation arguments.
+`remove_example()`, `format_example()`, `reboot_example()`, `siren_example()`, `pir_on_example()`, `pir_off_example()`, `ir_on_example()`, `ir_off_example()`, and `ir_auto_example()` are guarded. Keep them that way unless you have selected the exact target and intentionally pass the confirmation arguments.
 
 Voice file playback requires `ffmpeg` and `ffprobe` in `PATH`. Microphone input requires `sounddevice` and a working local input device.

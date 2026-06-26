@@ -68,6 +68,11 @@ extension = XmlTemplate(
     document=False,
 )
 
+extension_rf = XmlTemplate(
+    '<?xml version="1.0" encoding="UTF-8" ?><Extension version="1.1"><rfId>{rf_id}</rfId></Extension>',
+    document=False,
+)
+
 extension_binary = XmlTemplate(
     '<?xml version="1.0" encoding="UTF-8" ?><Extension version="1.1"><channelId>{channel_id}</channelId><binaryData>1</binaryData><encryptLen>1024</encryptLen></Extension>',
     document=False,

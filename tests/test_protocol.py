@@ -1,4 +1,4 @@
-from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, StreamServer, Voice, config_from_dict
+from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, Settings, StreamServer, Voice, config_from_dict
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
 from pyneolink.sd_card import SdCard
 from pyneolink.core.bc import Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
@@ -7,6 +7,8 @@ from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_x
 from pyneolink.core.const import MSG, MSG_CLASS, payloads
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
 from pyneolink.motion import CameraEvent, CameraEvents, parse_motion_events
+from pyneolink.settings import Ir, Pir
+from pyneolink.cli import CLI
 import queue
 import struct
 import threading
@@ -1043,6 +1045,243 @@ def test_camera_voice_api_is_available():
     assert hasattr(camera.voice(), "play")
     assert hasattr(camera.voice(), "microphone")
     assert hasattr(camera.voice(), "siren")
+
+
+def test_camera_settings_api_is_available():
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    settings = camera.settings()
+
+    assert isinstance(settings, Settings)
+    assert isinstance(settings.ir, Ir)
+    assert isinstance(settings.pir, Pir)
+    assert hasattr(settings.ir, "status")
+    assert hasattr(settings.ir, "on")
+    assert hasattr(settings.ir, "off")
+    assert hasattr(settings.ir, "auto")
+    assert hasattr(settings.pir, "status")
+    assert hasattr(settings.pir, "on")
+    assert hasattr(settings.pir, "off")
+
+
+def test_cli_pir_command_parses_action():
+    args = CLI().parse_args(["pir", "--config", "file.conf", "--camera", "Camera name", "status"])
+
+    assert args.command == "pir"
+    assert args.config == "file.conf"
+    assert args.camera == "Camera name"
+    assert args.action == "status"
+
+
+def test_cli_ir_command_parses_action():
+    args = CLI().parse_args(["ir", "--config", "file.conf", "--camera", "Camera name", "auto"])
+
+    assert args.command == "ir"
+    assert args.config == "file.conf"
+    assert args.camera == "Camera name"
+    assert args.action == "auto"
+
+
+def test_cli_led_command_accepts_auto_alias():
+    args = CLI().parse_args(["led", "--config", "file.conf", "--camera", "Camera name", "auto"])
+
+    assert args.command == "led"
+    assert args.config == "file.conf"
+    assert args.camera == "Camera name"
+    assert args.value == "auto"
+
+
+def test_camera_led_auto_delegates_to_ir_setting():
+    class FakeIr:
+        def __init__(self):
+            self.calls = []
+
+        def status(self):
+            self.calls.append("status")
+            return {"mode": "off"}
+
+        def on(self):
+            self.calls.append("on")
+            return {"mode": "on"}
+
+        def off(self):
+            self.calls.append("off")
+            return {"mode": "off"}
+
+        def auto(self):
+            self.calls.append("auto")
+            return {"mode": "auto"}
+
+    class FakeSettings:
+        def __init__(self, ir):
+            self.ir = ir
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    ir = FakeIr()
+    camera.ensure_connected = lambda: None
+    camera.settings = lambda: FakeSettings(ir)
+
+    assert camera.led()["mode"] == "off"
+    assert camera.led("auto")["mode"] == "auto"
+    assert ir.calls == ["status", "auto"]
+
+
+def test_ir_status_parses_led_state():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 3})()
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            self.msg_id = msg_id
+            self.extension = extension
+            xml = xml_document(
+                '<LedState version="1.1">'
+                "<channelId>3</channelId>"
+                "<ledVersion>2</ledVersion>"
+                "<state>auto</state>"
+                "<lightState>open</lightState>"
+                "</LedState>"
+            )
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+    camera = FakeCamera()
+    status = Ir(camera).status()
+
+    assert camera.msg_id == MSG.GET_LED
+    assert b"<channelId>3</channelId>" in camera.extension
+    assert status["mode"] == "auto"
+    assert status["state"] == "auto"
+    assert status["channel_id"] == 3
+    assert status["light_state"] == "open"
+
+
+def test_ir_auto_updates_state_and_preserves_status_led():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.sent = []
+            self.replies = [
+                xml_document(
+                    '<LedState version="1.1">'
+                    "<channelId>0</channelId>"
+                    "<ledVersion>2</ledVersion>"
+                    "<state>close</state>"
+                    "<lightState>open</lightState>"
+                    "</LedState>"
+                ),
+                xml_document(
+                    '<LedState version="1.1">'
+                    "<channelId>0</channelId>"
+                    "<state>auto</state>"
+                    "<lightState>open</lightState>"
+                    "</LedState>"
+                ),
+            ]
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            xml = self.replies.pop(0)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+        def send(self, msg_id, payload=b"", *, extension=b"", **_kwargs):
+            self.sent.append((msg_id, payload, extension))
+            return 11
+
+        def _recv(self, timeout=None):
+            return Message(Header(MSG.SET_LED, 0, 0, 0, 11, 200, MSG_CLASS.MODERN), payload=b"")
+
+    camera = FakeCamera()
+    status = Ir(camera).auto()
+
+    msg_id, payload, extension = camera.sent[0]
+    assert msg_id == MSG.SET_LED
+    assert b"<channelId>0</channelId>" in extension
+    assert b"<LedState" in payload
+    assert b"<state>auto</state>" in payload
+    assert b"<lightState>open</lightState>" in payload
+    assert b"<ledVersion>" not in payload
+    assert status["mode"] == "auto"
+
+
+def test_pir_status_parses_rf_alarm_cfg():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 2})()
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            self.msg_id = msg_id
+            self.extension = extension
+            xml = xml_document(
+                '<rfAlarmCfg version="1.1">'
+                "<rfID>2</rfID>"
+                "<enable>1</enable>"
+                "<sensitivity>80</sensitivity>"
+                "<sensiValue>3</sensiValue>"
+                "<reduceFalseAlarm>1</reduceFalseAlarm>"
+                "</rfAlarmCfg>"
+            )
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+    camera = FakeCamera()
+    status = Pir(camera).status()
+
+    assert camera.msg_id == MSG.GET_PIR_ALARM
+    assert b"<rfId>2</rfId>" in camera.extension
+    assert status["enabled"] is True
+    assert status["rf_id"] == 2
+    assert status["sensitivity"] == 80
+    assert status["sensi_value"] == 3
+    assert status["reduce_false_alarm"] is True
+
+
+def test_pir_on_updates_enable_and_preserves_payload_shape():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.sent = []
+            self.replies = [
+                xml_document(
+                    '<rfAlarmCfg version="1.1">'
+                    "<rfID>0</rfID>"
+                    "<enable>0</enable>"
+                    "<sensitivity>70</sensitivity>"
+                    "<sensiValue>2</sensiValue>"
+                    "<reduceFalseAlarm>0</reduceFalseAlarm>"
+                    "<timeBlockList><timeBlock><enable>1</enable></timeBlock></timeBlockList>"
+                    "</rfAlarmCfg>"
+                ),
+                xml_document(
+                    '<rfAlarmCfg version="1.1">'
+                    "<rfID>0</rfID>"
+                    "<enable>1</enable>"
+                    "<sensitivity>70</sensitivity>"
+                    "<sensiValue>2</sensiValue>"
+                    "<reduceFalseAlarm>0</reduceFalseAlarm>"
+                    "<timeBlockList><timeBlock><enable>1</enable></timeBlock></timeBlockList>"
+                    "</rfAlarmCfg>"
+                ),
+            ]
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            xml = self.replies.pop(0)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+        def send(self, msg_id, payload=b"", *, extension=b"", **_kwargs):
+            self.sent.append((msg_id, payload, extension))
+            return 9
+
+        def _recv(self, timeout=None):
+            return Message(Header(MSG.SET_PIR_ALARM, 0, 0, 0, 9, 200, MSG_CLASS.MODERN), payload=b"")
+
+    camera = FakeCamera()
+    status = Pir(camera).on()
+
+    msg_id, payload, extension = camera.sent[0]
+    assert msg_id == MSG.SET_PIR_ALARM
+    assert b"<rfId>0</rfId>" in extension
+    assert b"<rfAlarmCfg" in payload
+    assert b"<enable>1</enable>" in payload
+    assert b"<sensitivity>70</sensitivity>" in payload
+    assert b"<timeBlockList>" in payload
+    assert status["enabled"] is True
 
 
 def test_voice_siren_sends_play_audio_payload():

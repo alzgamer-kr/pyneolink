@@ -23,6 +23,8 @@ Neolink and Reolink protocol support are reverse engineered. This project is not
 - Motion status and motion event watch mode
 - Two-way voice/talk from microphone, audio file, or generated test tone
 - Camera siren trigger
+- PIR status and PIR on/off settings
+- IR light status and IR on/off/auto settings
 
 ## Current Limits
 
@@ -31,7 +33,7 @@ Neolink and Reolink protocol support are reverse engineered. This project is not
 - Microphone voice input needs the Python `sounddevice` package and a working local input device.
 - Local stream recording writes MPEG-TS (`.ts`) files, not MP4.
 - SD-card `remove()` and `format()` exist, but are intentionally guarded.
-- PTZ, PIR settings, image settings, alarm schedules, floodlight/IR settings, and Web UI are not implemented yet.
+- PTZ, image settings, alarm schedules, floodlight settings, and Web UI are not implemented yet.
 
 ## Install
 
@@ -95,6 +97,24 @@ Motion:
 ```powershell
 python pyneolink/cli.py motion --camera "Home-Front"
 python pyneolink/cli.py motion --camera "Home-Front" --watch --duration 30
+```
+
+PIR:
+
+```powershell
+python pyneolink/cli.py pir --config config.json --camera "Home-Front" status
+python pyneolink/cli.py pir --config config.json --camera "Home-Front" on
+python pyneolink/cli.py pir --config config.json --camera "Home-Front" off
+```
+
+IR light:
+
+```powershell
+python pyneolink/cli.py ir --config config.json --camera "Home-Front" status
+python pyneolink/cli.py ir --config config.json --camera "Home-Front" on
+python pyneolink/cli.py ir --config config.json --camera "Home-Front" off
+python pyneolink/cli.py ir --config config.json --camera "Home-Front" auto
+python pyneolink/cli.py led --config config.json --camera "Home-Front" auto
 ```
 
 Voice and siren:
@@ -211,6 +231,22 @@ with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as c
     voice.siren()
 ```
 
+Settings and PIR:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    settings = camera.settings()
+    print(settings.pir.status())
+    settings.pir.on()
+    settings.pir.off()
+    print(settings.ir.status())
+    settings.ir.on()
+    settings.ir.off()
+    settings.ir.auto()
+```
+
 Live stream server from a dict:
 
 ```python
@@ -243,6 +279,7 @@ See the `examples/` directory:
 - `motion_example.py`: motion status and watch mode
 - `record_example.py`: duration and manual local stream recording
 - `voice_example.py`: file, microphone, tone, and siren helpers
+- `settings_example.py`: PIR and IR status plus guarded setting helpers
 - `stream_example.py`: live MPEG-TS and HLS timeshift server from a dict config
 
 Each example keeps camera settings as a small local dict near the top of the file. Edit those values directly or replace the dict with your own configuration loader.
