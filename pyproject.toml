@@ -1,20 +1,73 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pyneolink"
-version = "0.1.0"
-description = "Experimental Python implementation of the Reolink/Neolink Baichuan bridge"
-readme = "README.md"
+version = "0.3.0"
+description = "Experimental Python client for Reolink cameras"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "AlzGamer", email = "dev@alzgamer.pro" },
+]
+maintainers = [
+    { name = "AlzGamer", email = "dev@alzgamer.pro" },
+]
+keywords = [
+    "reolink",
+    "neolink",
+    "baichuan",
+    "camera",
+    "p2p",
+    "uid",
+    "ip-camera",
+    "security-camera",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
 dependencies = [
     "cryptography>=42",
 ]
 
 [project.optional-dependencies]
-aes = ["cryptography>=42"]
 voice = ["sounddevice>=0.4"]
+dev = [
+    "build>=1.2",
+    "pytest>=8",
+    "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/alzgamer-kr/pyneolink"
+Repository = "https://github.com/alzgamer-kr/pyneolink"
+Issues = "https://github.com/alzgamer-kr/pyneolink/issues"
+Changelog = "https://github.com/alzgamer-kr/pyneolink/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pyneolink = "pyneolink.cli:main"
 
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["pyneolink*"]
+exclude = ["docs*", "examples*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
