@@ -1,30 +1,32 @@
 from __future__ import annotations
 
-import os
+import sys
 from datetime import date
+from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from pyneolink import Camera
 
 
-if load_dotenv:
-    load_dotenv()
+SETTINGS = {
+    "uuid": "ABCDEF0123456789",
+    "username": "admin",
+    "password": "password",
+}
+
+TARGET_DATE = date.today().isoformat()
+DOWNLOAD_DIR = "downloads"
+DOWNLOAD_QUALITY = "high"
 
 
 def open_camera() -> Camera:
-    return Camera(
-        uuid=os.environ["CAMERA_UID"],
-        username=os.environ.get("CAMERA_USERNAME", "admin"),
-        password=os.environ["CAMERA_PASSWORD"],
-    )
+    return Camera(**SETTINGS)
 
 
-def list_example(target_date: str | None = None) -> list[dict]:
-    target_date = target_date or os.environ.get("PYNEOLINK_DATE", date.today().isoformat())
+def list_example(target_date: str = TARGET_DATE) -> list[dict]:
     with open_camera() as camera:
         sd_card = camera.sd_card()
         files = sd_card.list(start=target_date, end=target_date)
@@ -34,10 +36,7 @@ def list_example(target_date: str | None = None) -> list[dict]:
         return files
 
 
-def download_example(target_date: str | None = None, quality: str = "high") -> None:
-    target_date = target_date or os.environ.get("PYNEOLINK_DATE", date.today().isoformat())
-    quality = os.environ.get("PYNEOLINK_QUALITY", quality)
-    output_dir = os.environ.get("PYNEOLINK_DOWNLOAD_DIR", "downloads")
+def download_example(target_date: str = TARGET_DATE, quality: str = DOWNLOAD_QUALITY, output_dir: str = DOWNLOAD_DIR) -> None:
     with open_camera() as camera:
         sd_card = camera.sd_card()
         files = sd_card.list(start=target_date, end=target_date)
@@ -51,11 +50,10 @@ def download_example(target_date: str | None = None, quality: str = "high") -> N
         print(f"Saved: {saved_path}")
 
 
-def remove_example(target_date: str | None = None, *, confirm: bool = False) -> None:
+def remove_example(target_date: str = TARGET_DATE, *, confirm: bool = False) -> None:
     if not confirm:
         print("Refusing to remove a recording. Pass confirm=True after choosing the exact file.")
         return
-    target_date = target_date or os.environ.get("PYNEOLINK_DATE", date.today().isoformat())
     with open_camera() as camera:
         sd_card = camera.sd_card()
         files = sd_card.list(start=target_date, end=target_date)

@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from .core.const import msg
+
 
 @dataclass
 class CameraConfig:
@@ -29,12 +31,12 @@ class Config:
         cams = self.cameras or []
         if name is None:
             if len(cams) != 1:
-                raise ValueError("Specify --camera when the config has zero or multiple cameras")
+                raise ValueError(msg.Error.SelectOneCamera)
             return cams[0]
         for cam in cams:
             if cam.name == name:
                 return cam
-        raise ValueError(f"No camera named {name!r}")
+        raise ValueError(msg.Error.NoCameraNamed.format(name=name))
 
 
 def load_config(path: str | Path) -> Config:

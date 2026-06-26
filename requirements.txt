@@ -1,2 +1,2 @@
 cryptography>=42
-python-dotenv>=1.0
+sounddevice>=0.4

@@ -4,6 +4,8 @@ import binascii
 import hashlib
 from dataclasses import dataclass
 
+from .const import msg
+
 BC_XML_KEY = bytes([0x1F, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0xFF])
 UDP_XML_KEY = [
     0x1F2D3C4B,
@@ -65,7 +67,7 @@ class Cipher:
 
     def _aes(self, data: bytes, encrypt: bool) -> bytes:
         if not self.key:
-            raise RuntimeError("AES cipher selected without a key")
+            raise RuntimeError(msg.Error.AesWithoutKey)
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher as AesCipher
             from cryptography.hazmat.primitives.ciphers import algorithms
@@ -74,7 +76,7 @@ class Cipher:
             except ImportError:
                 from cryptography.hazmat.primitives.ciphers import modes as cipher_modes
         except ImportError as exc:
-            raise RuntimeError("Install dependencies with: python -m pip install -r requirements.txt") from exc
+            raise RuntimeError(msg.Error.InstallDependencies) from exc
         cipher = AesCipher(algorithms.AES(self.key), cipher_modes.CFB(AES_IV))
         ctx = cipher.encryptor() if encrypt else cipher.decryptor()
         return ctx.update(data) + ctx.finalize()

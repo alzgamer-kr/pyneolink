@@ -9,27 +9,10 @@ import random
 import xml.etree.ElementTree as ET
 
 from .core.bc import (
-    CLASS_FILE_DOWNLOAD,
-    CLASS_MODERN,
-    MSG_DAY_RECORDS,
-    MSG_FILE_DOWNLOAD,
-    MSG_FILE_DOWNLOAD_VIDEO,
-    MSG_FILE_INFO_LIST,
-    MSG_FILE_INFO_LIST_ALT,
-    MSG_FILE_INFO_LIST_ALT2,
-    MSG_FILE_PLAYBACK,
-    MSG_FILE_PLAYBACK_STOP,
-    MSG_FILE_REPLAY,
-    MSG_FILE_REPLAY_STOP,
-    MSG_HDD_INFO,
-    MSG_HDD_INIT,
-    MSG_REPLAY_SEEK,
-    MSG_UDP_KEEPALIVE,
     InvalidMagicError,
     ProtocolError,
-    extension_xml,
-    xml_document,
 )
+from .core.const import MSG, MSG_CLASS, msg as const_msg, payloads
 from .core.media import bcmedia_to_mp4, extract_embedded_mp4, looks_like_bcmedia
 from .core.xmlutil import xml_to_dict
 
@@ -298,10 +281,14 @@ class SdCard:
         if best_mismatch and expected_size is not None:
             label, written = best_mismatch
             raise DownloadSizeMismatch(
-                f"Best attempt {label} downloaded {written} bytes, expected {expected_size} bytes. "
-                f"Tried: {', '.join(self.last_download_attempts)}"
+                const_msg.Error.SdBestAttemptMismatch.format(
+                    label=label,
+                    written=written,
+                    expected_size=expected_size,
+                    attempts=", ".join(self.last_download_attempts),
+                )
             ) from last_error
-        raise ProtocolError(f"SD download failed. Tried: {', '.join(self.last_download_attempts)}") from last_error
+        raise ProtocolError(const_msg.Error.SdDownloadFailed.format(attempts=", ".join(self.last_download_attempts))) from last_error
 
     def _download_with_query(
         self,
@@ -316,7 +303,7 @@ class SdCard:
     ) -> int:
         replay_mode = query.label.startswith("replay5/")
         playback_mode = query.label.startswith("playback143/")
-        msg_class = query.msg_class if query.msg_class is not None else (CLASS_FILE_DOWNLOAD if not replay_mode else CLASS_MODERN)
+        msg_class = query.msg_class if query.msg_class is not None else (MSG_CLASS.FILE_DOWNLOAD if not replay_mode else MSG_CLASS.MODERN)
         msg_num = self.camera.send(query.msg_id, query.payload, msg_class=msg_class, channel_id=query.channel_id, msg_num=query.msg_num)
         accepted_msg_nums = {msg_num}
         chunks = 0
@@ -385,7 +372,7 @@ class SdCard:
                                 f"msg_nums={len(accepted_msg_nums)}"
                             )
                             break
-                        raise TimeoutError("Timed out waiting for download response")
+                        raise TimeoutError(const_msg.Error.SdDownloadTimeout)
                     continue
                 accepted_msg_nums.add(msg.header.msg_num)
                 deadline_misses = 0
@@ -393,7 +380,7 @@ class SdCard:
                 max_payload_len = max(max_payload_len, len(msg.payload))
                 if getattr(msg, "encrypted_len", None) is not None:
                     encrypted_lens.add(msg.encrypted_len)
-                replay_payload = replay_mode and msg.header.msg_id == MSG_FILE_REPLAY and bool(msg.payload)
+                replay_payload = replay_mode and msg.header.msg_id == MSG.FILE_REPLAY and bool(msg.payload)
                 if replay_mode and msg.header.response_code == 201:
                     if msg.payload:
                         payload = _clip_payload(msg.payload, written, effective_expected_size)
@@ -405,7 +392,7 @@ class SdCard:
                     self._last_download_detail = f"playback finished response=300, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
                     break
                 if msg.header.response_code not in (0, 200) and not replay_payload:
-                    raise ProtocolError(_response_detail(msg, f"response {msg.header.response_code}"))
+                    raise ProtocolError(_response_detail(msg, const_msg.Error.Response.format(response_code=msg.header.response_code)))
                 if b"<binaryData>1</binaryData>" in msg.extension:
                     self.camera.binary_msg_nums.add(msg_num)
                     self.camera.binary_msg_nums.add(msg.header.msg_num)
@@ -518,34 +505,18 @@ class SdCard:
         start_time = _parse_time(raw, "startTime")
         stream_type = str(raw.get("streamType") or "mainStream")
         if not name or not start_time:
-            raise ProtocolError("Replay download needs file name and startTime")
+            raise ProtocolError(const_msg.Error.SdReplayNeedsNameAndStart)
         channel = self.camera.config.channel_id
         seq = int(start_time.timestamp())
-        seek_payload = xml_document(
-            "<ReplaySeek version=\"1.1\">"
-            f"<channelId>{channel}</channelId>"
-            f"<seq>{seq}</seq>"
-            f"{_time_xml('seekTime', start_time)}"
-            "</ReplaySeek>"
-        )
-        seek_reply = self.camera.command(MSG_REPLAY_SEEK, seek_payload)
+        seek_payload = payloads.replay_seek.format(channel_id=channel, seq=seq, seek_time=_time_fragment("seekTime", start_time))
+        seek_reply = self.camera.command(MSG.REPLAY_SEEK, seek_payload)
         if seek_reply.header.response_code != 200:
-            raise ProtocolError(f"ReplaySeek failed with response {seek_reply.header.response_code}")
+            raise ProtocolError(const_msg.Error.ReplaySeekFailed.format(response_code=seek_reply.header.response_code))
 
-        detail_payload = xml_document(
-            "<FileInfoList version=\"1.1\">"
-            "<FileInfo>"
-            f"<channelId>{channel}</channelId>"
-            f"<name>{_escape(name)}</name>"
-            "<supportSub>1</supportSub>"
-            "<playSpeed>1</playSpeed>"
-            f"<streamType>{_escape(stream_type)}</streamType>"
-            "</FileInfo>"
-            "</FileInfoList>"
-        )
-        detail_reply = self.camera.command(MSG_FILE_DOWNLOAD, detail_payload)
+        detail_payload = payloads.replay_file_detail.format(channel_id=channel, name=name, stream_type=stream_type)
+        detail_reply = self.camera.command(MSG.FILE_DOWNLOAD, detail_payload)
         if detail_reply.header.response_code != 200:
-            raise ProtocolError(f"Replay file detail failed with response {detail_reply.header.response_code}")
+            raise ProtocolError(const_msg.Error.ReplayFileDetailFailed.format(response_code=detail_reply.header.response_code))
         self._active_replay_name = name
 
     def _stop_replay_download(self, raw: dict) -> None:
@@ -553,22 +524,15 @@ class SdCard:
         self._active_replay_name = None
         if not name:
             return
-        payload = xml_document(
-            "<FileInfoList version=\"1.1\">"
-            "<FileInfo>"
-            f"<channelId>{self.camera.config.channel_id}</channelId>"
-            f"<name>{_escape(name)}</name>"
-            "</FileInfo>"
-            "</FileInfoList>"
-        )
+        payload = payloads.replay_stop.format(channel_id=self.camera.config.channel_id, name=name)
         try:
-            self.camera.command(MSG_FILE_REPLAY_STOP, payload)
+            self.camera.command(MSG.FILE_REPLAY_STOP, payload)
         except Exception:
             pass
 
     def _stop_playback_download(self) -> None:
         try:
-            self.camera.send(MSG_FILE_PLAYBACK_STOP, channel_id=random.randint(64, 255), msg_num=0)
+            self.camera.send(MSG.FILE_PLAYBACK_STOP, channel_id=random.randint(64, 255), msg_num=0)
         except Exception:
             pass
 
@@ -577,7 +541,7 @@ class SdCard:
         if now < next_at:
             return next_at
         try:
-            self.camera.send(MSG_UDP_KEEPALIVE, channel_id=0, msg_num=0)
+            self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
         except Exception:
             return now + 0.75
         return now + 0.75
@@ -592,21 +556,21 @@ class SdCard:
 
     def remove(self, file: dict | SdCardFile | str, *, confirm: bool = False) -> None:
         if not confirm:
-            raise DangerousSdCardOperation("Refusing to remove an SD-card file without confirm=True")
-        raise NotImplementedError("SD-card file removal is not wired yet; list/download are the current safe operations")
+            raise DangerousSdCardOperation(const_msg.Error.SdRemoveNeedsConfirm)
+        raise NotImplementedError(const_msg.Error.SdRemoveNotImplemented)
 
     def format(self, *, confirm: bool = False, confirmation_text: str = "", disk_id: int = 0) -> None:
         if not confirm or confirmation_text != "FORMAT SD CARD":
-            raise DangerousSdCardOperation('Refusing to format the SD card without confirm=True and confirmation_text="FORMAT SD CARD"')
-        payload = xml_document(f"<HddInitList version=\"1.1\"><HddInit><id>{disk_id}</id></HddInit></HddInitList>")
-        reply = self.camera.command(MSG_HDD_INIT, payload)
+            raise DangerousSdCardOperation(const_msg.Error.SdFormatNeedsConfirm)
+        payload = payloads.hdd_init.format(disk_id=disk_id)
+        reply = self.camera.command(MSG.HDD_INIT, payload)
         if reply.header.response_code != 200:
-            raise ProtocolError(f"SD-card format failed with response {reply.header.response_code}")
+            raise ProtocolError(const_msg.Error.SdFormatFailed.format(response_code=reply.header.response_code))
 
     def disk_info(self) -> dict:
-        reply = self.camera.command(MSG_HDD_INFO)
+        reply = self.camera.command(MSG.HDD_INFO)
         if reply.header.response_code != 200:
-            raise ProtocolError(f"SD-card disk info failed with response {reply.header.response_code}")
+            raise ProtocolError(const_msg.Error.SdDiskInfoFailed.format(response_code=reply.header.response_code))
         return xml_to_dict(reply.xml_text or "")
 
     def day_records(self, day: date | str | None = None) -> dict:
@@ -620,7 +584,7 @@ class SdCard:
                 self.last_xml = reply.xml_text
                 return xml_to_dict(reply.xml_text or "")
         self.last_attempts = attempts
-        raise ProtocolError(f"SD-card day records failed. Tried: {', '.join(attempts)}")
+        raise ProtocolError(const_msg.Error.SdDayRecordsFailed.format(attempts=", ".join(attempts)))
 
 
 def _parse_file_list(root: ET.Element | None) -> list[SdCardFile]:
@@ -707,116 +671,79 @@ _FILE_TYPE_CANDIDATES = ("All", "all", "Rec", "rec", "record", "Record", "MD", "
 
 def _file_info_queries(channel: int, start: datetime, end: datetime, stream_type: str, file_type: str) -> list[_FileInfoQuery]:
     msg_ids = [
-        ("replay", MSG_FILE_REPLAY),
-        ("info14", MSG_FILE_INFO_LIST),
-        ("info15", MSG_FILE_INFO_LIST_ALT),
-        ("info16", MSG_FILE_INFO_LIST_ALT2),
+        ("replay", MSG.FILE_REPLAY),
+        ("info14", MSG.FILE_INFO_LIST),
+        ("info15", MSG.FILE_INFO_LIST_ALT),
+        ("info16", MSG.FILE_INFO_LIST_ALT2),
     ]
-    payloads = [
+    variants = [
         *[
             (
                 f"compact-{type_value}",
-                xml_document(
-                    "<FileInfoList version=\"1.1\">"
-                    f"<channelId>{channel}</channelId>"
-                    f"<type>{type_value}</type>"
-                    f"<beginTime>{start:%Y%m%d%H%M%S}</beginTime>"
-                    f"<endTime>{end:%Y%m%d%H%M%S}</endTime>"
-                    "</FileInfoList>"
-                ),
+                payloads.file_info_compact_type.format(channel_id=channel, start=start, end=end, type_value=type_value),
             )
             for type_value in _FILE_TYPE_CANDIDATES
         ],
         *[
             (
                 f"compact-{stream_value}",
-                xml_document(
-                    "<FileInfoList version=\"1.1\">"
-                    f"<channelId>{channel}</channelId>"
-                    f"<streamType>{stream_value}</streamType>"
-                    f"<beginTime>{start:%Y%m%d%H%M%S}</beginTime>"
-                    f"<endTime>{end:%Y%m%d%H%M%S}</endTime>"
-                    "</FileInfoList>"
-                ),
+                payloads.file_info_compact_stream.format(channel_id=channel, start=start, end=end, stream_type=stream_value),
             )
             for stream_value in _STREAM_TYPE_CANDIDATES
         ],
         *[
             (
                 f"compact-{stream_value}-{type_value}",
-                xml_document(
-                    "<FileInfoList version=\"1.1\">"
-                    f"<channelId>{channel}</channelId>"
-                    f"<streamType>{stream_value}</streamType>"
-                    f"<type>{type_value}</type>"
-                    f"<beginTime>{start:%Y%m%d%H%M%S}</beginTime>"
-                    f"<endTime>{end:%Y%m%d%H%M%S}</endTime>"
-                    "</FileInfoList>"
-                ),
+                payloads.file_info_compact_stream_type.format(channel_id=channel, start=start, end=end, stream_type=stream_value, type_value=type_value),
             )
             for stream_value in _STREAM_TYPE_CANDIDATES
             for type_value in _FILE_TYPE_CANDIDATES
         ],
         (
             "nested-basic",
-            xml_document(
-                "<FileInfoList version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<streamType>{stream_type}</streamType>"
-                f"{_time_xml('beginTime', start)}"
-                f"{_time_xml('endTime', end)}"
-                "</FileInfoList>"
+            payloads.file_info_nested.format(
+                channel_id=channel,
+                stream_type=stream_type,
+                start_time=_time_fragment("beginTime", start),
+                end_time=_time_fragment("endTime", end),
             ),
         ),
         (
             "nested-type",
-            xml_document(
-                "<FileInfoList version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<streamType>{stream_type}</streamType>"
-                f"<type>{file_type}</type>"
-                f"{_time_xml('beginTime', start)}"
-                f"{_time_xml('endTime', end)}"
-                "</FileInfoList>"
+            payloads.file_info_nested_type.format(
+                channel_id=channel,
+                stream_type=stream_type,
+                file_type=file_type,
+                start_time=_time_fragment("beginTime", start),
+                end_time=_time_fragment("endTime", end),
             ),
         ),
         (
             "start-end",
-            xml_document(
-                "<FileInfoList version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<streamType>{stream_type}</streamType>"
-                f"{_time_xml('startTime', start)}"
-                f"{_time_xml('endTime', end)}"
-                "</FileInfoList>"
+            payloads.file_info_nested.format(
+                channel_id=channel,
+                stream_type=stream_type,
+                start_time=_time_fragment("startTime", start),
+                end_time=_time_fragment("endTime", end),
             ),
         ),
         (
             "flat",
-            xml_document(
-                "<FileInfoList version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<streamType>{stream_type}</streamType>"
-                f"{_flat_time_xml('begin', start)}"
-                f"{_flat_time_xml('end', end)}"
-                "</FileInfoList>"
+            payloads.file_info_flat.format(
+                channel_id=channel,
+                stream_type=stream_type,
+                begin_time=_flat_time_fragment("begin", start),
+                end_time=_flat_time_fragment("end", end),
             ),
         ),
         (
             "compact",
-            xml_document(
-                "<FileInfoList version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<streamType>{stream_type}</streamType>"
-                f"<beginTime>{start:%Y%m%d%H%M%S}</beginTime>"
-                f"<endTime>{end:%Y%m%d%H%M%S}</endTime>"
-                "</FileInfoList>"
-            ),
+            payloads.file_info_compact_stream.format(channel_id=channel, start=start, end=end, stream_type=stream_type),
         ),
     ]
     queries = []
-    ext = extension_xml(channel_id=channel)
-    for payload_label, payload in payloads:
+    ext = payloads.extension.format(channel_id=channel)
+    for payload_label, payload in variants:
         for msg_label, msg_id in msg_ids:
             queries.append(_FileInfoQuery(f"{msg_label}/{payload_label}", msg_id, payload))
             queries.append(_FileInfoQuery(f"{msg_label}/{payload_label}+ext", msg_id, payload, ext))
@@ -826,16 +753,11 @@ def _file_info_queries(channel: int, start: datetime, end: datetime, stream_type
 def _day_records_range_query(channel: int, start: datetime, end: datetime) -> _FileInfoQuery:
     return _FileInfoQuery(
         "day-records/range",
-        MSG_DAY_RECORDS,
-        xml_document(
-            "<DayRecords version=\"1.1\">"
-            f"{_time_xml('startTime', start)}"
-            f"{_time_xml('endTime', end)}"
-            "<DayRecordList><DayRecord>"
-            "<index>0</index>"
-            f"<channelId>{channel}</channelId>"
-            "</DayRecord></DayRecordList>"
-            "</DayRecords>"
+        MSG.DAY_RECORDS,
+        payloads.day_records_range.format(
+            channel_id=channel,
+            start_time=_time_fragment("startTime", start),
+            end_time=_time_fragment("endTime", end),
         ),
     )
 
@@ -847,57 +769,36 @@ def _handle_queries(channel: int, start: datetime, end: datetime, stream_type: s
         streams.append("subStream")
     queries = []
     for stream in streams:
-        payload = xml_document(
-            "<FileInfoList version=\"1.1\">"
-            "<FileInfo>"
-            f"<channelId>{channel}</channelId>"
-            f"<streamType>{stream}</streamType>"
-            f"<recordType>{record_types}</recordType>"
-            f"{_time_xml('startTime', start)}"
-            f"{_time_xml('endTime', end)}"
-            "</FileInfo>"
-            "</FileInfoList>"
+        payload = payloads.file_handle_request.format(
+            channel_id=channel,
+            stream_type=stream,
+            record_types=record_types,
+            start_time=_time_fragment("startTime", start),
+            end_time=_time_fragment("endTime", end),
         )
-        queries.append(_FileInfoQuery(f"handle/{stream}", MSG_FILE_INFO_LIST, payload))
-        queries.append(_FileInfoQuery(f"handle/{stream}+ext", MSG_FILE_INFO_LIST, payload, extension_xml(channel_id=channel)))
+        queries.append(_FileInfoQuery(f"handle/{stream}", MSG.FILE_INFO_LIST, payload))
+        queries.append(_FileInfoQuery(f"handle/{stream}+ext", MSG.FILE_INFO_LIST, payload, payloads.extension.format(channel_id=channel)))
     return queries
 
 
 def _handle_detail_queries(channel: int, handle: str) -> list[_FileInfoQuery]:
-    payload = xml_document(
-        "<FileInfoList version=\"1.1\">"
-        "<FileInfo>"
-        f"<channelId>{channel}</channelId>"
-        f"<handle>{handle}</handle>"
-        "</FileInfo>"
-        "</FileInfoList>"
-    )
+    payload = payloads.files_for_handle.format(channel_id=channel, handle=handle)
     return [
-        _FileInfoQuery(f"files/handle-{handle}", MSG_FILE_INFO_LIST_ALT, payload),
-        _FileInfoQuery(f"files/handle-{handle}+ext", MSG_FILE_INFO_LIST_ALT, payload, extension_xml(channel_id=channel)),
+        _FileInfoQuery(f"files/handle-{handle}", MSG.FILE_INFO_LIST_ALT, payload),
+        _FileInfoQuery(f"files/handle-{handle}+ext", MSG.FILE_INFO_LIST_ALT, payload, payloads.extension.format(channel_id=channel)),
     ]
 
 
 def _day_record_queries(channel: int, target: date) -> list[_FileInfoQuery]:
-    ext = extension_xml(channel_id=channel)
-    payloads = [
+    ext = payloads.extension.format(channel_id=channel)
+    variants = [
         (
             "nested",
-            xml_document(
-                "<DayRecords version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<year>{target.year}</year><month>{target.month}</month><day>{target.day}</day>"
-                "</DayRecords>"
-            ),
+            payloads.day_record_nested.format(channel_id=channel, target=target),
         ),
         (
             "compact",
-            xml_document(
-                "<DayRecords version=\"1.1\">"
-                f"<channelId>{channel}</channelId>"
-                f"<date>{target:%Y%m%d}</date>"
-                "</DayRecords>"
-            ),
+            payloads.day_record_compact.format(channel_id=channel, target=target),
         ),
         (
             "empty",
@@ -905,9 +806,9 @@ def _day_record_queries(channel: int, target: date) -> list[_FileInfoQuery]:
         ),
     ]
     queries = []
-    for label, payload in payloads:
-        queries.append(_FileInfoQuery(f"day/{target}/{label}", MSG_DAY_RECORDS, payload))
-        queries.append(_FileInfoQuery(f"day/{target}/{label}+ext", MSG_DAY_RECORDS, payload, ext))
+    for label, payload in variants:
+        queries.append(_FileInfoQuery(f"day/{target}/{label}", MSG.DAY_RECORDS, payload))
+        queries.append(_FileInfoQuery(f"day/{target}/{label}+ext", MSG.DAY_RECORDS, payload, ext))
     return queries
 
 
@@ -964,24 +865,12 @@ def _coerce_datetime(value: datetime | date | str | None, *, end_of_day: bool) -
     return datetime.fromisoformat(text)
 
 
-def _time_xml(tag: str, value: datetime) -> str:
-    return (
-        f"<{tag}>"
-        f"<year>{value.year}</year><month>{value.month}</month><day>{value.day}</day>"
-        f"<hour>{value.hour}</hour><minute>{value.minute}</minute><second>{value.second}</second>"
-        f"</{tag}>"
-    )
+def _time_fragment(tag: str, value: datetime) -> payloads.Raw:
+    return payloads.Raw(payloads.time_node.format(tag=tag, value=value))
 
 
-def _flat_time_xml(prefix: str, value: datetime) -> str:
-    return (
-        f"<{prefix}Year>{value.year}</{prefix}Year>"
-        f"<{prefix}Month>{value.month}</{prefix}Month>"
-        f"<{prefix}Day>{value.day}</{prefix}Day>"
-        f"<{prefix}Hour>{value.hour}</{prefix}Hour>"
-        f"<{prefix}Min>{value.minute}</{prefix}Min>"
-        f"<{prefix}Sec>{value.second}</{prefix}Sec>"
-    )
+def _flat_time_fragment(prefix: str, value: datetime) -> payloads.Raw:
+    return payloads.Raw(payloads.flat_time.format(prefix=prefix, value=value))
 
 
 def _parse_time(raw: dict, *keys: str) -> datetime | None:
@@ -1099,7 +988,7 @@ def _sort_recordings(files: list[SdCardFile], sort: str | None) -> None:
         return
     normalized = sort.lower()
     if normalized not in ("asc", "desc"):
-        raise ValueError('sort must be "asc", "desc", or None')
+        raise ValueError(const_msg.Error.SortValue)
     files.sort(key=_recording_sort_key, reverse=normalized == "desc")
 
 
@@ -1131,7 +1020,7 @@ def _download_raw(item: dict) -> dict:
 
 def _normalize_download_stream_type(*, stream_type: str | None, quality: str | None) -> str | None:
     if stream_type and quality:
-        raise ValueError("Use either stream_type or quality, not both")
+        raise ValueError(const_msg.Error.StreamTypeOrQuality)
     value = stream_type or quality
     if value is None:
         return None
@@ -1153,33 +1042,33 @@ def _download_queries(channel: int, file_id: str, raw: dict) -> list[_FileInfoQu
     replay_payload = _replay_download_payload(channel, raw)
     playback_payloads = _playback_download_payloads(channel, raw)
     playback_channel_id = _int_or_none(raw.get("_playbackChannelId")) or 29
-    payloads = [
+    download_payloads = [
         ("id", _download_payload(channel, file_id, raw, mode="id")),
         ("filename", _download_payload(channel, file_id, raw, mode="fileName")),
         ("name", _download_payload(channel, file_id, raw, mode="name")),
         ("full", _download_payload(channel, file_id, raw, mode="full")),
     ]
     queries = []
-    primary_label, primary_payload = payloads[0]
-    full_payload = payloads[-1][1]
+    primary_label, primary_payload = download_payloads[0]
+    full_payload = download_payloads[-1][1]
     if _is_forced_high_quality(raw):
-        queries.append(_FileInfoQuery("download13/full-high/class6482", MSG_FILE_DOWNLOAD, full_payload, msg_class=CLASS_FILE_DOWNLOAD))
-        queries.append(_FileInfoQuery("download8/full-high/class6482", MSG_FILE_DOWNLOAD_VIDEO, full_payload, msg_class=CLASS_FILE_DOWNLOAD))
+        queries.append(_FileInfoQuery("download13/full-high/class6482", MSG.FILE_DOWNLOAD, full_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+        queries.append(_FileInfoQuery("download8/full-high/class6482", MSG.FILE_DOWNLOAD_VIDEO, full_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
         return queries
-    queries.append(_FileInfoQuery(f"download13/{primary_label}/class6482", MSG_FILE_DOWNLOAD, primary_payload, msg_class=CLASS_FILE_DOWNLOAD))
+    queries.append(_FileInfoQuery(f"download13/{primary_label}/class6482", MSG.FILE_DOWNLOAD, primary_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
     for label, payload in playback_payloads:
-        queries.append(_FileInfoQuery(f"playback143/{label}/bcmedia", MSG_FILE_PLAYBACK, payload, msg_class=CLASS_MODERN, channel_id=playback_channel_id, msg_num=0))
-    queries.append(_FileInfoQuery(f"download8/{primary_label}/class6482", MSG_FILE_DOWNLOAD_VIDEO, primary_payload, msg_class=CLASS_FILE_DOWNLOAD))
+        queries.append(_FileInfoQuery(f"playback143/{label}/bcmedia", MSG.FILE_PLAYBACK, payload, msg_class=MSG_CLASS.MODERN, channel_id=playback_channel_id, msg_num=0))
+    queries.append(_FileInfoQuery(f"download8/{primary_label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, primary_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
     if replay_payload:
-        queries.append(_FileInfoQuery("replay5/start/bcmedia", MSG_FILE_REPLAY, replay_payload, msg_class=CLASS_MODERN))
-    for label, payload in payloads:
+        queries.append(_FileInfoQuery("replay5/start/bcmedia", MSG.FILE_REPLAY, replay_payload, msg_class=MSG_CLASS.MODERN))
+    for label, payload in download_payloads:
         if label == primary_label:
             continue
-        queries.append(_FileInfoQuery(f"download13/{label}/class6482", MSG_FILE_DOWNLOAD, payload, msg_class=CLASS_FILE_DOWNLOAD))
-        queries.append(_FileInfoQuery(f"download8/{label}/class6482", MSG_FILE_DOWNLOAD_VIDEO, payload, msg_class=CLASS_FILE_DOWNLOAD))
-    for label, payload in payloads:
-        queries.append(_FileInfoQuery(f"download8/{label}/class6414", MSG_FILE_DOWNLOAD_VIDEO, payload, msg_class=CLASS_MODERN))
-        queries.append(_FileInfoQuery(f"download13/{label}/class6414", MSG_FILE_DOWNLOAD, payload, msg_class=CLASS_MODERN))
+        queries.append(_FileInfoQuery(f"download13/{label}/class6482", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+        queries.append(_FileInfoQuery(f"download8/{label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+    for label, payload in download_payloads:
+        queries.append(_FileInfoQuery(f"download8/{label}/class6414", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.MODERN))
+        queries.append(_FileInfoQuery(f"download13/{label}/class6414", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.MODERN))
     return queries
 
 
@@ -1192,18 +1081,11 @@ def _replay_download_payload(channel: int, raw: dict) -> bytes | None:
     stream_type = raw.get("streamType") or "mainStream"
     if not start_time:
         return None
-    bits = [
-        "<FileInfoList version=\"1.1\">",
-        "<FileInfo>",
-        f"<channelId>{channel}</channelId>",
-        "<supportSub>1</supportSub>",
-        f"<streamType>{_escape(str(stream_type))}</streamType>",
-        _time_xml("startTime", start_time),
-        "<playSpeed>1</playSpeed>",
-        "</FileInfo>",
-        "</FileInfoList>",
-    ]
-    return xml_document("".join(bits))
+    return payloads.replay_download.format(
+        channel_id=channel,
+        stream_type=str(stream_type),
+        start_time=_time_fragment("startTime", start_time),
+    )
 
 
 def _playback_download_payloads(channel: int, raw: dict) -> list[tuple[str, bytes]]:
@@ -1225,57 +1107,42 @@ def _playback_download_payloads(channel: int, raw: dict) -> list[tuple[str, byte
 
 
 def _playback_download_payload(channel: int, start_time: datetime, end_time: datetime, stream_type: str, *, support_sub: int | None = 1) -> bytes:
-    bits = [
-        "<FileInfoList version=\"1.1\">",
-        "<FileInfo>",
-        "<logicChnBitmap>255</logicChnBitmap>",
-        f"<channelId>{channel}</channelId>",
-    ]
-    if support_sub is not None:
-        bits.append(f"<supportSub>{support_sub}</supportSub>")
-    bits.extend(
-        [
-            f"<streamType>{_escape(str(stream_type))}</streamType>",
-            _time_xml("startTime", start_time),
-            _time_xml("endTime", end_time),
-            "</FileInfo>",
-            "</FileInfoList>",
-        ]
+    template = payloads.playback_download_no_support if support_sub is None else payloads.playback_download
+    return template.format(
+        channel_id=channel,
+        stream_type=stream_type,
+        support_sub=support_sub,
+        start_time=_time_fragment("startTime", start_time),
+        end_time=_time_fragment("endTime", end_time),
     )
-    return xml_document("".join(bits))
 
 
 def _download_payload(channel: int, file_id: str, raw: dict, *, mode: str) -> bytes:
     start_time = _parse_time(raw, "startTime")
     end_time = _parse_time(raw, "endTime")
-    bits = [
-        "<FileInfoList version=\"1.1\">",
-        "<FileInfo>",
-        f"<channelId>{channel}</channelId>",
-    ]
+    fields = []
     if mode in ("id", "full"):
-        bits.append(f"<Id>{_escape(file_id)}</Id>")
+        fields.append(payloads.download_id_field.format(file_id=file_id))
     if mode in ("fileName", "full"):
-        bits.append(f"<fileName>{_escape(file_id)}</fileName>")
+        fields.append(payloads.download_file_name_field.format(file_id=file_id))
     if mode in ("name", "full") and raw.get("name"):
-        bits.append(f"<fileName>{_escape(str(raw['name']))}</fileName>")
+        fields.append(payloads.download_name_as_file_name_field.format(name=raw["name"]))
     if mode == "full" and raw.get("name"):
-        bits.append(f"<name>{_escape(str(raw['name']))}</name>")
+        fields.append(payloads.download_name_field.format(name=raw["name"]))
     handle = raw.get("handle")
     if mode == "full" and handle:
-        bits.append(f"<handle>{_escape(str(handle))}</handle>")
+        fields.append(payloads.download_handle_field.format(handle=handle))
     if mode == "full" and raw.get("streamType"):
-        bits.append(f"<streamType>{_escape(str(raw['streamType']))}</streamType>")
+        fields.append(payloads.download_stream_type_field.format(stream_type=raw["streamType"]))
     if mode == "full" and raw.get("fileType"):
-        bits.append(f"<fileType>{_escape(str(raw['fileType']))}</fileType>")
+        fields.append(payloads.download_file_type_field.format(file_type=raw["fileType"]))
     if mode == "full" and raw.get("recordType"):
-        bits.append(f"<recordType>{_escape(str(raw['recordType']))}</recordType>")
+        fields.append(payloads.download_record_type_field.format(record_type=raw["recordType"]))
     if mode == "full" and start_time:
-        bits.append(_time_xml("startTime", start_time))
+        fields.append(_time_fragment("startTime", start_time).value)
     if mode == "full" and end_time:
-        bits.append(_time_xml("endTime", end_time))
-    bits.extend(["</FileInfo>", "</FileInfoList>"])
-    return xml_document("".join(bits))
+        fields.append(_time_fragment("endTime", end_time).value)
+    return payloads.download_file.format(channel_id=channel, fields=payloads.Raw("".join(fields)))
 
 
 def _download_xml_done_text(text: str) -> bool:
@@ -1320,11 +1187,11 @@ def _one_line_preview(value: str | bytes, limit: int = 320) -> str:
 
 
 def _is_download_continuation(msg, query_msg_id: int, download_started: bool) -> bool:
-    if msg.header.msg_id not in (query_msg_id, MSG_FILE_REPLAY, MSG_FILE_DOWNLOAD_VIDEO, MSG_FILE_DOWNLOAD):
+    if msg.header.msg_id not in (query_msg_id, MSG.FILE_REPLAY, MSG.FILE_DOWNLOAD_VIDEO, MSG.FILE_DOWNLOAD):
         return False
     if msg.header.response_code not in (0, 200):
         return False
-    if msg.header.msg_class == CLASS_FILE_DOWNLOAD:
+    if msg.header.msg_class == MSG_CLASS.FILE_DOWNLOAD:
         return True
     if b"<binaryData>1</binaryData>" in msg.extension:
         return True
@@ -1411,16 +1278,6 @@ def _success(query: _FileInfoQuery, xml_text: str | None) -> dict:
     }
 
 
-def _escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&apos;")
-    )
-
-
 def _remove_empty_file(path: Path) -> None:
     try:
         if path.exists() and path.stat().st_size == 0:
@@ -1432,7 +1289,7 @@ def _remove_empty_file(path: Path) -> None:
 def _finalize_download(part_path: Path, output_path: Path, expected_size: int | None) -> Path:
     actual_size = part_path.stat().st_size
     if expected_size is not None and actual_size != expected_size:
-        raise DownloadSizeMismatch(f"Downloaded {actual_size} bytes, expected {expected_size} bytes")
+        raise DownloadSizeMismatch(const_msg.Error.DownloadSizeMismatch.format(actual_size=actual_size, expected_size=expected_size))
     if output_path.suffix.lower() == ".mp4" and looks_like_bcmedia(part_path):
         if output_path.exists():
             output_path.unlink()
@@ -1446,7 +1303,7 @@ def _finalize_download(part_path: Path, output_path: Path, expected_size: int | 
             if raw_path.exists():
                 raw_path.unlink()
             part_path.replace(raw_path)
-            raise ProtocolError(f"Downloaded BCMedia, but MP4 conversion failed; raw stream saved to {raw_path}: {exc}") from exc
+            raise ProtocolError(const_msg.Error.Mp4ConversionFailed.format(raw_path=raw_path, exc=exc)) from exc
         part_path.unlink(missing_ok=True)
         return output_path
     if output_path.exists():
@@ -1469,4 +1326,4 @@ def _safe_label(label: str) -> str:
 
 def _debug(camera: Camera, message: str) -> None:
     if getattr(camera, "debug", False):
-        print(f"[pyneolink] {message}")
+        print(const_msg.Log.Pyneolink.format(message=message))

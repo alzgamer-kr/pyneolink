@@ -10,6 +10,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from .camera import Camera
 from .config import Config, config_from_dict, load_config
+from .core.const import msg
 from .core.media import MediaParser, MediaPacket
 
 
@@ -62,12 +63,12 @@ class StreamServer:
         server.hls_segment_seconds = self.hls_segment_seconds
         server.hls_sessions = {}
         server.hls_sessions_lock = threading.Lock()
-        print(f"Serving camera streams on http://{self.host}:{self.port}/")
+        print(msg.Log.Serving.format(host=self.host, port=self.port))
         display_host = _display_host(self.host)
         if display_host != self.host:
-            print(f"Open locally with http://{display_host}:{self.port}/")
+            print(msg.Log.OpenLocal.format(host=display_host, port=self.port))
         for url in self.urls(host=display_host):
-            print(f"  {url}")
+            print(msg.Log.Url.format(url=url))
         server.serve_forever()
 
 
@@ -123,7 +124,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self._send_index()
             return
         if len(parts) not in (2, 3, 4):
-            self.send_error(404, "Use /{camera}/{quality} or /{camera}/{quality}/hls.m3u8")
+            self.send_error(404, msg.Error.StreamRoute)
             return
         camera_name, quality = parts[0], parts[1]
         try:
@@ -135,18 +136,18 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
         if len(parts) == 3:
             if parts[2] not in ("hls.m3u8", "playlist.m3u8"):
-                self.send_error(404, "Use /{camera}/{quality}/hls.m3u8")
+                self.send_error(404, msg.Error.HlsRoute)
                 return
             self._serve_hls_playlist(camera_config, stream)
             return
         if len(parts) == 4:
             if parts[2] != "segments" or not parts[3].endswith(".ts"):
-                self.send_error(404, "Use /{camera}/{quality}/segments/{sequence}.ts")
+                self.send_error(404, msg.Error.HlsSegmentRoute)
                 return
             try:
                 sequence = int(parts[3][:-3])
             except ValueError:
-                self.send_error(404, "Invalid HLS segment sequence")
+                self.send_error(404, msg.Error.InvalidHlsSegmentSequence)
                 return
             self._serve_hls_segment(camera_config, stream, sequence)
             return
@@ -217,7 +218,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         session = self._hls_session(camera_config, stream)
         segment = session.segment(sequence)
         if segment is None:
-            self.send_error(404, "HLS segment is no longer available")
+            self.send_error(404, msg.Error.HlsSegmentExpired)
             return
         self.send_response(200)
         self.send_header("Content-Type", "video/MP2T")
@@ -459,7 +460,7 @@ class HlsSession:
             payloads = camera.read_stream_payloads(self.stream)
             first_packets, codec, fps = _read_until_keyframe(payloads, parser)
             if codec not in ("H264", "H265"):
-                raise RuntimeError("HLS requires H264 or H265 camera video")
+                raise RuntimeError(msg.Error.HlsRequiresH264OrH265)
             first_packets = _packets_from_first_keyframe(first_packets)
             muxer = MpegTsMuxer(codec, fps=fps)
             current = bytearray()
@@ -587,7 +588,7 @@ def _quality_to_stream(quality: str) -> str:
         return "mainStream"
     if normalized in ("low", "sub", "substream", "fluent"):
         return "subStream"
-    raise ValueError('quality must be "high" or "low"')
+    raise ValueError(msg.Error.InvalidQuality)
 
 
 def _display_host(bind_host: str) -> str:
@@ -604,7 +605,7 @@ def _find_camera(config: Config, name: str):
         if _normalize_camera_name(camera.name) == wanted:
             return camera
     available = ", ".join(camera.name for camera in config.cameras or []) or "none"
-    raise ValueError(f"No camera named {name!r}. Available cameras: {available}")
+    raise ValueError(msg.Error.NoCameraNamedWithAvailable.format(name=name, available=available))
 
 
 def _normalize_camera_name(name: str) -> str:

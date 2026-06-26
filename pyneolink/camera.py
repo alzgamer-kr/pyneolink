@@ -7,30 +7,25 @@ from pathlib import Path
 
 from .config import CameraConfig
 from .core.bc import (
-    CLASS_MODERN,
-    MSG_BATTERY,
-    MSG_GET_LED,
-    MSG_LOGIN,
-    MSG_REBOOT,
-    MSG_SET_LED,
-    MSG_UID,
-    MSG_UDP_KEEPALIVE,
-    MSG_VIDEO,
-    MSG_VIDEO_STOP,
     ProtocolError,
     encode_legacy_login,
     encode_modern,
     find_text,
     recv_message,
-    xml_document,
 )
+from .core.const import MSG, MSG_CLASS, msg, payloads
 from .battery import Battery
 from .core.crypto import Cipher, make_aes_key, md5_hex
 from .core.discovery import local_discover, remote_uid_lookup
 from .core.state import ConnectionState
 from .core.udp_transport import UdpBcConnection, connect_local_direct, connect_relay
+from .motion import Motion
 from .core.xmlutil import xml_to_dict
+from .internal.camera import CameraOnlineLease, redact_sensitive, split_address, stream_params
+from .internal.snapshot import parse_snapshot_info, snapshot_output_path
+from .recorder import StreamRecorder
 from .sd_card import SdCard
+from .voice import Voice
 
 
 class Camera(AbstractContextManager["Camera"]):
@@ -106,13 +101,13 @@ class Camera(AbstractContextManager["Camera"]):
                 return
             except Exception as exc:
                 if self.debug:
-                    print(f"[pyneolink] Local UDP P2P failed: {type(exc).__name__}: {exc}")
+                    print(msg.Log.LocalUdpP2pFailed.format(exc_type=type(exc).__name__, exc=exc))
                 if self.config.discovery == "local":
                     raise
         resolved = self._resolve_address()
         if len(resolved) == 3 and resolved[2] == "udp-relay":
             if not self.config.uid:
-                raise ValueError("UDP relay requires a camera UID")
+                raise ValueError(msg.Error.UdpRelayRequiresUid)
             self.sock = connect_relay(self.config.uid, timeout=max(self.timeout, 20.0), debug=self.debug)
             self.connected_address = self.sock.addr
             if self.state:
@@ -140,7 +135,7 @@ class Camera(AbstractContextManager["Camera"]):
         return self._online_required > 0
 
     def require_online(self):
-        return _CameraOnlineLease(self)
+        return CameraOnlineLease(self)
 
     def keepalive(self, *, timeout: float = 0.05) -> str:
         self.ensure_connected()
@@ -162,7 +157,7 @@ class Camera(AbstractContextManager["Camera"]):
         reply = self._recv()
         nonce = find_text(reply.xml_root, "nonce")
         if not nonce:
-            raise ProtocolError("Camera did not return a login nonce")
+            raise ProtocolError(msg.Error.LoginNonce)
         low = reply.header.response_code & 0xFF
         if low == 0:
             self.cipher = Cipher("none")
@@ -172,14 +167,11 @@ class Camera(AbstractContextManager["Camera"]):
             self.cipher = Cipher("aes", make_aes_key(nonce, self.config.password), full_media=(low == 0x12))
         username = md5_hex(self.config.username + nonce)
         password = md5_hex((self.config.password or "") + nonce)
-        payload = xml_document(
-            f"<LoginUser version=\"1.1\"><userName>{username}</userName><password>{password}</password><userVer>1</userVer></LoginUser>"
-            "<LoginNet version=\"1.1\"><type>LAN</type><udpPort>0</udpPort></LoginNet>"
-        )
-        self._send(encode_modern(MSG_LOGIN, msg_num, payload, channel_id=self.config.channel_id, cipher=self.cipher))
+        payload = payloads.login.format(username=username, password=password)
+        self._send(encode_modern(MSG.LOGIN, msg_num, payload, channel_id=self.config.channel_id, cipher=self.cipher))
         modern = self._recv()
         if modern.header.response_code != 200:
-            raise ProtocolError(f"Login failed with response {modern.header.response_code}")
+            raise ProtocolError(msg.Error.LoginFailed.format(response_code=modern.header.response_code))
         self.login_xml = modern.xml_text or ""
         return self.login_xml
 
@@ -187,7 +179,7 @@ class Camera(AbstractContextManager["Camera"]):
         self.ensure_connected()
         info = xml_to_dict(self.login_xml)
         if not include_sensitive:
-            _redact_sensitive(info)
+            redact_sensitive(info)
         return {
             "name": self.config.name,
             "uid": self.config.uid or self.get_uid(),
@@ -200,24 +192,86 @@ class Camera(AbstractContextManager["Camera"]):
 
     def get_uid(self) -> str | None:
         self.ensure_connected()
-        reply = self.command(MSG_UID)
+        reply = self.command(MSG.UID)
         return find_text(reply.xml_root, "uid") or find_text(reply.xml_root, "UID")
 
     def reboot(self) -> None:
         self.ensure_connected()
-        self.command(MSG_REBOOT)
+        self.command(MSG.REBOOT)
 
     def led(self, value: str | None = None) -> str | None:
         self.ensure_connected()
         if value is None:
-            return self.command(MSG_GET_LED).xml_text
+            return self.command(MSG.GET_LED).xml_text
         value_num = 1 if value.lower() in ("1", "on", "true") else 0
-        payload = xml_document(f"<LedState version=\"1.1\"><channelId>{self.config.channel_id}</channelId><state>{value_num}</state></LedState>")
-        self.command(MSG_SET_LED, payload)
+        payload = payloads.led_state.format(channel_id=self.config.channel_id, state=value_num)
+        self.command(MSG.SET_LED, payload)
         return None
+
+    def snapshot(self, *, out: str | Path | None = None, stream_type: str = "main") -> bytes | Path:
+        self.ensure_connected()
+        msg_num = self.send(
+            MSG.SNAP,
+            payloads.snapshot.format(channel_id=self.config.channel_id, stream_type=stream_type),
+            extension=payloads.extension.format(channel_id=self.config.channel_id),
+        )
+
+        info = self._recv_matching(MSG.SNAP, msg_num)
+        if info.header.response_code != 200:
+            raise ProtocolError(msg.Error.SnapshotInfoFailed.format(response_code=info.header.response_code))
+
+        file_name, expected_size = parse_snapshot_info(info.xml_root)
+        data = bytearray()
+        deadline = time.monotonic() + self.timeout
+        while True:
+            reply = self._recv()
+            if reply.header.msg_id != MSG.SNAP:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=MSG.SNAP, msg_num=msg_num))
+                continue
+            if reply.payload:
+                data.extend(reply.payload)
+            if reply.header.response_code == 201:
+                break
+            if reply.header.response_code != 200:
+                raise ProtocolError(msg.Error.SnapshotDataFailed.format(response_code=reply.header.response_code))
+            deadline = time.monotonic() + self.timeout
+
+        if expected_size is not None and len(data) != expected_size:
+            raise ProtocolError(msg.Error.SnapshotSizeMismatch.format(actual_size=len(data), expected_size=expected_size))
+
+        image = bytes(data)
+        if out is None:
+            return image
+        path = snapshot_output_path(out, file_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(image)
+        return path
+
+    def record(
+        self,
+        *,
+        out: str | Path,
+        duration: float | None = None,
+        stream: str = "mainStream",
+    ) -> StreamRecorder | Path:
+        self.ensure_connected()
+        recorder = StreamRecorder(self, out=out, stream=stream, duration=duration).start()
+        if duration is not None:
+            return recorder.wait()
+        return recorder
 
     def battery(self) -> Battery:
         return Battery(self)
+
+    def motion(self, *, channel_id: int | None = None) -> Motion:
+        return Motion(self, channel_id=channel_id)
+
+    def motion_status(self, *, timeout: float = 3.0, channel_id: int | None = None) -> dict:
+        return self.motion(channel_id=channel_id).status(timeout=timeout)
+
+    def voice(self) -> Voice:
+        return Voice(self)
 
     def battery_xml(self, *, mode: str = "reconnect") -> str | None:
         return self.battery().raw(mode=mode)
@@ -231,20 +285,26 @@ class Camera(AbstractContextManager["Camera"]):
     def command(self, msg_id: int, payload: bytes = b"", *, extension: bytes = b""):
         self.ensure_connected()
         msg_num = self.send(msg_id, payload, extension=extension)
+        return self._recv_matching(msg_id, msg_num)
+
+    def _recv_matching(self, msg_id: int, msg_num: int):
         deadline = time.monotonic() + self.timeout
         while True:
-            msg = self._recv()
-            if msg.header.msg_num == msg_num:
+            reply_msg = self._recv()
+            if reply_msg.header.msg_num == msg_num:
                 if hasattr(self.sock, "discard_sent"):
                     self.sock.discard_sent()
-                return msg
+                return reply_msg
             if self.debug:
                 print(
-                    f"[pyneolink] Ignoring unmatched message msg_id={msg.header.msg_id} "
-                    f"msg_num={msg.header.msg_num}; waiting for msg_num={msg_num}"
+                    msg.Log.IgnoringUnmatchedMessage.format(
+                        msg_id=reply_msg.header.msg_id,
+                        msg_num=reply_msg.header.msg_num,
+                        expected_msg_num=msg_num,
+                    )
                 )
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Timed out waiting for response to message {msg_id} #{msg_num}")
+                raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=msg_id, msg_num=msg_num))
 
     def send(
         self,
@@ -253,7 +313,7 @@ class Camera(AbstractContextManager["Camera"]):
         *,
         extension: bytes = b"",
         binary_reply: bool = False,
-        msg_class: int = CLASS_MODERN,
+        msg_class: int = MSG_CLASS.MODERN,
         channel_id: int | None = None,
         msg_num: int | None = None,
         stream_type: int = 0,
@@ -279,13 +339,11 @@ class Camera(AbstractContextManager["Camera"]):
     def start_stream(self, stream: str = "mainStream"):
         self.ensure_connected()
         msg_num = self._next_msg()
-        stream_name, stream_code, handle = _stream_params(stream)
-        payload = xml_document(
-            f"<Preview version=\"1.1\"><channelId>{self.config.channel_id}</channelId><handle>{handle}</handle><streamType>{stream_name}</streamType></Preview>"
-        )
+        stream_name, stream_code, handle = stream_params(stream)
+        payload = payloads.preview_start.format(channel_id=self.config.channel_id, handle=handle, stream_type=stream_name)
         self._send(
             encode_modern(
-                MSG_VIDEO,
+                MSG.VIDEO,
                 msg_num,
                 payload,
                 channel_id=self.config.channel_id,
@@ -295,26 +353,24 @@ class Camera(AbstractContextManager["Camera"]):
         )
         deadline = time.monotonic() + self.timeout
         while True:
-            msg = self._recv()
-            if msg.header.msg_id == MSG_VIDEO and msg.header.msg_num == msg_num:
-                if msg.header.response_code != 200:
-                    raise ProtocolError(f"Stream start failed with response {msg.header.response_code}")
+            reply_msg = self._recv()
+            if reply_msg.header.msg_id == MSG.VIDEO and reply_msg.header.msg_num == msg_num:
+                if reply_msg.header.response_code != 200:
+                    raise ProtocolError(msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code))
                 self.binary_msg_nums.add(msg_num)
                 return msg_num
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Timed out waiting for stream start response #{msg_num}")
+                raise TimeoutError(msg.Error.StreamStartTimeout.format(msg_num=msg_num))
 
     def stop_stream(self, stream: str = "mainStream", msg_num: int | None = None) -> None:
         self.ensure_connected()
-        _stream_name, stream_code, handle = _stream_params(stream)
+        _stream_name, stream_code, handle = stream_params(stream)
         sent_msg_num = self._next_msg() if msg_num is None else msg_num
-        payload = xml_document(
-            f"<Preview version=\"1.1\"><channelId>{self.config.channel_id}</channelId><handle>{handle}</handle></Preview>"
-        )
+        payload = payloads.preview_stop.format(channel_id=self.config.channel_id, handle=handle)
         self.binary_msg_nums.discard(sent_msg_num)
         self._send(
             encode_modern(
-                MSG_VIDEO_STOP,
+                MSG.VIDEO_STOP,
                 sent_msg_num,
                 payload,
                 channel_id=self.config.channel_id,
@@ -325,13 +381,13 @@ class Camera(AbstractContextManager["Camera"]):
         deadline = time.monotonic() + min(self.timeout, 2.0)
         while time.monotonic() <= deadline:
             try:
-                msg = self._recv(timeout=0.5)
+                reply_msg = self._recv(timeout=0.5)
             except TimeoutError:
                 return
-            if msg.header.msg_id == MSG_VIDEO_STOP and msg.header.msg_num == sent_msg_num:
-                if msg.header.response_code not in (0, 200):
+            if reply_msg.header.msg_id == MSG.VIDEO_STOP and reply_msg.header.msg_num == sent_msg_num:
+                if reply_msg.header.response_code not in (0, 200):
                     if self.debug:
-                        print(f"[pyneolink] Stream stop returned {msg.header.response_code}; ignoring")
+                        print(msg.Log.StreamStopReturned.format(response_code=reply_msg.header.response_code))
                     return
                 return
 
@@ -343,30 +399,30 @@ class Camera(AbstractContextManager["Camera"]):
                 while True:
                     now = time.monotonic()
                     if now >= next_keepalive_at:
-                        self.send(MSG_UDP_KEEPALIVE, channel_id=0, msg_num=0)
+                        self.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
                         next_keepalive_at = now + 0.75
                     try:
                         msg = self._recv(timeout=1.0)
                     except TimeoutError:
                         continue
-                    if msg.header.msg_id == MSG_VIDEO and msg.header.msg_num == msg_num and msg.payload:
+                    if msg.header.msg_id == MSG.VIDEO and msg.header.msg_num == msg_num and msg.payload:
                         yield msg.payload
             finally:
                 try:
                     self.stop_stream(stream, msg_num)
                 except Exception as exc:
                     if self.debug:
-                        print(f"[pyneolink] Stream stop failed during close: {type(exc).__name__}: {exc}")
+                        print(msg.Log.StreamStopCloseFailed.format(exc_type=type(exc).__name__, exc=exc))
 
     def _resolve_address(self) -> tuple[str, int] | tuple[str, int, str]:
         if self.config.address:
-            return _split_address(self.config.address)
+            return split_address(self.config.address)
         if self.config.cached_address:
-            return _split_address(self.config.cached_address)
+            return split_address(self.config.cached_address)
         if self.state:
             cached = self.state.get_address(self.config.name, transport="tcp")
             if cached:
-                return _split_address(cached)
+                return split_address(cached)
         if self.config.uid:
             if self.config.discovery in ("relay", "cellular"):
                 return "", 0, "udp-relay"
@@ -381,7 +437,7 @@ class Camera(AbstractContextManager["Camera"]):
                     host, port = tcp_hits[0].address
                     return host, port if port else 9000
                 return "", 0, "udp-relay"
-        raise ValueError("Camera needs address, cached_address, or a UID reachable by discovery")
+        raise ValueError(msg.Error.CameraAddressRequired)
 
     def ensure_connected(self) -> None:
         if self.sock is None:
@@ -395,26 +451,26 @@ class Camera(AbstractContextManager["Camera"]):
 
     def _send(self, data: bytes) -> None:
         if self.sock is None:
-            raise RuntimeError("Camera is not connected")
+            raise RuntimeError(msg.Error.CameraNotConnected)
         self.sock.sendall(data)
 
     def _recv(self, timeout: float | None = None):
         if self.sock is None:
-            raise RuntimeError("Camera is not connected")
+            raise RuntimeError(msg.Error.CameraNotConnected)
         msg = recv_message(self.sock, self.cipher, timeout=self.timeout if timeout is None else timeout, binary_msg_nums=self.binary_msg_nums)
-        if msg.header.msg_id == MSG_UDP_KEEPALIVE:
+        if msg.header.msg_id == MSG.UDP_KEEPALIVE:
             self._reply_keepalive(msg)
         return msg
 
-    def _reply_keepalive(self, msg) -> None:
+    def _reply_keepalive(self, keepalive_msg) -> None:
         if self.sock is None:
             return
         try:
             data = encode_modern(
-                MSG_UDP_KEEPALIVE,
-                msg.header.msg_num,
-                channel_id=msg.header.channel_id,
-                stream_type=msg.header.stream_type,
+                MSG.UDP_KEEPALIVE,
+                keepalive_msg.header.msg_num,
+                channel_id=keepalive_msg.header.channel_id,
+                stream_type=keepalive_msg.header.stream_type,
                 response_code=200,
                 cipher=self.cipher,
             )
@@ -424,64 +480,4 @@ class Camera(AbstractContextManager["Camera"]):
                 self._send(data)
         except Exception as exc:
             if self.debug:
-                print(f"[pyneolink] Failed to reply to stream keepalive: {type(exc).__name__}: {exc}")
-
-
-def _split_address(address: str) -> tuple[str, int]:
-    if ":" in address:
-        host, port = address.rsplit(":", 1)
-        return host, int(port)
-    return address, 9000
-
-
-class _CameraOnlineLease:
-    def __init__(self, camera: Camera) -> None:
-        self.camera = camera
-        self.active = False
-
-    def __enter__(self) -> Camera:
-        if not self.active:
-            self.camera._online_required += 1
-            self.active = True
-        return self.camera
-
-    def __exit__(self, *exc: object) -> None:
-        if self.active:
-            self.camera._online_required = max(0, self.camera._online_required - 1)
-            self.active = False
-
-
-def _stream_params(stream: str) -> tuple[str, int, int]:
-    normalized = stream.strip()
-    aliases = {
-        "high": "mainStream",
-        "main": "mainStream",
-        "mainstream": "mainStream",
-        "clear": "mainStream",
-        "low": "subStream",
-        "sub": "subStream",
-        "substream": "subStream",
-        "fluent": "subStream",
-        "extern": "externStream",
-        "externstream": "externStream",
-    }
-    stream_name = aliases.get(normalized.lower(), normalized)
-    if stream_name == "mainStream":
-        return stream_name, 0, 0
-    if stream_name == "subStream":
-        return stream_name, 1, 256
-    if stream_name == "externStream":
-        return stream_name, 0, 1024
-    raise ValueError('stream must be "mainStream", "subStream", "externStream", "high", or "low"')
-
-
-def _redact_sensitive(value: object) -> None:
-    if isinstance(value, dict):
-        for key in list(value.keys()):
-            if key.lower() in {"secretcode", "bootsecret", "password"}:
-                value[key] = "***"
-            else:
-                _redact_sensitive(value[key])
-    elif isinstance(value, list):
-        for item in value:
-            _redact_sensitive(item)
+                print(msg.Log.StreamKeepaliveReplyFailed.format(exc_type=type(exc).__name__, exc=exc))
