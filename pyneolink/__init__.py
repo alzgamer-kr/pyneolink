@@ -7,6 +7,7 @@ from .core.const import EVENTS
 from .motion import CameraEvent, CameraEvents, Motion, parse_motion_events
 from .recorder import StreamRecorder
 from .sd_card import DangerousSdCardOperation, DownloadSizeMismatch, SdCard, SdCardFile
+from .settings import Ir, Pir, Settings
 from .stream_server import StreamServer, serve_streams
 from .voice import TalkConfig, Voice
 
@@ -24,6 +25,9 @@ __all__ = [
     "DownloadSizeMismatch",
     "SdCard",
     "SdCardFile",
+    "Ir",
+    "Pir",
+    "Settings",
     "StreamServer",
     "StreamRecorder",
     "EVENTS",

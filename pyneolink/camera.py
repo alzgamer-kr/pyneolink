@@ -25,6 +25,7 @@ from .internal.camera import CameraOnlineLease, redact_sensitive, split_address,
 from .internal.snapshot import parse_snapshot_info, snapshot_output_path
 from .recorder import StreamRecorder
 from .sd_card import SdCard
+from .settings import Settings
 from .voice import Voice
 
 
@@ -199,14 +200,18 @@ class Camera(AbstractContextManager["Camera"]):
         self.ensure_connected()
         self.command(MSG.REBOOT)
 
-    def led(self, value: str | None = None) -> str | None:
+    def led(self, value: str | None = None) -> dict:
         self.ensure_connected()
         if value is None:
-            return self.command(MSG.GET_LED).xml_text
-        value_num = 1 if value.lower() in ("1", "on", "true") else 0
-        payload = payloads.led_state.format(channel_id=self.config.channel_id, state=value_num)
-        self.command(MSG.SET_LED, payload)
-        return None
+            return self.settings().ir.status()
+        normalized = value.lower()
+        if normalized in ("1", "on", "true", "open"):
+            return self.settings().ir.on()
+        if normalized in ("0", "off", "false", "close"):
+            return self.settings().ir.off()
+        if normalized == "auto":
+            return self.settings().ir.auto()
+        raise ValueError(msg.Error.IrModeValue)
 
     def snapshot(self, *, out: str | Path | None = None, stream_type: str = "main") -> bytes | Path:
         self.ensure_connected()
@@ -272,6 +277,9 @@ class Camera(AbstractContextManager["Camera"]):
 
     def voice(self) -> Voice:
         return Voice(self)
+
+    def settings(self) -> Settings:
+        return Settings(self)
 
     def battery_xml(self, *, mode: str = "reconnect") -> str | None:
         return self.battery().raw(mode=mode)

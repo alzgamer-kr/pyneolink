@@ -48,6 +48,8 @@ class CLI:
             "events": self.run_camera_command,
             "motion": self.run_camera_command,
             "voice": self.run_camera_command,
+            "pir": self.run_camera_command,
+            "ir": self.run_camera_command,
             "raw-stream": self.run_camera_command,
         }
         self.camera_handlers: dict[str, CameraCommandHandler] = {
@@ -62,6 +64,8 @@ class CLI:
             "events": self.camera_events,
             "motion": self.camera_motion,
             "voice": self.camera_voice,
+            "pir": self.camera_pir,
+            "ir": self.camera_ir,
             "raw-stream": self.camera_raw_stream,
         }
 
@@ -118,7 +122,7 @@ class CLI:
         led = subparsers.add_parser("led")
         self.add_common_options(led)
         led.add_argument("--camera")
-        led.add_argument("value", nargs="?", choices=["on", "off"])
+        led.add_argument("value", nargs="?", choices=["on", "off", "auto"])
 
         snapshot = subparsers.add_parser("snapshot")
         self.add_common_options(snapshot)
@@ -157,6 +161,16 @@ class CLI:
         voice.add_argument("--volume", type=float, default=1.0)
         voice.add_argument("--voice-codec", choices=["python", "ffmpeg"], default="python", help="ADPCM encoder for --file")
         voice.add_argument("--voice-wait-ack", action="store_true", help="Wait for every talk packet acknowledgement")
+
+        pir = subparsers.add_parser("pir")
+        self.add_common_options(pir)
+        pir.add_argument("--camera")
+        pir.add_argument("action", choices=["status", "on", "off"])
+
+        ir = subparsers.add_parser("ir")
+        self.add_common_options(ir)
+        ir.add_argument("--camera")
+        ir.add_argument("action", choices=["status", "on", "off", "auto"])
 
         discover = subparsers.add_parser("discover")
         self.add_common_options(discover)
@@ -273,7 +287,7 @@ class CLI:
         return 0
 
     def camera_led(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
-        print(cam.led(args.value) or "")
+        print(json.dumps(cam.led(args.value), indent=2, ensure_ascii=False))
         return 0
 
     def camera_snapshot(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
@@ -359,6 +373,27 @@ class CLI:
                     on_ready=lambda _config: print(msg.Log.VoicePlaying.format(input=f"{args.tone:g} Hz tone"), flush=True),
                 )
         print(msg.Log.VoiceSent)
+        return 0
+
+    def camera_pir(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
+        pir = cam.settings().pir
+        actions: dict[str, Callable[[], dict]] = {
+            "status": pir.status,
+            "on": pir.on,
+            "off": pir.off,
+        }
+        print(json.dumps(actions[args.action](), indent=2, ensure_ascii=False))
+        return 0
+
+    def camera_ir(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
+        ir = cam.settings().ir
+        actions: dict[str, Callable[[], dict]] = {
+            "status": ir.status,
+            "on": ir.on,
+            "off": ir.off,
+            "auto": ir.auto,
+        }
+        print(json.dumps(actions[args.action](), indent=2, ensure_ascii=False))
         return 0
 
     def camera_raw_stream(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:

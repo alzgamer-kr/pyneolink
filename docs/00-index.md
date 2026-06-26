@@ -12,6 +12,6 @@ Recommended reading order:
 6. [05-internal-helpers.md](05-internal-helpers.md): helper modules used to keep public modules smaller.
 7. [06-sd-card-downloads.md](06-sd-card-downloads.md): SD-card file listing, pagination, and download strategies.
 8. [07-media-and-streaming.md](07-media-and-streaming.md): BCMedia parsing, MPEG-TS, HLS timeshift, snapshots, and local recording.
-9. [08-motion-voice-and-controls.md](08-motion-voice-and-controls.md): motion status/watch, two-way voice, siren, and basic camera controls.
+9. [08-motion-voice-and-controls.md](08-motion-voice-and-controls.md): motion status/watch, two-way voice, siren, PIR, IR, and basic camera controls.
 
 This is not official Reolink documentation. It describes the current PyNeolink implementation and the reverse-engineered behavior it relies on.
