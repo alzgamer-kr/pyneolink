@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .const import msg
+
 
 @dataclass
 class MediaPacket:
@@ -105,7 +107,7 @@ def extract_video_stream(source: str | Path, destination: str | Path) -> tuple[s
                     dst.write(packet.data)
                     frames += 1
     if not codec or not frames:
-        raise ValueError("BCMedia stream did not contain readable video frames")
+        raise ValueError(msg.Error.NoReadableVideoFrames)
     return codec, fps, frames
 
 
@@ -138,7 +140,7 @@ def bcmedia_to_mp4(source: str | Path, destination: str | Path) -> None:
             detail = result.stderr.strip() or result.stdout.strip() or f"ffmpeg exited with {result.returncode}"
             raise RuntimeError(detail)
         if not destination_path.exists() or destination_path.stat().st_size == 0:
-            raise RuntimeError(f"ffmpeg created no output from {frames} {codec} frames")
+            raise RuntimeError(msg.Error.FfmpegNoOutput.format(frames=frames, codec=codec))
     finally:
         raw_path.unlink(missing_ok=True)
 

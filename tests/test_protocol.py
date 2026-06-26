@@ -1,12 +1,16 @@
-from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, StreamServer, config_from_dict
+from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, StreamServer, Voice, config_from_dict
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
 from pyneolink.sd_card import SdCard
-from pyneolink.core.bc import CLASS_MODERN, MSG_BATTERY, MSG_UDP_KEEPALIVE, MSG_VIDEO, MSG_VIDEO_STOP, Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
+from pyneolink.core.bc import Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
+from pyneolink.core.const import MSG, MSG_CLASS, payloads
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
+from pyneolink.motion import CameraEvent, CameraEvents, parse_motion_events
 import queue
+import struct
 import threading
+from pathlib import Path
 
 from pyneolink.stream_server import (
     HlsSegment,
@@ -31,6 +35,15 @@ from pyneolink.sd_card import (
     _xml_file_size,
 )
 from pyneolink.core.udp_transport import UdpBcConnection, decode_udp_packet, encode_udp_ack
+from pyneolink.recorder import StreamRecorder
+from pyneolink.internal.voice import (
+    ImaAdpcmEncoder,
+    adpcm_blocks_from_tone,
+    adpcm_level_hint,
+    audio_info_from_ffprobe,
+    parse_talk_config,
+    serialize_bcmedia_adpcm,
+)
 
 
 def test_bc_xor_roundtrip():
@@ -73,11 +86,21 @@ def test_full_aes_binary_keeps_raw_tail_after_encrypt_len():
     raw_tail = b"raw-media-tail"
     ext_raw = cipher.encrypt(0, extension)
     payload_raw = cipher.encrypt(0, prefix) + raw_tail
-    header = Header(8, len(ext_raw) + len(payload_raw), 0, 0, 7, 200, CLASS_MODERN, len(ext_raw))
+    header = Header(8, len(ext_raw) + len(payload_raw), 0, 0, 7, 200, MSG_CLASS.MODERN, len(ext_raw))
     msg = recv_message(FakeSocket(header.pack() + ext_raw + payload_raw), cipher)
     assert msg.payload == prefix + raw_tail
     assert msg.raw_payload_len == len(payload_raw)
     assert msg.encrypted_len == 4
+
+
+def test_outgoing_binary_payload_is_not_encrypted():
+    extension = payloads.extension_binary_data.format(channel_id=0)
+    payload = b"raw-talk-data"
+    packet = encode_modern(MSG.TALK, 7, payload, extension=extension, cipher=Cipher("bc"))
+    header = Header.unpack_from(packet[:24])
+    body = packet[24:]
+    assert body[header.payload_offset :] == payload
+    assert b"raw-talk-data" in packet
 
 
 def test_replay_timestamp_header_has_payload_offset():
@@ -303,24 +326,24 @@ def test_stream_server_buffers_initial_video_packets():
 
 
 def test_stream_server_camera_lookup_is_whitespace_tolerant():
-    config = Config(cameras=[CameraConfig(name="Scherbaka 41 - Front")])
-    assert _find_camera(config, "  scherbaka   41 - front  ").name == "Scherbaka 41 - Front"
+    config = Config(cameras=[CameraConfig(name="Home-Front")])
+    assert _find_camera(config, "  home-front  ").name == "Home-Front"
     try:
-        _find_camera(config, "Shiferna 43 - Front")
+        _find_camera(config, "Dorway")
     except ValueError as exc:
-        assert "Available cameras: Scherbaka 41 - Front" in str(exc)
+        assert "Available cameras: Home-Front" in str(exc)
     else:
         raise AssertionError("unknown camera should raise")
 
 
 def test_public_stream_server_builds_encoded_urls():
-    config = Config(bind="0.0.0.0", bind_port=8554, cameras=[CameraConfig(name="Scherbaka 41 - Front")])
+    config = Config(bind="0.0.0.0", bind_port=8554, cameras=[CameraConfig(name="Home-Front")])
     server = StreamServer(config)
     assert server.urls() == [
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high",
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low",
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high/hls.m3u8",
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low/hls.m3u8",
+        "http://127.0.0.1:8554/Home-Front/high",
+        "http://127.0.0.1:8554/Home-Front/low",
+        "http://127.0.0.1:8554/Home-Front/high/hls.m3u8",
+        "http://127.0.0.1:8554/Home-Front/low/hls.m3u8",
     ]
 
 
@@ -329,15 +352,15 @@ def test_stream_server_accepts_dict_config():
         {
             "bind": "0.0.0.0",
             "bind_port": 8554,
-            "cameras": [{"name": "Scherbaka 41 - Front", "uid": "abc"}],
+            "cameras": [{"name": "Home-Front", "uid": "abc"}],
         }
     )
-    assert server.config.camera("Scherbaka 41 - Front").uid == "abc"
+    assert server.config.camera("Home-Front").uid == "abc"
     assert server.urls() == [
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high",
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low",
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high/hls.m3u8",
-        "http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low/hls.m3u8",
+        "http://127.0.0.1:8554/Home-Front/high",
+        "http://127.0.0.1:8554/Home-Front/low",
+        "http://127.0.0.1:8554/Home-Front/high/hls.m3u8",
+        "http://127.0.0.1:8554/Home-Front/low/hls.m3u8",
     ]
 
 
@@ -458,8 +481,8 @@ def test_hash_shapes():
 
 
 def test_public_camera_constructor_accepts_uuid_alias():
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
-    assert camera.config.uid == "95270006R5KDROXI"
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    assert camera.config.uid == "ABCDEF0123456789"
     assert camera.config.password == "secret"
 
 
@@ -518,8 +541,8 @@ def test_camera_battery_info_requests_channel_extension():
         "<batteryPercent>64</batteryPercent>"
         "</BatteryInfo>"
     )
-    reply = encode_modern(MSG_BATTERY, 1, payload, response_code=200, cipher=Cipher("none"))
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", channel_id=2, state_path=None)
+    reply = encode_modern(MSG.BATTERY, 1, payload, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", channel_id=2, state_path=None)
     camera.sock = FakeSocket(reply)
     camera.login_xml = "<logged-in />"
     camera.cipher = Cipher("none")
@@ -529,7 +552,7 @@ def test_camera_battery_info_requests_channel_extension():
     sent = bytes(camera.sock.sent)
     header = Header.unpack_from(sent[:24])
     extension = sent[24 : 24 + (header.payload_offset or 0)]
-    assert header.msg_id == MSG_BATTERY
+    assert header.msg_id == MSG.BATTERY
     assert b"<channelId>2</channelId>" in extension
     assert camera.sock.discarded == 1
 
@@ -554,7 +577,7 @@ def test_battery_refresh_reconnects_after_timeout():
                 "<batteryPercent>99</batteryPercent>"
                 "</BatteryInfo>"
             )
-            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
         def reconnect(self):
             self.reconnects += 1
@@ -590,7 +613,7 @@ def test_battery_reconnect_mode_closes_only_when_not_online_required():
                 "<batteryPercent>98</batteryPercent>"
                 "</BatteryInfo>"
             )
-            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
         def close(self):
             self.closed += 1
@@ -642,8 +665,8 @@ def test_camera_start_stream_uses_neolink_substream_preview():
             del self.reply[:size]
             return chunk
 
-    reply = encode_modern(MSG_VIDEO, 1, response_code=200, cipher=Cipher("none"))
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    reply = encode_modern(MSG.VIDEO, 1, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     camera.sock = FakeSocket(reply)
     camera.login_xml = "<logged-in />"
     camera.cipher = Cipher("none")
@@ -652,7 +675,7 @@ def test_camera_start_stream_uses_neolink_substream_preview():
     header = Header.unpack_from(sent[:24])
     payload = sent[24:]
     assert msg_num == 1
-    assert header.msg_id == MSG_VIDEO
+    assert header.msg_id == MSG.VIDEO
     assert header.stream_type == 1
     assert b"<handle>256</handle>" in payload
     assert b"<streamType>subStream</streamType>" in payload
@@ -676,8 +699,8 @@ def test_camera_stop_stream_ignores_camera_400_reply():
             del self.reply[:size]
             return chunk
 
-    reply = encode_modern(MSG_VIDEO_STOP, 7, response_code=400, cipher=Cipher("none"))
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    reply = encode_modern(MSG.VIDEO_STOP, 7, response_code=400, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     camera.sock = FakeSocket(reply)
     camera.login_xml = "<logged-in />"
     camera.cipher = Cipher("none")
@@ -686,7 +709,7 @@ def test_camera_stop_stream_ignores_camera_400_reply():
     sent = bytes(camera.sock.sent)
     header = Header.unpack_from(sent[:24])
     payload = sent[24:]
-    assert header.msg_id == MSG_VIDEO_STOP
+    assert header.msg_id == MSG.VIDEO_STOP
     assert header.stream_type == 1
     assert b"<handle>256</handle>" in payload
     assert 7 not in camera.binary_msg_nums
@@ -713,16 +736,16 @@ def test_camera_replies_to_incoming_keepalive():
             del self.reply[:size]
             return chunk
 
-    incoming = encode_modern(MSG_UDP_KEEPALIVE, 9, channel_id=3, stream_type=1, cipher=Cipher("none"))
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    incoming = encode_modern(MSG.UDP_KEEPALIVE, 9, channel_id=3, stream_type=1, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     camera.sock = FakeSocket(incoming)
     camera.cipher = Cipher("none")
     msg = camera._recv()
     sent = bytes(camera.sock.untracked)
     header = Header.unpack_from(sent[:24])
-    assert msg.header.msg_id == MSG_UDP_KEEPALIVE
+    assert msg.header.msg_id == MSG.UDP_KEEPALIVE
     assert bytes(camera.sock.sent) == b""
-    assert header.msg_id == MSG_UDP_KEEPALIVE
+    assert header.msg_id == MSG.UDP_KEEPALIVE
     assert header.msg_num == 9
     assert header.channel_id == 3
     assert header.stream_type == 1
@@ -749,22 +772,22 @@ def test_camera_replies_to_keepalive_even_when_response_is_200():
             del self.reply[:size]
             return chunk
 
-    incoming = encode_modern(MSG_UDP_KEEPALIVE, 0, response_code=200, cipher=Cipher("none"))
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    incoming = encode_modern(MSG.UDP_KEEPALIVE, 0, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     camera.sock = FakeSocket(incoming)
     camera.cipher = Cipher("none")
     msg = camera._recv()
     sent = bytes(camera.sock.untracked)
     header = Header.unpack_from(sent[:24])
-    assert msg.header.msg_id == MSG_UDP_KEEPALIVE
+    assert msg.header.msg_id == MSG.UDP_KEEPALIVE
     assert msg.header.response_code == 200
-    assert header.msg_id == MSG_UDP_KEEPALIVE
+    assert header.msg_id == MSG.UDP_KEEPALIVE
     assert header.msg_num == 0
     assert header.response_code == 200
 
 
 def test_camera_sd_card_api_is_available():
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     sd_card = camera.sd_card()
     assert hasattr(sd_card, "list")
     assert hasattr(sd_card, "filter")
@@ -773,8 +796,384 @@ def test_camera_sd_card_api_is_available():
     assert hasattr(sd_card, "format")
 
 
+def test_motion_events_parse_alarm_event_list():
+    xml = xml_document(
+        '<AlarmEventList version="1.1">'
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>people</AItype><recording>1</recording><timeStamp>42</timeStamp></AlarmEvent>'
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>vehicle</AItype><recording>1</recording><timeStamp>43</timeStamp></AlarmEvent>'
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>none</AItype><recording>1</recording><timeStamp>44</timeStamp></AlarmEvent>'
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>none</status><AItype>none</AItype><recording>0</recording><timeStamp>0</timeStamp></AlarmEvent>'
+        "</AlarmEventList>"
+    )
+    root = Message(Header(MSG.MOTION, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml).xml_root
+    events = parse_motion_events(root)
+
+    assert [event.type for event in events] == [EVENTS.human, EVENTS.vehicle, EVENTS.motion, EVENTS.none]
+    assert events[0] == EVENTS.human
+    assert events[0].active is True
+    assert events[-1].active is False
+
+
+def test_camera_motion_api_is_available():
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    motion = camera.motion()
+    assert hasattr(motion, "status")
+    assert hasattr(motion.watch(), "__iter__")
+
+
+def test_camera_events_normalizes_stop_to_last_active_type():
+    camera = type("Camera", (), {"config": type("Config", (), {"channel_id": 0})()})()
+    events = CameraEvents(camera)
+    raw_events = [
+        CameraEvent(EVENTS.human, active=True),
+        CameraEvent(EVENTS.none, active=False),
+    ]
+
+    normalized = events._normalize_events(raw_events)
+
+    assert [event.type for event in normalized] == [EVENTS.human, EVENTS.human]
+    assert [event.active for event in normalized] == [True, False]
+
+
+def test_camera_events_status_returns_immediate_motion_event():
+    class Lease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    class FakeCamera:
+        def __init__(self):
+            self.config = type("Config", (), {"channel_id": 0})()
+            self.replies = [
+                Message(
+                    Header(MSG.MOTION, 0, 0, 0, 2, 200, MSG_CLASS.MODERN),
+                    payload=xml_document(
+                        '<AlarmEventList version="1.1">'
+                        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>people</AItype></AlarmEvent>'
+                        "</AlarmEventList>"
+                    ),
+                )
+            ]
+
+        def require_online(self):
+            return Lease()
+
+        def motion(self, *, channel_id=None):
+            from pyneolink.motion import Motion
+
+            return Motion(self, channel_id=channel_id)
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+        def send(self, *args, **kwargs):
+            pass
+
+        def _recv(self, timeout=None):
+            if self.replies:
+                return self.replies.pop(0)
+            raise TimeoutError("done")
+
+    event, known = CameraEvents(FakeCamera()).status(timeout=0.1)
+
+    assert known is True
+    assert event.type == EVENTS.human
+    assert event.active is True
+
+
+def test_camera_motion_status_marks_timeout_as_unknown():
+    class Lease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    class FakeCamera:
+        def __init__(self):
+            self.config = type("Config", (), {"channel_id": 0})()
+
+        def require_online(self):
+            return Lease()
+
+        def motion(self, *, channel_id=None):
+            from pyneolink.motion import Motion
+
+            return Motion(self, channel_id=channel_id)
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+        def send(self, *args, **kwargs):
+            pass
+
+        def _recv(self, timeout=None):
+            raise TimeoutError("done")
+
+    status = Camera.motion_status(FakeCamera(), timeout=0.01)
+
+    assert status["type"] == "none"
+    assert status["active"] is False
+    assert status["known"] is False
+
+
+def test_motion_watch_duration_stops_iterator():
+    class Lease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    class FakeCamera:
+        def __init__(self):
+            self.config = type("Config", (), {"channel_id": 0})()
+
+        def require_online(self):
+            return Lease()
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+        def send(self, *args, **kwargs):
+            pass
+
+        def _recv(self, timeout=None):
+            raise TimeoutError("done")
+
+    events = CameraEvents(FakeCamera(), duration=0.01)
+
+    try:
+        next(events)
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("duration-limited watch should stop")
+
+
+def test_talk_ability_parses_voice_config():
+    xml = xml_document(
+        '<TalkAbility version="1.1">'
+        "<duplexList><duplex>FDX</duplex></duplexList>"
+        "<audioStreamModeList><audioStreamMode>followVideoStream</audioStreamMode></audioStreamModeList>"
+        "<audioConfigList><audioConfig>"
+        "<audioType>adpcm</audioType>"
+        "<sampleRate>16000</sampleRate>"
+        "<samplePrecision>16</samplePrecision>"
+        "<lengthPerEncoder>512</lengthPerEncoder>"
+        "<soundTrack>mono</soundTrack>"
+        "</audioConfig></audioConfigList>"
+        "</TalkAbility>"
+    )
+    root = Message(Header(MSG.TALKABILITY, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml).xml_root
+
+    config = parse_talk_config(root, channel_id=0)
+
+    assert config.audio_type == "adpcm"
+    assert config.sample_rate == 16000
+    assert config.block_align == 260
+    assert config.samples_per_block == 513
+
+
+def test_voice_adpcm_bcmedia_packet_shape():
+    block = ImaAdpcmEncoder().encode_block([0, 1000, -1000, 500, -500])
+    packet = serialize_bcmedia_adpcm(block)
+
+    assert packet[:4] == b"01wb"
+    assert struct.unpack("<H", packet[8:10])[0] == 0x0100
+    assert packet[12:].startswith(block)
+
+
+def test_voice_adpcm_packs_high_nibble_first():
+    block = ImaAdpcmEncoder().encode_block([0, 1000, 2000])
+    assert block[4] >> 4 != 0
+
+
+def test_voice_adpcm_level_hint_reports_silence_as_zero():
+    block = b"\x00\x00\x00\x00" + (b"\x00" * 64)
+
+    assert adpcm_level_hint(block) == 0
+
+
+def test_voice_tone_source_generates_non_silent_blocks():
+    config = type("Config", (), {"sample_rate": 16000, "samples_per_block": 1025})()
+
+    block = next(adpcm_blocks_from_tone(config, frequency=1000.0, seconds=0.1, volume=0.5))
+
+    assert adpcm_level_hint(block) > 0
+
+
+def test_voice_ffprobe_audio_info_accepts_mp3_metadata():
+    info = audio_info_from_ffprobe(
+        Path("voice.mp3"),
+        {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "codec_name": "mp3",
+                    "sample_rate": "44100",
+                    "channels": 2,
+                    "duration": "1.5",
+                }
+            ],
+            "format": {"format_name": "mp3", "duration": "1.5"},
+        },
+    )
+
+    assert info.format_name == "mp3"
+    assert info.codec_name == "mp3"
+    assert info.sample_rate == 44100
+    assert info.channels == 2
+    assert info.duration == 1.5
+
+
+def test_voice_ffprobe_audio_info_rejects_files_without_audio():
+    try:
+        audio_info_from_ffprobe(Path("image.jpg"), {"streams": [{"codec_type": "video"}], "format": {}})
+    except ValueError as exc:
+        assert "no audio stream" in str(exc)
+    else:
+        raise AssertionError("file without audio should be rejected")
+
+
+def test_camera_voice_api_is_available():
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    assert hasattr(camera.voice(), "play")
+    assert hasattr(camera.voice(), "microphone")
+    assert hasattr(camera.voice(), "siren")
+
+
+def test_voice_siren_sends_play_audio_payload():
+    class FakeCamera:
+        def __init__(self):
+            self.config = type("Config", (), {"channel_id": 2})()
+            self.calls = []
+            self.debug = False
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            self.calls.append((msg_id, payload, extension))
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+    camera = FakeCamera()
+    Voice(camera).siren()
+
+    msg_id, payload, extension = camera.calls[0]
+    assert msg_id == MSG.PLAY_AUDIO
+    assert b"<channelId>2</channelId>" in extension
+    assert b"<audioPlayInfo" in payload
+    assert b"<playDuration>0</playDuration>" in payload
+    assert b"<playTimes>1</playTimes>" in payload
+    assert b"<onOff>0</onOff>" in payload
+
+
+def test_camera_snapshot_collects_binary_snap_packets(tmp_path):
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    info_xml = xml_document(
+        '<Snap version="1.1"><channelId>0</channelId><fileName>front.jpg</fileName><pictureSize>4</pictureSize></Snap>'
+    )
+    binary_ext = payloads.extension_binary.format(channel_id=0)
+    def snap_replies(msg_num):
+        return b"".join(
+            [
+                encode_modern(MSG.SNAP, msg_num, info_xml, response_code=200, cipher=Cipher("none")),
+                encode_modern(MSG.SNAP, 77, b"\xff\xd8", extension=binary_ext, response_code=200, cipher=Cipher("none")),
+                encode_modern(MSG.SNAP, 77, b"\xff\xd9", extension=binary_ext, response_code=201, cipher=Cipher("none")),
+            ]
+        )
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = FakeSocket(snap_replies(1))
+    camera.login_xml = "<logged-in />"
+    camera.cipher = Cipher("none")
+
+    data = camera.snapshot()
+    sent = bytes(camera.sock.sent)
+    header = Header.unpack_from(sent[:24])
+    payload = sent[24:]
+
+    assert data == b"\xff\xd8\xff\xd9"
+    assert header.msg_id == MSG.SNAP
+    assert b"<Snap" in payload
+    assert b"<streamType>main</streamType>" in payload
+
+    camera.sock = FakeSocket(snap_replies(2))
+    path = camera.snapshot(out=tmp_path)
+    assert path == tmp_path / "front.jpg"
+    assert path.read_bytes() == b"\xff\xd8\xff\xd9"
+
+
+def test_stream_recorder_writes_mpegts_and_stops_stream(tmp_path):
+    class FakeCamera:
+        def __init__(self):
+            self.sent = []
+            self.stopped = []
+            self.replies = [
+                Message(
+                    Header(MSG.VIDEO, 0, 0, 0, 7, 200, MSG_CLASS.MODERN),
+                    payload=_bcmedia_info(fps=15) + _bcmedia_iframe(),
+                )
+            ]
+
+        def start_stream(self, stream):
+            self.stream = stream
+            return 7
+
+        def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+
+        def _recv(self, timeout=None):
+            if self.replies:
+                return self.replies.pop(0)
+            raise TimeoutError("done")
+
+        def stop_stream(self, stream, msg_num):
+            self.stopped.append((stream, msg_num))
+
+    out = tmp_path / "clip"
+    camera = FakeCamera()
+    path = StreamRecorder(camera, out=out, stream="mainStream", duration=0.01).start().wait()
+    data = path.read_bytes()
+
+    assert path == tmp_path / "clip.ts"
+    assert data.startswith(b"\x47")
+    assert len(data) % 188 == 0
+    assert camera.stopped == [("mainStream", 7)]
+
+
+def _bcmedia_info(*, fps: int) -> bytes:
+    data = bytearray(32)
+    data[:4] = b"1001"
+    data[4:16] = struct.pack("<III", 32, 2304, 1296)
+    data[17] = fps
+    return bytes(data)
+
+
+def _bcmedia_iframe() -> bytes:
+    payload = b"\x00\x00\x00\x01\x65\x88\x84"
+    header = b"00dc" + b"H264" + struct.pack("<IIII", len(payload), 0, 0, 0)
+    padding = b"\x00" * ((8 - len(payload) % 8) % 8)
+    return header + payload + padding
+
+
 def test_sd_card_filter_and_danger_guards():
-    camera = Camera(uuid="95270006R5KDROXI", password="secret", state_path=None)
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     sd_card = camera.sd_card()
     files = [
         {"file_name": "front_2026-06-01.mp4", "start_time": "2026-06-01T10:00:00", "end_time": "2026-06-01T10:05:00"},
@@ -808,7 +1207,7 @@ def test_sd_card_list_parses_file_info_reply():
 </FileInfo>
 </FileInfoList>
 </body>"""
-            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
     camera = FakeCamera()
     files = SdCard(camera).list(start="2026-06-01", end="2026-06-01")
@@ -837,7 +1236,7 @@ def test_sd_card_list_sorts_recordings_by_time():
 </FileInfo>
 </FileInfoList>
 </body>"""
-            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
     sd_card = SdCard(FakeCamera())
     asc = sd_card.list(start="2026-06-02", end="2026-06-02")
@@ -896,7 +1295,7 @@ def test_sd_card_list_reads_all_handle_pages():
                 else:
                     xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
 <body><FileInfoList version="1.1" /></body>"""
-            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, CLASS_MODERN), payload=xml)
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
     sd_card = SdCard(FakeCamera())
     files = sd_card.list(start="2026-06-02", end="2026-06-02")

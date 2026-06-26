@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -8,28 +7,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
 from pyneolink import Camera
 
 
-if load_dotenv:
-    load_dotenv()
+SETTINGS = {
+    "uuid": "ABCDEF0123456789",
+    "username": "admin",
+    "password": "password",
+}
 
-
-INTERVAL_SECONDS = float(os.environ.get("PYNEOLINK_BATTERY_INTERVAL", "60"))
-COUNT = int(os.environ["PYNEOLINK_BATTERY_COUNT"]) if os.environ.get("PYNEOLINK_BATTERY_COUNT") else None
+INTERVAL_SECONDS = 60.0
+COUNT = None
 
 
 def open_camera() -> Camera:
-    return Camera(
-        uuid=os.environ["CAMERA_UID"],
-        username=os.environ.get("CAMERA_USERNAME", "admin"),
-        password=os.environ["CAMERA_PASSWORD"],
-    )
+    return Camera(**SETTINGS)
 
 
 def battery_info_example(mode: str = "reconnect") -> dict:

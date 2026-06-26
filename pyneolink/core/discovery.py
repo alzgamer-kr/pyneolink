@@ -8,8 +8,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from .crypto import neolink_crc32, udp_xor
+from .const import MAGIC
 
-MAGIC_DISCOVERY = 0x2A87CF3A
 P2P_RELAY_HOSTNAMES = [
     "p2p.reolink.com",
     "p2p1.reolink.com",
@@ -43,14 +43,14 @@ class DiscoveryHit:
 
 def encode_discovery_xml(tid: int, xml: str) -> bytes:
     payload = udp_xor(tid, xml.encode("utf-8"))
-    return struct.pack("<IIIII", MAGIC_DISCOVERY, len(payload), 1, tid, neolink_crc32(payload)) + payload
+    return struct.pack("<IIIII", MAGIC.DISCOVERY, len(payload), 1, tid, neolink_crc32(payload)) + payload
 
 
 def decode_discovery_packet(data: bytes) -> tuple[int, str] | None:
     if len(data) < 20:
         return None
     magic, size, _one, tid, checksum = struct.unpack("<IIIII", data[:20])
-    if magic != MAGIC_DISCOVERY or len(data) < 20 + size:
+    if magic != MAGIC.DISCOVERY or len(data) < 20 + size:
         return None
     payload = data[20 : 20 + size]
     if neolink_crc32(payload) != checksum:

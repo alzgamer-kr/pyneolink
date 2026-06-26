@@ -6,40 +6,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from .crypto import Cipher
-
-MAGIC = 0x0ABCDEF0
-MAGIC_REV = 0x0FEDCBA0
-CLASS_LEGACY = 0x6514
-CLASS_MODERN_REPLY = 0x6614
-CLASS_MODERN = 0x6414
-CLASS_FILE_DOWNLOAD = 0x6482
-CLASS_MODERN_ZERO = 0x0000
-
-MSG_LOGIN = 1
-MSG_LOGOUT = 2
-MSG_VIDEO = 3
-MSG_VIDEO_STOP = 4
-MSG_FILE_REPLAY = 5
-MSG_FILE_REPLAY_STOP = 7
-MSG_FILE_DOWNLOAD_VIDEO = 8
-MSG_FILE_DOWNLOAD = 13
-MSG_FILE_INFO_LIST = 14
-MSG_FILE_INFO_LIST_ALT = 15
-MSG_FILE_INFO_LIST_ALT2 = 16
-MSG_REBOOT = 23
-MSG_VERSION = 80
-MSG_HDD_INFO = 102
-MSG_HDD_INIT = 103
-MSG_SNAP = 109
-MSG_UID = 114
-MSG_REPLAY_SEEK = 123
-MSG_DAY_RECORDS = 142
-MSG_FILE_PLAYBACK = 143
-MSG_FILE_PLAYBACK_STOP = 144
-MSG_GET_LED = 208
-MSG_SET_LED = 209
-MSG_UDP_KEEPALIVE = 234
-MSG_BATTERY = 253
+from .const import MAGIC, MSG, MSG_CLASS, msg
 
 
 class ProtocolError(RuntimeError):
@@ -48,7 +15,7 @@ class ProtocolError(RuntimeError):
 
 class InvalidMagicError(ProtocolError):
     def __init__(self, magic: int, data: bytes) -> None:
-        super().__init__(f"Invalid Baichuan magic 0x{magic:08x}")
+        super().__init__(msg.Error.InvalidBaichuanMagic.format(magic=magic))
         self.magic = magic
         self.data = data
 
@@ -66,16 +33,16 @@ class Header:
 
     @property
     def has_payload_offset(self) -> bool:
-        return self.msg_class in (CLASS_MODERN, CLASS_FILE_DOWNLOAD, CLASS_MODERN_ZERO) or self.msg_id == MSG_FILE_REPLAY
+        return self.msg_class in (MSG_CLASS.MODERN, MSG_CLASS.FILE_DOWNLOAD, MSG_CLASS.MODERN_ZERO) or self.msg_id == MSG.FILE_REPLAY
 
     @property
     def is_modern(self) -> bool:
-        return self.msg_class != CLASS_LEGACY
+        return self.msg_class != MSG_CLASS.LEGACY
 
     def pack(self) -> bytes:
         header = struct.pack(
             "<III BB HH",
-            MAGIC,
+            MAGIC.BAICHUAN,
             self.msg_id,
             self.body_len,
             self.channel_id,
@@ -91,14 +58,14 @@ class Header:
     @classmethod
     def unpack_from(cls, data: bytes) -> "Header":
         if len(data) < 20:
-            raise ProtocolError("Short Baichuan header")
+            raise ProtocolError(msg.Error.ShortBaichuanHeader)
         magic, msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class = struct.unpack(
             "<III BB HHH", data[:20]
         )
-        if magic not in (MAGIC, MAGIC_REV):
+        if magic not in (MAGIC.BAICHUAN, MAGIC.BAICHUAN_REVERSED):
             raise InvalidMagicError(magic, data[:20])
         payload_offset = None
-        if msg_class in (CLASS_MODERN, CLASS_FILE_DOWNLOAD, CLASS_MODERN_ZERO) or msg_id == MSG_FILE_REPLAY:
+        if msg_class in (MSG_CLASS.MODERN, MSG_CLASS.FILE_DOWNLOAD, MSG_CLASS.MODERN_ZERO) or msg_id == MSG.FILE_REPLAY:
             if len(data) < 24:
                 return cls(msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class, None)
             payload_offset = struct.unpack("<I", data[20:24])[0]
@@ -153,21 +120,22 @@ def encode_modern(
     channel_id: int = 0,
     stream_type: int = 0,
     response_code: int = 0,
-    msg_class: int = CLASS_MODERN,
+    msg_class: int = MSG_CLASS.MODERN,
     cipher: Cipher | None = None,
 ) -> bytes:
     cipher = cipher or Cipher("bc")
-    wire_cipher = Cipher("bc") if msg_id == MSG_LOGIN and cipher.name == "aes" else cipher
+    wire_cipher = Cipher("bc") if msg_id == MSG.LOGIN and cipher.name == "aes" else cipher
+    binary_payload = b"<binaryData>1</binaryData>" in extension
     enc_ext = wire_cipher.encrypt(channel_id, extension) if extension else b""
-    enc_payload = wire_cipher.encrypt(channel_id, payload) if payload else b""
+    enc_payload = payload if binary_payload else wire_cipher.encrypt(channel_id, payload) if payload else b""
     body = enc_ext + enc_payload
-    payload_offset = len(enc_ext) if msg_class in (CLASS_MODERN, CLASS_MODERN_ZERO) else None
+    payload_offset = len(enc_ext) if msg_class in (MSG_CLASS.MODERN, MSG_CLASS.MODERN_ZERO) else None
     return Header(msg_id, len(body), channel_id, stream_type, msg_num, response_code, msg_class, payload_offset).pack() + body
 
 
 def encode_legacy_login(msg_num: int, *, max_encryption: str = "aes", channel_id: int = 0) -> bytes:
     enc = {"none": 0xDC00, "bc": 0xDC01, "aes": 0xDC12}.get(max_encryption, 0xDC12)
-    return Header(MSG_LOGIN, 0, channel_id, 0, msg_num, enc, CLASS_LEGACY).pack()
+    return Header(MSG.LOGIN, 0, channel_id, 0, msg_num, enc, MSG_CLASS.LEGACY).pack()
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -176,7 +144,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     while remaining:
         chunk = sock.recv(remaining)
         if not chunk:
-            raise EOFError("Camera closed the connection")
+            raise EOFError(msg.Error.CameraClosedConnection)
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -195,9 +163,9 @@ def recv_message(sock: socket.socket, cipher: Cipher, *, timeout: float | None =
     ext_raw = body[:ext_len]
     payload_raw = body[ext_len:]
     reply_cipher = cipher
-    if header.msg_id == MSG_LOGIN and (header.response_code >> 8) == 0xDD:
+    if header.msg_id == MSG.LOGIN and (header.response_code >> 8) == 0xDD:
         reply_cipher = Cipher("none" if (header.response_code & 0xFF) == 0 else "bc")
-    elif header.msg_id == MSG_LOGIN and cipher.name == "aes":
+    elif header.msg_id == MSG.LOGIN and cipher.name == "aes":
         reply_cipher = Cipher("bc")
     extension = reply_cipher.decrypt(header.channel_id, ext_raw) if ext_raw else b""
     in_binary = b"<binaryData>1</binaryData>" in extension

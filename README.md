@@ -1,163 +1,51 @@
 # PyNeolink
 
-Python port of the Neolink/Reolink Baichuan client focused on UID/P2P camera access.
+PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-This project follows the behavior of `surfzoid/neolink` / `QuantumEntangledAndy/neolink`:
+This project was developed entirely with OpenAI Codex as an AI-assisted implementation effort. It is based on reverse-engineering work and behavior observed from the Rust `neolink` project, especially `surfzoid/neolink` and `QuantumEntangledAndy/neolink`. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
+
+Neolink and Reolink protocol support are reverse engineered. This project is not affiliated with Reolink.
+
+## What Works
 
 - JSON camera configuration with `address` or `uid`
-- Baichuan TCP packet framing
-- Reolink UID/P2P lookup, register, and relay handshake
-- legacy-to-modern login flow
-- BC XOR encryption and optional AES-CFB when `cryptography` is installed
-- local UDP UID discovery
-- camera info and read-only status commands
-- media packet parsing for H264/H265/AAC/ADPCM payloads
+- Reolink UID/P2P lookup, registration, UDP relay, and local UDP connection
+- Baichuan login and command framing
+- BC XOR encryption and AES-CFB support through `cryptography`
+- Camera information, UID, LED command, and reboot command
+- Battery status, including reconnect and online polling modes
+- SD-card recording list with pagination and time sorting
+- SD-card recording download with high/low quality selection
+- Snapshot download to bytes or JPEG file
+- Local MPEG-TS recording from the live stream
+- Live HTTP MPEG-TS viewing with H264/H265 video and AAC audio
+- HLS timeshift viewing with an in-memory sliding buffer
+- Motion status and motion event watch mode
+- Two-way voice/talk from microphone, audio file, or generated test tone
+- Camera siren trigger
 
-The Rust `neolink/` checkout is kept in this workspace as the reference implementation.
+## Current Limits
 
-## Quick Start
+- This is reverse engineered and tested against a small number of real cameras, so behavior may differ between models and firmware versions.
+- Voice file playback uses `ffmpeg`/`ffprobe` for format validation and conversion. Install FFmpeg and make sure both commands are available in `PATH`.
+- Microphone voice input needs the Python `sounddevice` package and a working local input device.
+- Local stream recording writes MPEG-TS (`.ts`) files, not MP4.
+- SD-card `remove()` and `format()` exist, but are intentionally guarded.
+- PTZ, PIR settings, image settings, alarm schedules, floodlight/IR settings, and Web UI are not implemented yet.
+
+## Install
 
 ```powershell
+python -m venv .venv
+.venv\Scripts\activate
 python -m pip install -r requirements.txt
-python pyneolink/cli.py --info --camera "Scherbaka 41 - Front"
 ```
 
-With Docker:
+The `cryptography` package is required for AES-encrypted cameras. FFmpeg is a system dependency for audio-file voice playback and some media conversion paths.
 
-```powershell
-docker build -t pyneolink .
-docker run --rm --network host `
-  -v "${PWD}\config.json:/app/config.json:ro" `
-  -v "${PWD}\.pyneolink_state.json:/app/.pyneolink_state.json" `
-  pyneolink --info --camera "Scherbaka 41 - Front"
-```
+## Configuration
 
-For connection diagnostics, add `--debug` to the same command. The normal `--info` output redacts sensitive camera fields.
-
-Library use:
-
-```python
-from pyneolink import Camera
-
-camera = Camera(uuid="ABCDEF0123456789", password="password")
-info = camera.info()
-camera.close()
-```
-
-The public API lives at the package root. Low-level protocol, crypto, discovery, relay transport, state, media, and XML helpers live in `pyneolink.core`.
-
-SD-card access:
-
-```python
-from examples.sd_card_example import download_example
-
-download_example()
-```
-
-See [examples/sd_card_example.py](examples/sd_card_example.py) for:
-
-- `list_example()`
-- `download_example()`
-- `remove_example()`
-- `format_example()`
-
-`list()` sorts recordings by time ascending by default, so `files[-1]` is the newest recording. Use `sort="desc"` for newest first or `sort=None` to keep the camera response order.
-
-When the camera returns a Reolink BCMedia stream for an `.mp4` recording, `download()` converts it to a playable MP4 with `ffmpeg`. If conversion fails, the raw stream is kept as `*.mp4.bcmedia` for debugging.
-Use `quality="high"`/`quality="low"` or `stream_type="mainStream"`/`stream_type="subStream"` to choose the recording stream.
-
-`remove()` and `format()` are intentionally guarded. `format()` requires both `confirm=True` and `confirmation_text="FORMAT SD CARD"`.
-
-Battery status:
-
-```python
-from pyneolink import Camera
-
-with Camera(uuid="ABCDEF0123456789", password="password") as camera:
-    battery = camera.battery()
-
-    with battery.info() as info:
-        print(info["level_percent"], info["is_charging"], info["adapter_status"])
-
-    with battery.info(interval=60, count=3, mode="reconnect") as updates:
-        for update in updates:
-            print(update["level_percent"], update["adapter_status"])
-
-    with battery.info(interval=60, mode="online") as updates:
-        for update in updates:
-            print(update["level_percent"], update["adapter_status"])
-```
-
-From CLI:
-
-```powershell
-python pyneolink/cli.py battery --camera "Scherbaka 41 - Front"
-python pyneolink/cli.py battery --camera "Scherbaka 41 - Front" --watch --interval 60
-python pyneolink/cli.py battery --camera "Scherbaka 41 - Front" --watch --interval 60 --mode online
-python pyneolink/cli.py battery --camera "Scherbaka 41 - Front" --raw
-```
-
-Battery polling defaults to `mode="reconnect"` to avoid keeping battery cameras awake. Use `mode="online"` only when frequent updates are more important than power saving, or when another component already keeps the camera online.
-
-See [examples/battery_example.py](examples/battery_example.py) for `battery_info_example()`, `reconnect_mode_example()`, and `online_mode_example()`.
-
-Live view:
-
-```powershell
-python pyneolink/cli.py serve --config config.json
-python examples/stream_example.py
-```
-
-The server may bind to `0.0.0.0`, but clients should not open `0.0.0.0` directly. Use the printed URL, `127.0.0.1` on the same PC, or the PC's LAN IP from another device.
-
-Open the stream in VLC/ffplay with a URL shaped like:
-
-```text
-http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high
-http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low
-```
-
-Open the HLS timeshift stream with:
-
-```text
-http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/high/hls.m3u8
-http://127.0.0.1:8554/Scherbaka%2041%20-%20Front/low/hls.m3u8
-```
-
-The endpoint muxes H264/H265 video and AAC audio into MPEG-TS for VLC/ffplay. ADPCM audio is currently ignored because it needs a transcoding step. Short camera stalls are bridged with MPEG-TS null packets so players are less likely to close the stream while waiting for the camera to resume. This is a lightweight first step toward Neolink-style viewing; RTSP/HLS wrapping can be added on top later.
-
-HLS keeps a sliding in-memory timeshift window. By default it stores up to 100 MB and cuts segments around 2 seconds, starting each segment on a keyframe when possible. Tune it from CLI with:
-
-```powershell
-python pyneolink/cli.py serve --config config.json --hls-buffer-mb 100 --hls-segment-seconds 2
-```
-
-Library use:
-
-```python
-from pyneolink import StreamServer
-
-config = {
-    "bind": "0.0.0.0",
-    "bind_port": 8554,
-    "cameras": [
-        {
-            "name": "Scherbaka 41 - Front",
-            "username": "admin",
-            "password": "password",
-            "uid": "ABCDEF0123456789",
-            "discovery": "relay",
-        }
-    ],
-}
-
-server = StreamServer(config, debug=True, buffer_seconds=1.5, hls_buffer_mb=100, hls_segment_seconds=2)
-server.serve_forever()
-```
-
-`examples/stream_example.py` is a small development runner for live streams. It parses `config.json` into a dict and passes that dict to `StreamServer`. You can override values with environment variables such as `PYNEOLINK_CONFIG`, `PYNEOLINK_HOST`, `PYNEOLINK_PORT`, `PYNEOLINK_DEBUG`, `PYNEOLINK_BUFFER_SECONDS`, `PYNEOLINK_HLS_BUFFER_MB`, `PYNEOLINK_HLS_SEGMENT_SECONDS`, `CAMERA_NAME`, `CAMERA_UID`, `CAMERA_USERNAME`, and `CAMERA_PASSWORD`.
-
-Example `config.json`:
+Create a local `config.json`:
 
 ```json
 {
@@ -165,7 +53,7 @@ Example `config.json`:
   "bind_port": 8554,
   "cameras": [
     {
-      "name": "Scherbaka 41 - Front",
+      "name": "Home-Front",
       "username": "admin",
       "password": "password",
       "uid": "ABCDEF0123456789",
@@ -175,6 +63,194 @@ Example `config.json`:
 }
 ```
 
-## Notes
+`config.json` is ignored by Git because it can contain camera credentials.
 
-Neolink is reverse engineered and not affiliated with Reolink. Current SD-card work should stay read-only: listing and downloading files only. Do not format or write to the SD card from this project.
+## CLI
+
+Camera info:
+
+```powershell
+python pyneolink/cli.py info --camera "Home-Front" --config config.json
+python pyneolink/cli.py --info --camera "Home-Front"
+```
+
+Battery:
+
+```powershell
+python pyneolink/cli.py battery --camera "Home-Front"
+python pyneolink/cli.py battery --camera "Home-Front" --watch --interval 60
+python pyneolink/cli.py battery --camera "Home-Front" --watch --interval 60 --mode online
+```
+
+Snapshots and local recording:
+
+```powershell
+python pyneolink/cli.py snapshot --camera "Home-Front" --out snapshots/
+python pyneolink/cli.py record --camera "Home-Front" --out recordings/ --duration 30 --quality high
+python pyneolink/cli.py record --camera "Home-Front" --out recordings/live.ts --quality low
+```
+
+Motion:
+
+```powershell
+python pyneolink/cli.py motion --camera "Home-Front"
+python pyneolink/cli.py motion --camera "Home-Front" --watch --duration 30
+```
+
+Voice and siren:
+
+```powershell
+python pyneolink/cli.py voice --camera "Home-Front" --file alert.mp3
+python pyneolink/cli.py voice --camera "Home-Front" --microphone --seconds 10
+python pyneolink/cli.py voice --camera "Home-Front" --tone 1000 --seconds 3
+python pyneolink/cli.py voice --camera "Home-Front" --siren
+```
+
+Live view server:
+
+```powershell
+python pyneolink/cli.py serve --config config.json
+```
+
+Open direct MPEG-TS in VLC/ffplay:
+
+```text
+http://127.0.0.1:8554/Home-Front/high
+http://127.0.0.1:8554/Home-Front/low
+```
+
+Open HLS timeshift in VLC/ffplay:
+
+```text
+http://127.0.0.1:8554/Home-Front/high/hls.m3u8
+http://127.0.0.1:8554/Home-Front/low/hls.m3u8
+```
+
+HLS keeps a sliding in-memory buffer. By default it stores up to 100 MB and cuts segments around 2 seconds:
+
+```powershell
+python pyneolink/cli.py serve --config config.json --hls-buffer-mb 100 --hls-segment-seconds 2
+```
+
+When binding to `0.0.0.0`, do not open `0.0.0.0` in VLC. Use `127.0.0.1` on the same PC or the PC's LAN IP from another device.
+
+## Library Use
+
+Camera information:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    info = camera.info()
+    print(info)
+```
+
+Battery:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    battery = camera.battery()
+
+    with battery.info() as info:
+        print(info["level_percent"], info["is_charging"], info["adapter_status"])
+
+    with battery.info(interval=60, mode="reconnect", count=3) as updates:
+        for update in updates:
+            print(update["level_percent"], update["adapter_status"])
+```
+
+SD-card download:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    sd = camera.sd_card()
+    files = sd.list(start="2026-06-03", end="2026-06-03")
+    videos = sd.filter(files, name=".mp4")
+    if videos:
+        sd.download(videos[-1], "downloads", quality="high", progress=True)
+```
+
+Motion:
+
+```python
+from pyneolink import Camera, EVENTS
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    motion = camera.motion()
+    print(motion.status())
+
+    with motion.watch(duration=30) as events:
+        for event in events:
+            if event == EVENTS.human and event.active:
+                print("human detected")
+```
+
+Snapshot and local recording:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    camera.snapshot(out="snapshots")
+    camera.record(out="recordings", duration=30, stream="mainStream")
+```
+
+Voice and siren:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    voice = camera.voice()
+    voice.play("alert.mp3")
+    voice.siren()
+```
+
+Live stream server from a dict:
+
+```python
+from pyneolink import StreamServer
+
+config = {
+    "bind": "0.0.0.0",
+    "bind_port": 8554,
+    "cameras": [
+        {
+            "name": "Home-Front",
+            "username": "admin",
+            "password": "password",
+            "uid": "ABCDEF0123456789",
+            "discovery": "relay",
+        }
+    ],
+}
+
+StreamServer(config, buffer_seconds=1.5, hls_buffer_mb=100, hls_segment_seconds=2).serve_forever()
+```
+
+## Examples
+
+See the `examples/` directory:
+
+- `camera_example.py`: info, snapshot, LED, and guarded reboot helpers
+- `sd_card_example.py`: list, filter, download, remove, and guarded format calls
+- `battery_example.py`: one-shot battery status plus reconnect/online polling
+- `motion_example.py`: motion status and watch mode
+- `record_example.py`: duration and manual local stream recording
+- `voice_example.py`: file, microphone, tone, and siren helpers
+- `stream_example.py`: live MPEG-TS and HLS timeshift server from a dict config
+
+Each example keeps camera settings as a small local dict near the top of the file. Edit those values directly or replace the dict with your own configuration loader.
+
+## Internals
+
+See `docs/` for a sorted internal documentation set that explains the core files, connection flow, login, encryption, Baichuan messages, UDP/P2P transport, SD-card downloads, media streaming, motion, voice, and camera controls.
+
+## Reference
+
+The Rust `neolink/` checkout can be kept locally as a protocol reference, but it is ignored by Git in this workspace. The Python code here is intended to be understandable and hackable for people who want to experiment with Reolink cameras from Python.
