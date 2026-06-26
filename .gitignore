@@ -3,21 +3,46 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
+.eggs/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.pyre/
+.tox/
+.nox/
 .coverage
+.coverage.*
 htmlcov/
 build/
 dist/
+wheelhouse/
+pip-wheel-metadata/
+*.whl
+*.tar.gz
+*.egg
+MANIFEST
 
 # Virtual environments and local tooling
 .venv/
 venv/
+env/
+ENV/
 .env
 .env.*
 .idea/
 .vscode/
+.fleet/
+.vs/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+.spyproject/
+.spyderproject
+.ropeproject/
+nbproject/
 .dockerconfig/
 
 # Local camera configuration and runtime state

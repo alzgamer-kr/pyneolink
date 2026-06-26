@@ -2,9 +2,15 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-This project was developed entirely with OpenAI Codex as an AI-assisted implementation effort. It is based on reverse-engineering work and behavior observed from the Rust `neolink` project, especially `surfzoid/neolink` and `QuantumEntangledAndy/neolink`. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
+Version: `0.3.0` alpha.
+
+This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
 Neolink and Reolink protocol support are reverse engineered. This project is not affiliated with Reolink.
+
+## Status
+
+PyNeolink is experimental alpha software. It works against a limited set of real cameras, but Reolink firmware and model behavior can differ. APIs may change before `1.0.0`.
 
 ## What Works
 
@@ -37,13 +43,45 @@ Neolink and Reolink protocol support are reverse engineered. This project is not
 
 ## Install
 
+From GitHub, before PyPI publication:
+
+```powershell
+python -m pip install git+https://github.com/alzgamer-kr/pyneolink.git
+```
+
+From PyPI, after publication:
+
+```powershell
+python -m pip install pyneolink
+```
+
+For microphone voice input:
+
+```powershell
+python -m pip install "pyneolink[voice]"
+```
+
+For local development from a checkout:
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
 ```
 
-The `cryptography` package is required for AES-encrypted cameras. FFmpeg is a system dependency for audio-file voice playback and some media conversion paths.
+The `cryptography` package is required for AES-encrypted cameras. It is installed automatically when installing the package.
+
+## FFmpeg
+
+FFmpeg is a system dependency for audio-file voice playback and some media conversion paths. PyNeolink expects both `ffmpeg` and `ffprobe` to be available in `PATH`.
+
+Official FFmpeg download page:
+
+- Windows: https://ffmpeg.org/download.html
+- Linux: https://ffmpeg.org/download.html
+- macOS: https://ffmpeg.org/download.html
+
+On Linux and macOS, using the OS package manager is usually the simplest path when available. On Windows, install one of the builds linked from the official FFmpeg download page and add its `bin` directory to `PATH`.
 
 ## Configuration
 
@@ -288,6 +326,16 @@ Each example keeps camera settings as a small local dict near the top of the fil
 
 See `docs/` for a sorted internal documentation set that explains the core files, connection flow, login, encryption, Baichuan messages, UDP/P2P transport, SD-card downloads, media streaming, motion, voice, and camera controls.
 
+## Credits
+
+PyNeolink exists because of the reverse-engineering work done by the Neolink community. In particular, the Rust `neolink` implementations and documentation were used as the protocol reference for this Python port.
+
+This Python implementation was developed with OpenAI Codex. Human testing against real cameras guided the implementation and bug fixes.
+
 ## Reference
 
 The Rust `neolink/` checkout can be kept locally as a protocol reference, but it is ignored by Git in this workspace. The Python code here is intended to be understandable and hackable for people who want to experiment with Reolink cameras from Python.
+
+## Tested Cameras
+
+- Reolink Argus Eco
