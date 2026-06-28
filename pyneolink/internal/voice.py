@@ -21,6 +21,18 @@ _IMA_STEP_TABLE = (7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 
 
 @dataclass(frozen=True)
 class TalkConfig:
+    """Camera two-way talk audio configuration.
+
+    :param channel_id: Camera channel id.
+    :param duplex: Duplex mode reported by the camera.
+    :param audio_stream_mode: Audio stream mode reported by the camera.
+    :param audio_type: Audio codec type, currently expected to be `adpcm`.
+    :param sample_rate: Source sample rate in Hz.
+    :param sample_precision: Source sample precision in bits.
+    :param length_per_encoder: Camera encoder block size.
+    :param sound_track: Audio channel layout, usually `mono`.
+    """
+
     channel_id: int
     duplex: str
     audio_stream_mode: str
@@ -41,6 +53,16 @@ class TalkConfig:
 
 @dataclass(frozen=True)
 class AudioFileInfo:
+    """Audio file metadata returned by FFprobe validation.
+
+    :param path: Audio file path.
+    :param format_name: Container/format name.
+    :param codec_name: Audio codec name.
+    :param sample_rate: Sample rate in Hz when known.
+    :param channels: Number of channels when known.
+    :param duration: Duration in seconds when known.
+    """
+
     path: Path
     format_name: str
     codec_name: str
@@ -434,12 +456,21 @@ def _required_int(root, tag: str) -> int:  # noqa: ANN001
 
 
 class ImaAdpcmEncoder:
+    """IMA ADPCM encoder used for camera talk audio."""
+
     def __init__(self) -> None:
+        """Create an encoder with default predictor/index state."""
         self.predictor = 0
         self.index = 0
         self.initialized = False
 
     def encode_block(self, samples: list[int]) -> bytes:
+        """
+        Encode one PCM sample block as IMA ADPCM.
+
+        :param samples: Signed 16-bit mono PCM samples.
+        """
+
         if not samples:
             return b""
         if not self.initialized:

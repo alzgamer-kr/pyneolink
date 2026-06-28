@@ -33,6 +33,16 @@ P2P_RELAY_HOSTNAMES = [
 
 @dataclass
 class DiscoveryHit:
+    """One discovered camera/network candidate.
+
+    :param uid: Camera UID when known.
+    :param address: Candidate `(host, port)`.
+    :param xml: Raw discovery XML when available.
+    :param raw: Raw discovery packet bytes.
+    :param source: Discovery source label.
+    :param transport: Transport type, usually `tcp` or `udp-relay`.
+    """
+
     uid: str | None
     address: tuple[str, int]
     xml: str | None = None

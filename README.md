@@ -2,7 +2,7 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.3.1` alpha.
+Version: `0.3.2` alpha.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -224,7 +224,7 @@ with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as c
     files = sd.list(start="2026-06-03", end="2026-06-03")
     videos = sd.filter(files, name=".mp4")
     if videos:
-        sd.download(videos[-1], "downloads", quality="high", progress=True)
+        sd.download(videos[-1], "downloads", quality="high", rewrite_exists=False, progress=True)
 ```
 
 Motion:

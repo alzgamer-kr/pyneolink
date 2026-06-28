@@ -46,7 +46,14 @@ def download_example(target_date: str = TARGET_DATE, quality: str = DOWNLOAD_QUA
             return
         selected = videos[-1]
         print(f"Downloading: {selected.get('path') or selected.get('file_name')}")
-        saved_path = sd_card.download(selected, output_dir, quality=quality, progress=True)
+        saved_path = sd_card.download(
+            selected,
+            output_dir,
+            quality=quality,
+            reconnect_retries=3,
+            rewrite_exists=False,
+            progress=True,
+        )
         print(f"Saved: {saved_path}")
 
 

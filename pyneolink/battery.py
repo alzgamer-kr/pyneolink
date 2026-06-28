@@ -9,28 +9,57 @@ from .internal.battery import normalize_mode, parse_battery_xml
 
 
 class Battery:
+    """Battery status helper returned by `Camera.battery()`."""
+
     def __init__(self, camera) -> None:
+        """Create a battery helper.
+
+        :param camera: Connected or connectable `Camera` instance.
+        """
         self.camera = camera
 
     def raw(self, *, mode: str = "reconnect") -> str | None:
+        """Return raw battery XML.
+
+        :param mode: `reconnect` closes the connection after the request;
+            `online` keeps the camera session active.
+        """
         return self._request(mode=mode).xml_text
 
     def info(self, *, interval: float | None = None, count: int | None = None, mode: str = "reconnect"):
+        """Return battery info once or an update iterator.
+
+        :param interval: Poll interval in seconds. When omitted, a single
+            `BatteryInfo` dict is returned.
+        :param count: Optional maximum number of updates when `interval` is set.
+        :param mode: `reconnect` or `online` polling mode.
+        """
         if interval is None:
             return self.refresh(mode=mode)
         return BatteryInfoUpdates(self, interval=interval, count=count, mode=mode)
 
     def refresh(self, *, mode: str = "reconnect") -> dict[str, Any]:
+        """Fetch one parsed battery status.
+
+        :param mode: `reconnect` or `online` polling mode.
+        """
         reply = self._request(mode=mode)
         if reply.header.response_code != 200:
             raise ProtocolError(msg.Error.BatteryInfoFailed.format(response_code=reply.header.response_code))
         return BatteryInfo(parse_battery_xml(reply.xml_root))
 
     def watch(self, interval: float = 60.0, *, count: int | None = None, mode: str = "reconnect"):
+        """Yield parsed battery status repeatedly.
+
+        :param interval: Delay between polls in seconds.
+        :param count: Optional maximum number of updates.
+        :param mode: `reconnect` or `online` polling mode.
+        """
         with BatteryInfoUpdates(self, interval=interval, count=count, mode=mode) as updates:
             yield from updates
 
     def keepalive(self) -> str:
+        """Send one keepalive/maintenance step through the camera."""
         return self.camera.keepalive()
 
     def _request(self, *, mode: str = "reconnect", retries: int = 1):
@@ -55,6 +84,8 @@ class Battery:
 
 
 class BatteryInfoUpdates:
+    """Iterator/context manager for repeated battery polling."""
+
     def __init__(
         self,
         battery: Battery,
@@ -64,6 +95,15 @@ class BatteryInfoUpdates:
         mode: str = "reconnect",
         keepalive_interval: float = 1.0,
     ) -> None:
+        """Create a battery polling iterator.
+
+        :param battery: Battery helper used for requests.
+        :param interval: Delay between updates in seconds.
+        :param count: Optional maximum number of updates.
+        :param mode: `reconnect` or `online` polling mode.
+        :param keepalive_interval: Keepalive interval while waiting in online
+            mode.
+        """
         self.battery = battery
         self.interval = max(interval, 0.0)
         self.mode = normalize_mode(mode)
@@ -127,6 +167,8 @@ class BatteryInfoUpdates:
 
 
 class BatteryInfo(dict):
+    """Battery info dict that also works as a context manager."""
+
     def __enter__(self) -> "BatteryInfo":
         return self
 

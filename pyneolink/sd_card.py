@@ -15,21 +15,28 @@ from .core.bc import (
 from .core.const import MSG, MSG_CLASS, msg as const_msg, payloads
 from .core.media import bcmedia_to_mp4, extract_embedded_mp4, looks_like_bcmedia
 from .core.xmlutil import xml_to_dict
+from .errors import CameraConnectionError
 
 if TYPE_CHECKING:
     from .camera import Camera
 
 
 class DangerousSdCardOperation(RuntimeError):
+    """Raised when a destructive SD-card action is missing explicit confirmation."""
+
     pass
 
 
 class DownloadSizeMismatch(RuntimeError):
+    """Raised when downloaded bytes do not match the expected camera file size."""
+
     pass
 
 
 @dataclass(frozen=True)
 class SdCardFile:
+    """Normalized SD-card recording/file metadata."""
+
     file_name: str | None = None
     path: str | None = None
     size: int | None = None
@@ -50,7 +57,13 @@ class SdCardFile:
 
 
 class SdCard:
+    """SD-card helper for listing, filtering, and downloading recordings."""
+
     def __init__(self, camera: Camera) -> None:
+        """Create an SD-card helper.
+
+        :param camera: Connected or connectable `Camera` instance.
+        """
         self.camera = camera
         self.last_attempts: list[str] = []
         self.last_download_attempts: list[str] = []
@@ -71,6 +84,20 @@ class SdCard:
         as_dict: bool = True,
         sort: str | None = "asc",
     ) -> list[dict] | list[SdCardFile]:
+        """List SD-card recordings.
+
+        :param start: Start date/time. A `YYYY-MM-DD` string selects the start
+            of that day.
+        :param end: End date/time. A `YYYY-MM-DD` string selects the end of
+            that day.
+        :param stream_type: Reolink stream type to query, usually
+            `mainStream` or `subStream`.
+        :param file_type: Camera file type filter sent to the camera.
+        :param channel_id: Optional channel override.
+        :param as_dict: Return plain dicts when `True`, otherwise `SdCardFile`
+            objects.
+        :param sort: `asc`, `desc`, or `None`.
+        """
         start_dt, end_dt = _date_range(start, end)
         channel = self.camera.config.channel_id if channel_id is None else channel_id
         attempts = []
@@ -163,6 +190,16 @@ class SdCard:
         file_type: str | None = None,
         stream_type: str | None = None,
     ) -> list[dict]:
+        """Filter an SD-card file list in memory.
+
+        :param files: Existing files from `list()`. When omitted, `list()` is
+            called with `start`/`end`.
+        :param start: Optional minimum recording time.
+        :param end: Optional maximum recording time.
+        :param name: Substring to search in path/name/type fields.
+        :param file_type: Exact file type to keep.
+        :param stream_type: Exact stream type to keep.
+        """
         items = list(files if files is not None else self.list(start=start, end=end))
         start_dt = _coerce_datetime(start, end_of_day=False) if start is not None else None
         end_dt = _coerce_datetime(end, end_of_day=True) if end is not None else None
@@ -194,16 +231,35 @@ class SdCard:
         chunk_limit: int = 0,
         progress=False,
         max_attempts: int = 3,
+        reconnect_retries: int = 3,
+        rewrite_exists: bool = True,
         recv_timeout: float = 2.0,
     ) -> Path:
+        """Download one SD-card recording.
+
+        :param file: File dict, `SdCardFile`, or path/name string.
+        :param output: Output directory or complete output file path.
+        :param stream_type: Explicit stream type, for example `mainStream` or
+            `subStream`. Mutually exclusive with `quality`.
+        :param quality: Quality alias such as `high`/`main` or `low`/`sub`.
+            Mutually exclusive with `stream_type`.
+        :param chunk_limit: Optional low-level chunk limit for diagnostics.
+        :param progress: `True` to print progress, or a callable accepting a
+            progress string.
+        :param max_attempts: Maximum number of protocol download strategies to
+            try for one connection.
+        :param reconnect_retries: Number of reconnect attempts after an
+            interrupted download before raising `CameraConnectionError`.
+        :param rewrite_exists: When `False`, skip an already finalized local
+            file. Non-empty `.mp4` files are treated as complete.
+        :param recv_timeout: Per-read timeout while waiting for download data.
+        """
         item = _file_to_dict(file)
         raw = _download_raw(item)
         requested_stream = _normalize_download_stream_type(stream_type=stream_type, quality=quality)
         if requested_stream:
             raw["streamType"] = requested_stream
             raw["_streamTypeForced"] = True
-        self._playback_channel_id = random.randint(16, 63)
-        raw["_playbackChannelId"] = self._playback_channel_id
         file_id = raw.get("Id") or item.get("path") or item.get("file_name") or str(file)
         file_name = Path(str(file_id)).name if raw.get("Id") else item.get("file_name") or Path(str(file_id)).name or str(file)
         output_path = Path(output)
@@ -213,16 +269,92 @@ class SdCard:
         else:
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        expected_size = _int_or_none(item.get("size"))
-        forced_high = _is_forced_high_quality(raw)
+        expected_size = _int_or_none(item.get("size")) or _file_size(raw)
+        if not rewrite_exists and _existing_download_matches(output_path, expected_size):
+            _remove_stale_part_files(output_path)
+            _emit_progress_message(progress, f"  skipped existing file: {output_path}")
+            return output_path
+        if not rewrite_exists and output_path.exists():
+            _emit_progress_message(progress, _existing_download_mismatch_message(output_path, expected_size))
+
         self.last_download_attempts = []
+        while True:
+            try:
+                return self._download_once(
+                    item,
+                    dict(raw),
+                    str(file_id),
+                    output_path,
+                    expected_size=expected_size,
+                    chunk_limit=chunk_limit,
+                    progress=progress,
+                    max_attempts=max_attempts,
+                    recv_timeout=recv_timeout,
+                )
+            except DownloadSizeMismatch as exc:
+                _emit_progress_message(progress, f"  download incomplete: {exc}")
+                self._reconnect_for_download(file_name, reconnect_retries, progress, exc)
+            except TimeoutError as exc:
+                _emit_progress_message(progress, f"  download failed: {type(exc).__name__}: {exc}")
+                self._reconnect_for_download(file_name, reconnect_retries, progress, exc)
+
+    def _reconnect_for_download(
+        self,
+        file_name: str,
+        reconnect_retries: int,
+        progress,
+        cause: BaseException,
+    ) -> None:
+        attempts = max(reconnect_retries, 0)
+        if attempts <= 0:
+            raise CameraConnectionError(
+                f"Camera connection is unavailable while downloading {file_name}: {type(cause).__name__}: {cause}"
+            ) from None
+        last_error: BaseException = cause
+        for attempt in range(1, attempts + 1):
+            _emit_progress_message(progress, f"  reconnect attempt {attempt}/{attempts} after 5s: {file_name}")
+            monotonic_clock.sleep(5)
+            try:
+                self.camera.reconnect()
+                _emit_progress_message(progress, f"  reconnect ok: {file_name}")
+                return
+            except Exception as exc:
+                last_error = exc
+                message = (
+                    f"SD download reconnect failed for {file_name}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.last_download_attempts.append(message)
+                _emit_progress_message(progress, f"  {message}")
+        raise CameraConnectionError(
+            f"Camera connection is unavailable after {attempts} reconnect attempt(s) while downloading "
+            f"{file_name}: {type(last_error).__name__}: {last_error}"
+        ) from None
+
+    def _download_once(
+        self,
+        item: dict,
+        raw: dict,
+        file_id: str,
+        output_path: Path,
+        *,
+        expected_size: int | None,
+        chunk_limit: int,
+        progress,
+        max_attempts: int,
+        recv_timeout: float,
+    ) -> Path:
+        forced_high = _is_forced_high_quality(raw)
         last_error = None
         best_mismatch: tuple[str, int] | None = None
+        self._playback_channel_id = random.randint(16, 63)
+        raw["_playbackChannelId"] = self._playback_channel_id
         effective_max_attempts = max(max_attempts, 5) if forced_high else max_attempts
         for index, query in enumerate(_download_queries(self.camera.config.channel_id, str(file_id), raw)):
             if effective_max_attempts and index >= effective_max_attempts:
                 break
             part_path = output_path.with_name(output_path.name + f".{_safe_label(query.label)}.part")
+            _remove_file(part_path)
             try:
                 if query.label.startswith("replay5/"):
                     self._prepare_replay_download(raw)
@@ -555,11 +687,22 @@ class SdCard:
             self.last_download_attempts.append(f"reconnect-after-download: {type(exc).__name__}: {exc}")
 
     def remove(self, file: dict | SdCardFile | str, *, confirm: bool = False) -> None:
+        """Remove an SD-card file.
+
+        :param file: File dict, `SdCardFile`, or path/name string.
+        :param confirm: Must be `True` to allow the operation.
+        """
         if not confirm:
             raise DangerousSdCardOperation(const_msg.Error.SdRemoveNeedsConfirm)
         raise NotImplementedError(const_msg.Error.SdRemoveNotImplemented)
 
     def format(self, *, confirm: bool = False, confirmation_text: str = "", disk_id: int = 0) -> None:
+        """Format the camera SD card.
+
+        :param confirm: Must be `True` to allow formatting.
+        :param confirmation_text: Must be exactly `FORMAT SD CARD`.
+        :param disk_id: Camera disk id, usually 0.
+        """
         if not confirm or confirmation_text != "FORMAT SD CARD":
             raise DangerousSdCardOperation(const_msg.Error.SdFormatNeedsConfirm)
         payload = payloads.hdd_init.format(disk_id=disk_id)
@@ -568,12 +711,17 @@ class SdCard:
             raise ProtocolError(const_msg.Error.SdFormatFailed.format(response_code=reply.header.response_code))
 
     def disk_info(self) -> dict:
+        """Return parsed SD-card disk information."""
         reply = self.camera.command(MSG.HDD_INFO)
         if reply.header.response_code != 200:
             raise ProtocolError(const_msg.Error.SdDiskInfoFailed.format(response_code=reply.header.response_code))
         return xml_to_dict(reply.xml_text or "")
 
     def day_records(self, day: date | str | None = None) -> dict:
+        """Return raw day-record information for one day.
+
+        :param day: Target date. Defaults to today.
+        """
         target = _coerce_date(day or date.today())
         attempts = []
         for query in _day_record_queries(self.camera.config.channel_id, target):
@@ -1223,6 +1371,46 @@ def _emit_progress(progress, written: int, expected_size: int | None, chunks: in
         progress(message)
     else:
         print(message)
+
+
+def _emit_progress_message(progress, message: str) -> None:
+    if not progress:
+        return
+    if callable(progress):
+        progress(message)
+    else:
+        print(message)
+
+
+def _existing_download_matches(path: Path, expected_size: int | None) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    actual_size = path.stat().st_size
+    if path.suffix.lower() == ".mp4":
+        return actual_size > 0
+    if expected_size is None:
+        return actual_size > 0
+    return actual_size == expected_size
+
+
+def _remove_stale_part_files(output_path: Path) -> None:
+    prefix = f"{output_path.name}."
+    for candidate in output_path.parent.glob("*.part"):
+        if candidate.name.startswith(prefix):
+            _remove_file(candidate)
+
+
+def _existing_download_mismatch_message(path: Path, expected_size: int | None) -> str:
+    try:
+        actual_size = path.stat().st_size
+    except OSError as exc:
+        return f"  existing file cannot be checked: {path}: {type(exc).__name__}: {exc}"
+    if expected_size is None:
+        return f"  existing file found without camera size; downloading again: {path} local={actual_size} bytes"
+    return (
+        f"  existing file size differs; downloading again: {path} "
+        f"local={actual_size} bytes camera={expected_size} bytes"
+    )
 
 
 def _clip_payload(payload: bytes, written: int, expected_size: int | None) -> bytes:

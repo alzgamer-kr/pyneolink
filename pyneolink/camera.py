@@ -30,6 +30,13 @@ from .voice import Voice
 
 
 class Camera(AbstractContextManager["Camera"]):
+    """High-level Reolink camera client.
+
+    `Camera` owns the transport connection, login state, encryption mode, and
+    module factories such as `sd_card()`, `battery()`, `motion()`, `voice()`,
+    and `settings()`.
+    """
+
     def __init__(
         self,
         config: CameraConfig | None = None,
@@ -48,6 +55,28 @@ class Camera(AbstractContextManager["Camera"]):
         state_path: str | Path | None = ".pyneolink_state.json",
         debug: bool = False,
     ) -> None:
+        """Create a camera client.
+
+        :param config: Optional ready `CameraConfig`. When provided, keyword
+            camera identity fields are ignored.
+        :param uuid: Reolink UID alias. Use this or `uid` for P2P access.
+        :param uid: Reolink UID. Use this or `uuid` for P2P access.
+        :param username: Camera username.
+        :param password: Camera password.
+        :param name: Human-readable camera name used in logs and state cache.
+        :param address: Direct camera address, optionally with port
+            (`host` or `host:port`). Defaults to port 9000.
+        :param cached_address: Previously known address to try before UID
+            discovery.
+        :param discovery: Discovery mode. Common values are `local`, `remote`,
+            `map`, `relay`, or `cellular`.
+        :param channel_id: Reolink channel id. Battery cameras usually use 0.
+        :param stream: Preferred stream selection for config consumers. Use
+            method-level `stream`/`quality` parameters for explicit operations.
+        :param timeout: Socket/protocol timeout in seconds.
+        :param state_path: JSON state cache path, or `None` to disable cache.
+        :param debug: Print protocol/debug messages when enabled.
+        """
         if config is None:
             camera_uid = uid or uuid
             config = CameraConfig(
@@ -82,6 +111,7 @@ class Camera(AbstractContextManager["Camera"]):
         self.close()
 
     def connect(self) -> None:
+        """Open a transport connection to the camera."""
         if (
             self.config.uid
             and not self.config.address
@@ -121,12 +151,14 @@ class Camera(AbstractContextManager["Camera"]):
             self.state.update_address(self.config.name, f"{host}:{port}", uid=self.config.uid, transport="tcp")
 
     def close(self) -> None:
+        """Close the current transport connection and clear login state."""
         if self.sock:
             self.sock.close()
             self.sock = None
         self.login_xml = ""
 
     def reconnect(self) -> None:
+        """Close, reconnect, and log in again."""
         self.close()
         self.connect()
         self.login()
@@ -136,9 +168,14 @@ class Camera(AbstractContextManager["Camera"]):
         return self._online_required > 0
 
     def require_online(self):
+        """Return a context manager that marks the camera as required online."""
         return CameraOnlineLease(self)
 
     def keepalive(self, *, timeout: float = 0.05) -> str:
+        """Run one lightweight keepalive/maintenance cycle.
+
+        :param timeout: Maximum time in seconds to wait for a camera packet.
+        """
         self.ensure_connected()
         if hasattr(self.sock, "maintain"):
             self.sock.maintain()
@@ -149,6 +186,11 @@ class Camera(AbstractContextManager["Camera"]):
         return f"msg_id={msg.header.msg_id} msg_num={msg.header.msg_num} response={msg.header.response_code}"
 
     def login(self, max_encryption: str = "aes") -> str:
+        """Log in and return the raw login XML.
+
+        :param max_encryption: Highest encryption mode to request from the
+            camera. `aes` is the normal/default choice.
+        """
         if self.sock is None:
             self.connect()
         if self.login_xml:
@@ -177,6 +219,11 @@ class Camera(AbstractContextManager["Camera"]):
         return self.login_xml
 
     def info(self, *, include_sensitive: bool = False) -> dict:
+        """Return normalized camera information.
+
+        :param include_sensitive: Include sensitive fields such as secrets when
+            `True`. They are redacted by default.
+        """
         self.ensure_connected()
         info = xml_to_dict(self.login_xml)
         if not include_sensitive:
@@ -189,18 +236,25 @@ class Camera(AbstractContextManager["Camera"]):
         }
 
     def sd_card(self) -> SdCard:
+        """Return the SD-card helper for listing and downloading recordings."""
         return SdCard(self)
 
     def get_uid(self) -> str | None:
+        """Read the camera UID if the camera exposes it."""
         self.ensure_connected()
         reply = self.command(MSG.UID)
         return find_text(reply.xml_root, "uid") or find_text(reply.xml_root, "UID")
 
     def reboot(self) -> None:
+        """Send the camera reboot command."""
         self.ensure_connected()
         self.command(MSG.REBOOT)
 
     def led(self, value: str | None = None) -> dict:
+        """Read or set the IR/LED mode.
+
+        :param value: `None` to read status, otherwise `on`, `off`, or `auto`.
+        """
         self.ensure_connected()
         if value is None:
             return self.settings().ir.status()
@@ -214,6 +268,12 @@ class Camera(AbstractContextManager["Camera"]):
         raise ValueError(msg.Error.IrModeValue)
 
     def snapshot(self, *, out: str | Path | None = None, stream_type: str = "main") -> bytes | Path:
+        """Capture a JPEG snapshot.
+
+        :param out: Optional file path or directory. When omitted, bytes are
+            returned. When a directory is provided, the camera file name is used.
+        :param stream_type: Snapshot stream type, usually `main` or `sub`.
+        """
         self.ensure_connected()
         msg_num = self.send(
             MSG.SNAP,
@@ -260,6 +320,14 @@ class Camera(AbstractContextManager["Camera"]):
         duration: float | None = None,
         stream: str = "mainStream",
     ) -> StreamRecorder | Path:
+        """Record the live stream locally as MPEG-TS.
+
+        :param out: Output file path or directory.
+        :param duration: Seconds to record. When omitted, a running
+            `StreamRecorder` is returned and the caller must stop it.
+        :param stream: Stream to record, for example `mainStream` or
+            `subStream`.
+        """
         self.ensure_connected()
         recorder = StreamRecorder(self, out=out, stream=stream, duration=duration).start()
         if duration is not None:
@@ -267,30 +335,65 @@ class Camera(AbstractContextManager["Camera"]):
         return recorder
 
     def battery(self) -> Battery:
+        """Return the battery helper."""
         return Battery(self)
 
     def motion(self, *, channel_id: int | None = None) -> Motion:
+        """Return the motion helper.
+
+        :param channel_id: Optional channel override. Defaults to the camera
+            config channel.
+        """
         return Motion(self, channel_id=channel_id)
 
     def motion_status(self, *, timeout: float = 3.0, channel_id: int | None = None) -> dict:
+        """Return one motion status snapshot.
+
+        :param timeout: Seconds to wait for a status reply.
+        :param channel_id: Optional channel override.
+        """
         return self.motion(channel_id=channel_id).status(timeout=timeout)
 
     def voice(self) -> Voice:
+        """Return the voice/talk helper."""
         return Voice(self)
 
     def settings(self) -> Settings:
+        """Return the settings helper."""
         return Settings(self)
 
     def battery_xml(self, *, mode: str = "reconnect") -> str | None:
+        """Return raw battery XML.
+
+        :param mode: `reconnect` closes between requests; `online` keeps the
+            camera session alive while polling.
+        """
         return self.battery().raw(mode=mode)
 
     def battery_info(self, *, mode: str = "reconnect") -> dict:
+        """Return parsed battery information.
+
+        :param mode: `reconnect` closes between requests; `online` keeps the
+            camera session alive while polling.
+        """
         return self.battery().info(mode=mode)
 
     def watch_battery(self, interval: float = 60.0, *, count: int | None = None, mode: str = "reconnect"):
+        """Yield battery information repeatedly.
+
+        :param interval: Delay between polls in seconds.
+        :param count: Optional maximum number of updates.
+        :param mode: `reconnect` or `online` polling mode.
+        """
         yield from self.battery().watch(interval=interval, count=count, mode=mode)
 
     def command(self, msg_id: int, payload: bytes = b"", *, extension: bytes = b""):
+        """Send a command and wait for the matching reply.
+
+        :param msg_id: Baichuan message id.
+        :param payload: Optional command payload bytes.
+        :param extension: Optional Baichuan extension bytes.
+        """
         self.ensure_connected()
         msg_num = self.send(msg_id, payload, extension=extension)
         return self._recv_matching(msg_id, msg_num)
@@ -326,6 +429,17 @@ class Camera(AbstractContextManager["Camera"]):
         msg_num: int | None = None,
         stream_type: int = 0,
     ) -> int:
+        """Send one Baichuan packet and return its message number.
+
+        :param msg_id: Baichuan message id.
+        :param payload: Optional payload bytes.
+        :param extension: Optional extension bytes.
+        :param binary_reply: Mark the reply as binary for payload decoding.
+        :param msg_class: Baichuan message class.
+        :param channel_id: Optional channel override.
+        :param msg_num: Optional explicit message number.
+        :param stream_type: Raw Baichuan stream type code.
+        """
         self.ensure_connected()
         sent_msg_num = self._next_msg() if msg_num is None else msg_num
         if binary_reply:
@@ -345,6 +459,11 @@ class Camera(AbstractContextManager["Camera"]):
         return sent_msg_num
 
     def start_stream(self, stream: str = "mainStream"):
+        """Start live stream payload delivery.
+
+        :param stream: Stream alias/name such as `high`, `low`, `mainStream`,
+            or `subStream`.
+        """
         self.ensure_connected()
         msg_num = self._next_msg()
         stream_name, stream_code, handle = stream_params(stream)
@@ -371,6 +490,12 @@ class Camera(AbstractContextManager["Camera"]):
                 raise TimeoutError(msg.Error.StreamStartTimeout.format(msg_num=msg_num))
 
     def stop_stream(self, stream: str = "mainStream", msg_num: int | None = None) -> None:
+        """Stop live stream payload delivery.
+
+        :param stream: Stream alias/name used to start the stream.
+        :param msg_num: Optional stream message number returned by
+            `start_stream()`.
+        """
         self.ensure_connected()
         _stream_name, stream_code, handle = stream_params(stream)
         sent_msg_num = self._next_msg() if msg_num is None else msg_num
@@ -400,6 +525,11 @@ class Camera(AbstractContextManager["Camera"]):
                 return
 
     def read_stream_payloads(self, stream: str = "mainStream"):
+        """Yield raw BCMedia payloads from a live stream.
+
+        :param stream: Stream alias/name such as `high`, `low`, `mainStream`,
+            or `subStream`.
+        """
         with self.require_online():
             msg_num = self.start_stream(stream)
             next_keepalive_at = time.monotonic() + 0.75
@@ -448,6 +578,7 @@ class Camera(AbstractContextManager["Camera"]):
         raise ValueError(msg.Error.CameraAddressRequired)
 
     def ensure_connected(self) -> None:
+        """Connect and log in if needed."""
         if self.sock is None:
             self.connect()
         if not self.login_xml:

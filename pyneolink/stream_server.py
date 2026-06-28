@@ -21,6 +21,8 @@ _DEFAULT_HLS_SEGMENT_SECONDS = 2.0
 
 
 class StreamServer:
+    """HTTP server for direct MPEG-TS and HLS camera streams."""
+
     def __init__(
         self,
         config: str | dict | Config = "config.json",
@@ -33,6 +35,17 @@ class StreamServer:
         hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
         hls_segment_seconds: float = _DEFAULT_HLS_SEGMENT_SECONDS,
     ) -> None:
+        """Create an HTTP live stream server.
+
+        :param config: Config path, config dict, or ready `Config` object.
+        :param host: Bind host override. Defaults to config `bind`.
+        :param port: Bind port override. Defaults to config `bind_port`.
+        :param state_path: Camera state cache path, or `None` to disable cache.
+        :param debug: Print protocol/debug output.
+        :param buffer_seconds: Startup buffer for direct MPEG-TS streams.
+        :param hls_buffer_mb: Maximum in-memory HLS timeshift buffer size.
+        :param hls_segment_seconds: Target HLS segment duration.
+        """
         self.config = _coerce_config(config)
         self.host = host if host is not None else self.config.bind
         self.port = port if port is not None else self.config.bind_port
@@ -43,6 +56,10 @@ class StreamServer:
         self.hls_segment_seconds = max(hls_segment_seconds, 0.5)
 
     def urls(self, *, host: str | None = None) -> list[str]:
+        """Return stream URLs for configured cameras.
+
+        :param host: Display host override for generated URLs.
+        """
         display_host = host or _display_host(self.host)
         urls = []
         for camera in self.config.cameras or []:
@@ -54,6 +71,7 @@ class StreamServer:
         return urls
 
     def serve_forever(self) -> None:
+        """Start serving streams and block forever."""
         server = _StreamServer((self.host, self.port), _StreamHandler)
         server.config = self.config
         server.state_path = self.state_path
@@ -83,6 +101,17 @@ def serve_streams(
     hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
     hls_segment_seconds: float = _DEFAULT_HLS_SEGMENT_SECONDS,
 ) -> None:
+    """Serve configured camera streams forever.
+
+    :param config_path: Path to JSON/TOML config file.
+    :param host: Bind host override.
+    :param port: Bind port override.
+    :param state_path: Camera state cache path, or `None` to disable cache.
+    :param debug: Print protocol/debug output.
+    :param buffer_seconds: Startup buffer for direct MPEG-TS streams.
+    :param hls_buffer_mb: Maximum in-memory HLS timeshift buffer size.
+    :param hls_segment_seconds: Target HLS segment duration.
+    """
     StreamServer(
         config_path,
         host=host,
@@ -319,12 +348,19 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
 
 class MpegTsMuxer:
+    """Small MPEG-TS muxer for parsed Reolink media packets."""
+
     PAT_PID = 0x0000
     PMT_PID = 0x0100
     VIDEO_PID = 0x0101
     AUDIO_PID = 0x0102
 
     def __init__(self, codec: str, *, fps: int = 15) -> None:
+        """Create an MPEG-TS muxer.
+
+        :param codec: Video codec name, currently `H264` or `H265`.
+        :param fps: Frames per second used when packet timestamps are missing.
+        """
         self.codec = codec
         self.fps = max(fps, 1)
         self.continuity: dict[int, int] = {}
@@ -333,6 +369,12 @@ class MpegTsMuxer:
         self.audio_pts = 0
 
     def feed(self, packet: MediaPacket) -> Iterable[bytes]:
+        """
+        Convert one parsed media packet into MPEG-TS packets.
+
+        :param packet: Parsed video or audio packet.
+        """
+
         if not self.tables_written:
             yield from self.table_packets()
 
@@ -394,6 +436,8 @@ class MpegTsMuxer:
 
 @dataclass
 class HlsSegment:
+    """One in-memory HLS media segment."""
+
     sequence: int
     duration: float
     data: bytes
@@ -401,6 +445,8 @@ class HlsSegment:
 
 
 class HlsSession:
+    """Background HLS timeshift session for one camera stream."""
+
     def __init__(
         self,
         camera_config,
@@ -411,6 +457,15 @@ class HlsSession:
         buffer_bytes: int,
         segment_seconds: float,
     ) -> None:
+        """Create an HLS session.
+
+        :param camera_config: Camera configuration for this session.
+        :param stream: Stream name, usually `mainStream` or `subStream`.
+        :param state_path: Camera state cache path.
+        :param debug: Print protocol/debug output.
+        :param buffer_bytes: Maximum in-memory HLS buffer size.
+        :param segment_seconds: Target HLS segment duration.
+        """
         self.camera_config = camera_config
         self.stream = stream
         self.state_path = state_path
@@ -434,6 +489,12 @@ class HlsSession:
             thread.start()
 
     def playlist(self, *, timeout: float = 15.0) -> str:
+        """
+        Return the current HLS playlist, waiting briefly for the first segment.
+
+        :param timeout: Seconds to wait for the first segment.
+        """
+
         self.start()
         deadline = time.monotonic() + timeout
         with self.condition:
@@ -445,6 +506,12 @@ class HlsSession:
         return _hls_playlist(segments, self.segment_seconds)
 
     def segment(self, sequence: int) -> HlsSegment | None:
+        """
+        Return a buffered HLS segment by sequence number.
+
+        :param sequence: HLS media sequence number.
+        """
+
         self.start()
         with self.lock:
             for segment in self.segments:

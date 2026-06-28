@@ -10,11 +10,19 @@ from pyneolink.core.xmlutil import xml_to_dict
 
 
 class Pir:
+    """PIR motion sensor settings helper."""
+
     def __init__(self, camera, *, rf_id: int | None = None) -> None:
+        """Create a PIR settings helper.
+
+        :param camera: Connected or connectable `Camera` instance.
+        :param rf_id: Optional RF/PIR id override. Defaults to camera channel.
+        """
         self.camera = camera
         self.rf_id = camera.config.channel_id if rf_id is None else rf_id
 
     def status(self) -> dict:
+        """Return PIR status and raw PIR configuration."""
         element = self._get_config()
         xml_text = ET.tostring(element, encoding="unicode")
         enable = _int_text(element, "enable")
@@ -29,9 +37,11 @@ class Pir:
         }
 
     def on(self) -> dict:
+        """Enable PIR motion detection."""
         return self._set_enabled(True)
 
     def off(self) -> dict:
+        """Disable PIR motion detection."""
         return self._set_enabled(False)
 
     def _set_enabled(self, enabled: bool) -> dict:

@@ -20,7 +20,13 @@ from .internal.voice import (
 
 
 class Voice:
+    """Two-way talk, audio playback, microphone, tone, and siren helper."""
+
     def __init__(self, camera) -> None:
+        """Create a voice/talk helper.
+
+        :param camera: Connected or connectable `Camera` instance.
+        """
         self.camera = camera
         self._lease = None
         self._started = False
@@ -38,6 +44,7 @@ class Voice:
             self._lease = None
 
     def ability(self) -> TalkConfig:
+        """Return camera talk capability/configuration."""
         reply = self.camera.command(MSG.TALKABILITY, extension=payloads.extension.format(channel_id=self.camera.config.channel_id))
         if reply.header.response_code != 200:
             raise ProtocolError(msg.Error.Response.format(response_code=reply.header.response_code))
@@ -54,6 +61,16 @@ class Voice:
         wait_ack: bool = False,
         on_ready: Callable[[TalkConfig], None] | None = None,
     ) -> None:
+        """Play an audio file through the camera speaker.
+
+        :param file: Audio file path. FFmpeg/FFprobe are used for validation and
+            conversion when needed.
+        :param volume: Linear PCM volume multiplier before ADPCM encoding.
+        :param codec: Audio conversion backend. `python` is the normal choice.
+        :param wait_ack: Wait for a camera reply after each talk packet.
+        :param on_ready: Optional callback called with `TalkConfig` after the
+            talk channel starts.
+        """
         with self.camera.require_online():
             config = self.ability()
             self._start(config)
@@ -77,6 +94,15 @@ class Voice:
         wait_ack: bool = False,
         on_ready: Callable[[TalkConfig], None] | None = None,
     ) -> None:
+        """Play a generated tone through the camera speaker.
+
+        :param frequency: Tone frequency in Hz.
+        :param seconds: Tone duration in seconds.
+        :param volume: Linear PCM volume multiplier before ADPCM encoding.
+        :param wait_ack: Wait for a camera reply after each talk packet.
+        :param on_ready: Optional callback called with `TalkConfig` after the
+            talk channel starts.
+        """
         with self.camera.require_online():
             config = self.ability()
             self._start(config)
@@ -99,6 +125,15 @@ class Voice:
         wait_ack: bool = False,
         on_ready: Callable[[TalkConfig], None] | None = None,
     ) -> None:
+        """Stream local microphone input to the camera speaker.
+
+        :param volume: Linear PCM volume multiplier before ADPCM encoding.
+        :param seconds: Optional capture duration. When omitted, capture runs
+            until interrupted by the input source.
+        :param wait_ack: Wait for a camera reply after each talk packet.
+        :param on_ready: Optional callback called with `TalkConfig` after the
+            talk channel starts.
+        """
         with self.camera.require_online():
             config = self.ability()
             self._start(config)
@@ -110,9 +145,16 @@ class Voice:
                 self.stop()
 
     def siren(self) -> None:
+        """Trigger the camera built-in siren once."""
         self._siren_command()
 
     def stop(self, *, wait: bool = False, force: bool = False) -> None:
+        """Stop the talk channel.
+
+        :param wait: Wait briefly for a stop reply.
+        :param force: Send stop even if this helper does not think talk is
+            currently started.
+        """
         if not self._started and not force:
             return
         try:

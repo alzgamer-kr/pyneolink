@@ -11,6 +11,18 @@ from .const import msg
 
 @dataclass
 class MediaPacket:
+    """Parsed BCMedia packet.
+
+    :param kind: Packet kind such as `info`, `iframe`, `pframe`, `aac`, or
+        `adpcm`.
+    :param codec: Video codec when known, usually `H264` or `H265`.
+    :param timestamp_us: Packet timestamp in microseconds when present.
+    :param data: Raw packet payload.
+    :param width: Video width from stream info.
+    :param height: Video height from stream info.
+    :param fps: Frames per second from stream info.
+    """
+
     kind: str
     codec: str | None
     timestamp_us: int | None
@@ -21,10 +33,17 @@ class MediaPacket:
 
 
 class MediaParser:
+    """Incremental BCMedia parser."""
+
     def __init__(self) -> None:
+        """Create an empty parser."""
         self._buf = bytearray()
 
     def feed(self, data: bytes) -> Iterator[MediaPacket]:
+        """Feed bytes and yield complete media packets.
+
+        :param data: BCMedia bytes to append to the parser buffer.
+        """
         self._buf.extend(data)
         while True:
             packet = self._try_one()

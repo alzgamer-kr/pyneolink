@@ -10,6 +10,20 @@ from .core.const import msg
 
 @dataclass
 class CameraConfig:
+    """Camera configuration.
+
+    :param name: Human-readable camera name.
+    :param username: Camera username.
+    :param password: Camera password.
+    :param address: Direct address, optionally `host:port`.
+    :param uid: Reolink UID for P2P access.
+    :param discovery: Discovery mode such as `local`, `remote`, `map`, `relay`,
+        or `cellular`.
+    :param channel_id: Camera channel id.
+    :param stream: Preferred stream selection for config consumers.
+    :param cached_address: Previously known address.
+    """
+
     name: str
     username: str = "admin"
     password: str = "123456"
@@ -23,11 +37,23 @@ class CameraConfig:
 
 @dataclass
 class Config:
+    """Top-level PyNeolink configuration.
+
+    :param bind: HTTP stream server bind host.
+    :param bind_port: HTTP stream server bind port.
+    :param cameras: Configured cameras.
+    """
+
     bind: str = "0.0.0.0"
     bind_port: int = 8554
     cameras: list[CameraConfig] | None = None
 
     def camera(self, name: str | None) -> CameraConfig:
+        """Return one camera config by name.
+
+        :param name: Camera name. When omitted, exactly one camera must be
+            configured.
+        """
         cams = self.cameras or []
         if name is None:
             if len(cams) != 1:
@@ -40,6 +66,10 @@ class Config:
 
 
 def load_config(path: str | Path) -> Config:
+    """Load JSON or TOML config from disk.
+
+    :param path: Config file path.
+    """
     path = Path(path)
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".json":
@@ -50,6 +80,10 @@ def load_config(path: str | Path) -> Config:
 
 
 def config_from_dict(data: dict) -> Config:
+    """Build `Config` from a plain dict.
+
+    :param data: Parsed config dictionary.
+    """
     cameras = [
         CameraConfig(
             name=item["name"],
@@ -68,6 +102,10 @@ def config_from_dict(data: dict) -> Config:
 
 
 def config_to_dict(config: Config) -> dict:
+    """Convert `Config` to a plain serializable dict.
+
+    :param config: Config object to convert.
+    """
     return {
         "bind": config.bind,
         "bind_port": config.bind_port,
@@ -93,4 +131,9 @@ def config_to_dict(config: Config) -> dict:
 
 
 def write_json_config(config: Config, path: str | Path) -> None:
+    """Write config as formatted JSON.
+
+    :param config: Config object to write.
+    :param path: Destination file path.
+    """
     Path(path).write_text(json.dumps(config_to_dict(config), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

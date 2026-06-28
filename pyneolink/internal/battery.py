@@ -92,8 +92,8 @@ def charge_type_from_adapter(adapter_status: str) -> str:
 
 def charge_type_label(charge_type: str) -> str:
     return {
-        "solar_panel": "Сонячна панель",
-        "mains": "Мережа",
-        "none": "Немає",
-        "unknown": "Невідомо",
+        "solar_panel": "Solar panel",
+        "mains": "Mains",
+        "none": "None",
+        "unknown": "Unknown",
     }[charge_type]

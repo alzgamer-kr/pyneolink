@@ -1,6 +1,35 @@
 # Changelog
 
-## 0.3.1 - Unreleased
+## 0.3.2
+
+Downloader reliability improvements.
+
+### Added
+
+- Added `CameraConnectionError` for unrecoverable camera reconnect failures.
+- Added `reconnect_retries` to `SdCard.download()` for interrupted long downloads.
+- Added `rewrite_exists` to `SdCard.download()` to skip already finalized local files.
+- Added IDE-friendly docstrings for SDK classes, CLI helpers, and core protocol components.
+
+### Changed
+
+- Treat existing non-empty `.mp4` files as complete when `rewrite_exists=False`.
+- Remove stale `.part` files for a recording when the finalized `.mp4` is skipped.
+- Translated internal documentation to English for publication.
+
+---
+
+## 0.3.1
+
+PyPI metadata and README link update.
+
+### Changed
+
+- Updated package metadata and installation links for the first PyPI publication.
+
+---
+
+## 0.3.0
 
 Initial public alpha preparation.
 

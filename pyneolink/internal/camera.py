@@ -11,7 +11,13 @@ def split_address(address: str) -> tuple[str, int]:
 
 
 class CameraOnlineLease:
+    """Context manager that marks a camera as required online."""
+
     def __init__(self, camera) -> None:
+        """Create an online lease context manager.
+
+        :param camera: Camera whose online lease counter should be adjusted.
+        """
         self.camera = camera
         self.active = False
 

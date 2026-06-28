@@ -9,6 +9,8 @@ from .core.media import MediaParser, MediaPacket
 
 
 class StreamRecorder:
+    """Background local recorder for a camera live stream."""
+
     def __init__(
         self,
         camera,
@@ -17,6 +19,14 @@ class StreamRecorder:
         stream: str = "mainStream",
         duration: float | None = None,
     ) -> None:
+        """Create a local stream recorder.
+
+        :param camera: Connected `Camera` instance.
+        :param out: Output file path or directory. Directories get an automatic
+            `.ts` file name.
+        :param stream: Stream alias/name, usually `mainStream` or `subStream`.
+        :param duration: Optional recording duration in seconds.
+        """
         self.camera = camera
         self.path = _record_output_path(out)
         self.stream = stream
@@ -40,6 +50,7 @@ class StreamRecorder:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> "StreamRecorder":
+        """Start recording in a background thread."""
         if self._thread is not None:
             return self
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,6 +59,10 @@ class StreamRecorder:
         return self
 
     def stop(self, timeout: float | None = 10.0) -> Path:
+        """Request stop and return the output path.
+
+        :param timeout: Seconds to wait for the recorder thread, or `None`.
+        """
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
@@ -56,6 +71,10 @@ class StreamRecorder:
         return self.path
 
     def wait(self, timeout: float | None = None) -> Path:
+        """Wait for recording completion and return the output path.
+
+        :param timeout: Seconds to wait, or `None` for no timeout.
+        """
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         if self.running:
@@ -160,4 +179,3 @@ def _fps_from_packets(packets: list[MediaPacket]) -> int:
         if packet.kind == "info" and packet.fps:
             return packet.fps
     return 15
-
