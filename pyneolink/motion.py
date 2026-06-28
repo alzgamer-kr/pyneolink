@@ -12,15 +12,31 @@ from .core.const import EVENTS, MSG, msg
 
 
 class Motion:
+    """Motion status/watch helper returned by `Camera.motion()`."""
+
     def __init__(self, camera, *, channel_id: int | None = None) -> None:
+        """Create a motion helper.
+
+        :param camera: Connected or connectable `Camera` instance.
+        :param channel_id: Optional channel override.
+        """
         self.camera = camera
         self.channel_id = camera.config.channel_id if channel_id is None else channel_id
 
     def status(self, *, timeout: float = 3.0) -> dict:
+        """Read one motion status snapshot.
+
+        :param timeout: Seconds to wait for a motion status packet.
+        """
         event, known = self.watch().status(timeout=timeout)
         return event.to_dict(known=known)
 
     def watch(self, *, duration: float | None = None, keepalive_interval: float = 0.75) -> "CameraEvents":
+        """Create an iterator of motion events.
+
+        :param duration: Optional maximum watch time in seconds.
+        :param keepalive_interval: Seconds between keepalive packets.
+        """
         return CameraEvents(
             self.camera,
             channel_id=self.channel_id,
@@ -31,6 +47,8 @@ class Motion:
 
 @dataclass(frozen=True)
 class CameraEvent:
+    """Normalized motion event returned by `Motion.watch()`."""
+
     type: EVENTS
     active: bool
     channel_id: int | None = None
@@ -51,6 +69,10 @@ class CameraEvent:
         return f"{self.type.value} {state}"
 
     def with_type(self, event_type: EVENTS) -> "CameraEvent":
+        """Return a copy with another event type.
+
+        :param event_type: Replacement normalized event type.
+        """
         return CameraEvent(
             type=event_type,
             active=self.active,
@@ -64,6 +86,10 @@ class CameraEvent:
         )
 
     def to_dict(self, *, known: bool = True) -> dict:
+        """Convert the event to a plain dict.
+
+        :param known: Whether the status came from a real camera packet.
+        """
         return {
             "type": self.type.value,
             "active": self.active,
@@ -79,6 +105,8 @@ class CameraEvent:
 
 
 class CameraEvents(Iterator[CameraEvent]):
+    """Iterator/context manager that yields normalized camera motion events."""
+
     def __init__(
         self,
         camera,
@@ -87,6 +115,13 @@ class CameraEvents(Iterator[CameraEvent]):
         duration: float | None = None,
         keepalive_interval: float = 0.75,
     ) -> None:
+        """Create a motion event iterator.
+
+        :param camera: Connected or connectable `Camera` instance.
+        :param channel_id: Optional channel override.
+        :param duration: Optional maximum watch time in seconds.
+        :param keepalive_interval: Seconds between keepalive packets.
+        """
         self.camera = camera
         self.channel_id = camera.config.channel_id if channel_id is None else channel_id
         self.duration = duration
@@ -137,6 +172,7 @@ class CameraEvents(Iterator[CameraEvent]):
         raise StopIteration
 
     def start(self) -> "CameraEvents":
+        """Start listening for camera motion events."""
         if self._active:
             return self
         self._lease = self.camera.require_online()
@@ -151,6 +187,7 @@ class CameraEvents(Iterator[CameraEvent]):
         return self
 
     def close(self) -> None:
+        """Stop listening and release the online lease."""
         self._active = False
         self._pending.clear()
         self._deadline = None
@@ -160,6 +197,10 @@ class CameraEvents(Iterator[CameraEvent]):
             self._lease = None
 
     def status(self, *, timeout: float = 3.0) -> tuple[CameraEvent, bool]:
+        """Read one motion status packet.
+
+        :param timeout: Seconds to wait before returning an unknown status.
+        """
         self.start()
         deadline = time.monotonic() + max(0.0, timeout)
         try:
@@ -197,6 +238,11 @@ class CameraEvents(Iterator[CameraEvent]):
 
 
 def parse_motion_events(root: ET.Element | None, *, channel_id: int = 0) -> list[CameraEvent]:
+    """Parse camera motion XML into normalized events.
+
+    :param root: XML root from a motion response.
+    :param channel_id: Channel id to accept.
+    """
     if root is None:
         return []
     events: list[CameraEvent] = []

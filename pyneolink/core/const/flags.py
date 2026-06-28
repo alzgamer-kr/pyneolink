@@ -4,6 +4,8 @@ from enum import IntEnum, StrEnum
 
 
 class MAGIC(IntEnum):
+    """Protocol magic constants."""
+
     BAICHUAN = 0x0ABCDEF0
     BAICHUAN_REVERSED = 0x0FEDCBA0
     DISCOVERY = 0x2A87CF3A
@@ -12,6 +14,8 @@ class MAGIC(IntEnum):
 
 
 class MSG_CLASS(IntEnum):
+    """Baichuan message class constants."""
+
     LEGACY = 0x6514
     MODERN_REPLY = 0x6614
     MODERN = 0x6414
@@ -20,17 +24,23 @@ class MSG_CLASS(IntEnum):
 
 
 class BCMEDIA(IntEnum):
+    """BCMedia helper constants."""
+
     AUDIO_ADPCM_MAGIC = 0x62773130
     AUDIO_ADPCM_STREAM_TYPE = 0x0100
 
 
 class AUDIO_PLAY(IntEnum):
+    """Camera built-in audio/siren constants."""
+
     SIREN_MODE = 0
     SIREN_TRIGGER = 0
     DEFAULT_TIMES = 1
 
 
 class MSG(IntEnum):
+    """Baichuan message id constants."""
+
     LOGIN = 1
     LOGOUT = 2
     VIDEO = 3
@@ -68,6 +78,8 @@ class MSG(IntEnum):
 
 
 class EVENTS(StrEnum):
+    """Normalized motion event names."""
+
     human = "human"
     vehicle = "vehicle"
     motion = "motion"

@@ -1,186 +1,160 @@
 # UDP P2P Transport
 
-Reolink UID/P2P складається з двох шарів:
+Reolink UID/P2P has two layers:
 
-1. discovery/register XML packets;
-2. reliable-ish UDP data channel для Baichuan bytes.
+1. discovery/registration XML packets;
+2. a reliable-ish UDP data channel that carries Baichuan bytes.
 
-Discovery helpers живуть у `core/discovery.py`.
+Discovery helpers live in `pyneolink/core/discovery.py`.
 
-Socket-like UDP Baichuan channel живе у `core/udp_transport.py`.
+The socket-like UDP Baichuan channel lives in `pyneolink/core/udp_transport.py`.
 
-## Discovery packet format
+## Discovery Packet Format
 
-`encode_discovery_xml(tid, xml)`:
+Discovery XML packets are encoded as:
 
-1. XML кодується UTF-8;
-2. payload шифрується `udp_xor(tid, payload)`;
-3. рахується `neolink_crc32(payload)`;
-4. додається header:
+1. XML is encoded as UTF-8;
+2. payload is encrypted with `udp_xor(tid, payload)`;
+3. `neolink_crc32(payload)` is calculated;
+4. a header is added:
 
 ```text
-MAGIC.DISCOVERY = 0x2A87CF3A
-payload_size
-1
+magic
 tid
-crc32
-payload
+checksum
+payload_size
 ```
 
-`decode_discovery_packet()` робить зворотне: перевіряє magic, size, checksum і повертає `(tid, xml)`.
+`decode_discovery_packet()` reverses the process: it validates magic, size, and checksum, then returns `(tid, xml)`.
 
-## Local discovery
+## Local Discovery
 
-`local_discover()` відправляє UDP broadcast на порт `2015`:
+`local_discover()` sends UDP broadcast to port `2015`:
 
-- `C2D_S` для загального пошуку;
-- `C2D_C` для UID-specific пошуку.
+- `C2D_S` for general discovery;
+- `C2D_C` for UID-specific discovery.
 
-Камера може відповісти XML або іншим UDP payload. Якщо UID збігається, створюється `DiscoveryHit`.
+The camera may reply with XML or another UDP payload. If the UID matches, a `DiscoveryHit` is produced.
 
-Цей метод використовується для пошуку, але прямий live Baichuan channel відкриває не він, а `connect_local_direct()`.
+This method is used for discovery, but it does not open the live Baichuan channel. That is done by `connect_local_direct()`.
 
-## Local direct connection
+## Local Direct UDP
 
 `connect_local_direct(uid)`:
 
-1. відкриває UDP socket для Baichuan data;
-2. відкриває discovery socket;
-3. генерує `client_id`;
-4. broadcast-ить `C2D_C` з UID, client port, cid, mtu;
-5. чекає `D2C_C_R`;
-6. перевіряє `cid`, `did`, `rsp`;
-7. створює `UdpBcConnection(sock, addr, client_id, camera_id)`;
-8. відправляє heartbeat.
+1. opens a UDP socket for Baichuan data;
+2. opens a discovery socket;
+3. generates `client_id`;
+4. broadcasts `C2D_C` with UID, client port, cid, and MTU;
+5. waits for `D2C_C_R`;
+6. validates `cid`, `did`, and `rsp`;
+7. creates `UdpBcConnection(sock, addr, client_id, camera_id)`;
+8. sends a heartbeat.
 
-Це найкоротший шлях, коли камера доступна у LAN.
+This is the shortest path when the camera is reachable on the LAN.
 
-## Remote relay connection
+## Remote UID Lookup
 
-`connect_relay(uid)` відкриває P2P/relay шлях.
+`connect_relay(uid)` opens the P2P/relay path.
 
-### 1. P2P lookup
+The first step is:
 
-`_lookup_with_socket()` відправляє `C2M_Q` на `p2p*.reolink.com:9999`.
-
-Потрібна відповідь:
-
-```xml
-<M2C_Q_R>
-  <reg>...</reg>
-  <relay>...</relay>
-  <t>...</t>
-</M2C_Q_R>
+```python
+_lookup_with_socket()
 ```
 
-Неповні відповіді без `reg`/`relay` ігноруються.
+It sends `C2M_Q` to `p2p*.reolink.com:9999`.
 
-### 2. Register client
+The useful reply contains:
 
-Далі `connect_relay()` відправляє на register server:
+- `reg`: register server address;
+- `relay`: relay server address;
+- `t`: auxiliary relay/tunnel address;
+- camera/client ids;
+- NAT mapping information.
 
-```xml
-<C2R_C>
-  <uid>...</uid>
-  <cli><ip>local_ip</ip><port>local_port</port></cli>
-  <relay><ip>relay_ip</ip><port>relay_port</port></relay>
-  <cid>client_id</cid>
-  ...
-</C2R_C>
-```
+Incomplete replies without `reg`/`relay` are ignored.
 
-Потрібна відповідь `R2C_C_R`, з якої береться:
+## Register Server
+
+Next, `connect_relay()` sends `C2R_C` to the register server.
+
+The expected reply is `R2C_C_R`, which provides:
 
 - `sid`;
-- `dev`;
-- `dmap`;
-- `relay` або `relayt`.
+- local camera address candidate;
+- mapped public address candidate;
+- relay or relay-t address.
 
-### 3. Open registered channel
+## Candidate Selection
 
-Код формує список candidates:
+The code builds a candidate list:
 
-- `local`;
-- `map`;
-- `relay`.
+- local;
+- map;
+- relay.
 
-На кожен candidate відправляється:
+It sends `C2D_T` to every candidate.
 
-```xml
-<C2D_T>
-  <sid>...</sid>
-  <conn>local|map|relay</conn>
-  <cid>client_id</cid>
-  <mtu>1350</mtu>
-</C2D_T>
-```
+The first valid `D2C_CFM` with the expected `cid`, `sid`, `did`, and `conn` wins.
 
-Перший valid `D2C_CFM` з правильним `cid`, `sid`, `did`, `conn` виграє.
-
-Після цього відправляється `C2R_CFM` на register server і створюється `UdpBcConnection`.
+After that, `C2R_CFM` is sent to the register server and a `UdpBcConnection` is created.
 
 ## `UdpBcConnection`
 
-Цей клас робить UDP канал схожим на TCP socket:
+This class makes the UDP channel behave like a socket:
 
 - `sendall(data)`;
 - `recv(size)`;
 - `recv_some(size)`;
-- `settimeout(timeout)`;
+- `settimeout(value)`;
 - `close()`.
 
-Baichuan code не знає, що під ним UDP: `recv_message(sock, cipher)` працює і з TCP socket, і з `UdpBcConnection`.
+Baichuan code does not need to know whether it is using TCP or UDP: `recv_message(sock, cipher)` works with both a TCP socket and `UdpBcConnection`.
 
-## UDP data packets
+## Data Chunks
 
-Data packet:
-
-```text
-MAGIC.UDP_DATA = 0x2A87CF10
-connection_id
-0
-packet_id
-payload_size
-payload
-```
-
-ACK packet:
+`sendall()` splits Baichuan bytes into chunks up to:
 
 ```text
-MAGIC.UDP_ACK = 0x2A87CF20
-connection_id
-0
-group_id
-packet_id
-latency
-payload_size
-payload
+MTU - UDP_DATA_HEADER_SIZE
 ```
 
-`sendall()` розбиває Baichuan bytes на chunks до `MTU - UDP_DATA_HEADER_SIZE`.
+`recv()` reassembles chunks in order using `next_recv_id`.
 
-`recv()` збирає chunks у правильному порядку через `next_recv_id`.
+The connection tracks:
 
-## ACK, resend, heartbeat
+- sent chunks waiting for ACK;
+- received chunks waiting for missing gaps;
+- duplicate packets;
+- ignored packets;
+- data byte counters.
 
-`UdpBcConnection._maintenance()` викликається під час read timeout:
+## ACK, Resend, And Heartbeat
 
-- форсує ACK, якщо давно не відправлявся;
-- resend-ить unacked sent chunks;
-- відправляє P2P heartbeat раз на секунду.
+`UdpBcConnection._maintenance()` runs during read timeouts:
 
-ACK payload описує, які packet ids після останнього contiguous packet вже отримані. Це допомагає при gaps.
+- forces ACK when no ACK has been sent recently;
+- resends unacked sent chunks;
+- sends a P2P heartbeat once per second.
 
-## Debug snapshot
+ACK payloads describe which packet ids after the last contiguous packet have already been received. This helps with gaps.
 
-`debug_snapshot()` повертає:
+## Debug Snapshot
 
-- next/last/max packet ids;
-- buffered bytes;
-- pending gaps;
-- data/duplicate/ignored counters;
-- ACK counters;
-- heartbeat/resend counters;
-- seconds since data.
+`debug_snapshot()` returns transport counters such as:
 
-Це використовується у SD download diagnostics.
+- `udp_next_recv_id`;
+- `udp_max_packet_id`;
+- `udp_pending_chunks`;
+- `udp_pending_gaps`;
+- `udp_buffered_bytes`;
+- `udp_data_packets`;
+- `udp_data_bytes`;
+- `udp_duplicates`;
+- `udp_acks_sent`;
+- `udp_acks_received`;
+- `udp_resend_packets`;
+- `udp_seconds_since_data`.
+
+This is used in SD-card download diagnostics.

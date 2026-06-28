@@ -18,11 +18,19 @@ _MODE_TO_STATE = {value: key for key, value in _STATE_TO_MODE.items()}
 
 
 class Ir:
+    """IR light settings helper."""
+
     def __init__(self, camera, *, channel_id: int | None = None) -> None:
+        """Create an IR light settings helper.
+
+        :param camera: Connected or connectable `Camera` instance.
+        :param channel_id: Optional channel override.
+        """
         self.camera = camera
         self.channel_id = camera.config.channel_id if channel_id is None else channel_id
 
     def status(self) -> dict:
+        """Return IR light status."""
         element = self._get_config()
         xml_text = ET.tostring(element, encoding="unicode")
         state = (find_text(element, "state") or "").strip()
@@ -36,12 +44,15 @@ class Ir:
         }
 
     def on(self) -> dict:
+        """Force IR light on."""
         return self._set_mode("on")
 
     def off(self) -> dict:
+        """Force IR light off."""
         return self._set_mode("off")
 
     def auto(self) -> dict:
+        """Let the camera control IR light automatically."""
         return self._set_mode("auto")
 
     def _set_mode(self, mode: str) -> dict:

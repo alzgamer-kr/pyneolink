@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .eggs/
 .pytest_cache/
+.tmp/
 .ruff_cache/
 .mypy_cache/
 .pyre/

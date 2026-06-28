@@ -19,6 +19,8 @@ UDP_DATA_HEADER_SIZE = 20
 
 
 class UdpBcConnection:
+    """Socket-like reliable UDP channel for Baichuan bytes."""
+
     def __init__(
         self,
         sock: socket.socket,
@@ -29,6 +31,15 @@ class UdpBcConnection:
         timeout: float = 10.0,
         heartbeat_tid: int | None = None,
     ) -> None:
+        """Create a UDP Baichuan connection.
+
+        :param sock: UDP socket.
+        :param addr: Remote camera/relay address.
+        :param client_id: Local/client connection id.
+        :param camera_id: Remote/camera connection id.
+        :param timeout: Read timeout in seconds.
+        :param heartbeat_tid: Optional discovery heartbeat transaction id.
+        """
         self.sock = sock
         self.addr = addr
         self.client_id = client_id
@@ -65,9 +76,21 @@ class UdpBcConnection:
         self.sock.settimeout(0.01)
 
     def settimeout(self, timeout: float | None) -> None:
+        """
+        Set the socket-level receive timeout used by the stream wrapper.
+
+        :param timeout: Timeout in seconds, or ``None`` to keep the current value.
+        """
+
         self.timeout = timeout or self.timeout
 
     def sendall(self, data: bytes) -> None:
+        """
+        Send bytes as tracked UDP chunks.
+
+        :param data: Bytes to send.
+        """
+
         for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
             packet_id = self.next_send_id
             packet = encode_udp_data(self.camera_id, packet_id, chunk)
@@ -77,6 +100,12 @@ class UdpBcConnection:
         self.last_resend_at = time.monotonic()
 
     def send_untracked(self, data: bytes) -> None:
+        """
+        Send bytes as UDP chunks without storing them for resend.
+
+        :param data: Bytes to send.
+        """
+
         for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
             packet_id = self.next_send_id
             packet = encode_udp_data(self.camera_id, packet_id, chunk)
@@ -84,6 +113,12 @@ class UdpBcConnection:
             self.next_send_id += 1
 
     def recv(self, size: int) -> bytes:
+        """
+        Receive exactly ``size`` bytes from the buffered UDP stream.
+
+        :param size: Number of bytes to return.
+        """
+
         deadline = time.monotonic() + self.timeout
         while len(self.buffer) < size:
             if time.monotonic() > deadline:
@@ -94,6 +129,12 @@ class UdpBcConnection:
         return result
 
     def recv_some(self, size: int) -> bytes:
+        """
+        Receive up to ``size`` bytes once buffered data is available.
+
+        :param size: Maximum number of bytes to return.
+        """
+
         deadline = time.monotonic() + self.timeout
         while not self.buffer:
             if time.monotonic() > deadline:
@@ -115,6 +156,12 @@ class UdpBcConnection:
         self.sent_chunks.clear()
 
     def set_max_pending_chunks(self, limit: int | None) -> None:
+        """
+        Limit how many future UDP chunks are buffered before older gaps are skipped.
+
+        :param limit: Maximum pending chunk count, or ``None`` for no limit.
+        """
+
         self.max_pending_chunks = limit
 
     def _recv_one(self) -> None:

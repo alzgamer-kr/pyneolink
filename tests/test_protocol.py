@@ -1,10 +1,11 @@
 from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, Settings, StreamServer, Voice, config_from_dict
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
-from pyneolink.sd_card import SdCard
+from pyneolink.sd_card import DownloadSizeMismatch, SdCard
 from pyneolink.core.bc import Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
 from pyneolink.core.const import MSG, MSG_CLASS, payloads
+from pyneolink.errors import CameraConnectionError
 from pyneolink.core.media import MediaParser, extract_embedded_mp4
 from pyneolink.motion import CameraEvent, CameraEvents, parse_motion_events
 from pyneolink.settings import Ir, Pir
@@ -509,7 +510,7 @@ def test_battery_xml_parses_status_fields():
     assert info["level_percent"] == 87
     assert info["is_charging"] is True
     assert info["charge_type"] == "solar_panel"
-    assert info["charge_type_label"] == "Сонячна панель"
+    assert info["charge_type_label"] == "Solar panel"
     assert info["low_power"] is False
     assert info["raw"]["adapterStatus"] == "solarPanel"
 
@@ -1425,6 +1426,112 @@ def test_sd_card_filter_and_danger_guards():
         pass
     else:
         raise AssertionError("format must require an explicit confirmation")
+
+
+def test_sd_card_download_skips_existing_file(tmp_path):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    target = tmp_path / "clip.mp4"
+    target.write_bytes(b"12345")
+    messages = []
+    sd_card = SdCard(FakeCamera())
+
+    result = sd_card.download(
+        {"file_name": "clip.mp4", "size": 5},
+        tmp_path,
+        rewrite_exists=False,
+        progress=messages.append,
+    )
+
+    assert result == target
+    assert messages == [f"  skipped existing file: {target}"]
+
+
+def test_sd_card_download_skips_existing_mp4_even_when_camera_size_differs(tmp_path):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    target = tmp_path / "clip.mp4"
+    target.write_bytes(b"final-mp4")
+    stale_part = tmp_path / "clip.mp4.download8_full_high_class6482.part"
+    stale_part.write_bytes(b"partial")
+    messages = []
+    sd_card = SdCard(FakeCamera())
+
+    result = sd_card.download(
+        {"file_name": "clip.mp4", "size": 999999},
+        tmp_path,
+        rewrite_exists=False,
+        progress=messages.append,
+    )
+
+    assert result == target
+    assert target.read_bytes() == b"final-mp4"
+    assert not stale_part.exists()
+    assert messages == [f"  skipped existing file: {target}"]
+
+
+def test_sd_card_download_reconnects_after_size_mismatch(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.reconnects = 0
+
+        def reconnect(self):
+            self.reconnects += 1
+
+    camera = FakeCamera()
+    sd_card = SdCard(camera)
+    calls = []
+    messages = []
+
+    def fake_download_once(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise DownloadSizeMismatch("Downloaded 1 bytes, expected 5 bytes")
+        target = args[3]
+        target.write_bytes(b"12345")
+        return target
+
+    monkeypatch.setattr(sd_card, "_download_once", fake_download_once)
+    monkeypatch.setattr("pyneolink.sd_card.monotonic_clock.sleep", lambda seconds: None)
+
+    result = sd_card.download(
+        {"file_name": "clip.mp4", "size": 5},
+        tmp_path,
+        reconnect_retries=1,
+        progress=messages.append,
+    )
+
+    assert result == tmp_path / "clip.mp4"
+    assert camera.reconnects == 1
+    assert len(calls) == 2
+    assert any("reconnect attempt 1/1 after 5s" in message for message in messages)
+
+
+def test_sd_card_download_raises_camera_connection_error_when_reconnect_fails(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def reconnect(self):
+            raise TimeoutError("offline")
+
+    sd_card = SdCard(FakeCamera())
+
+    def fake_download_once(*args, **kwargs):
+        raise DownloadSizeMismatch("Downloaded 1 bytes, expected 5 bytes")
+
+    monkeypatch.setattr(sd_card, "_download_once", fake_download_once)
+    monkeypatch.setattr("pyneolink.sd_card.monotonic_clock.sleep", lambda seconds: None)
+
+    try:
+        sd_card.download({"file_name": "clip.mp4", "size": 5}, tmp_path, reconnect_retries=2)
+    except CameraConnectionError as exc:
+        assert "Camera connection is unavailable after 2 reconnect attempt(s)" in str(exc)
+    else:
+        raise AssertionError("download must raise CameraConnectionError when reconnect fails")
 
 
 def test_sd_card_list_parses_file_info_reply():

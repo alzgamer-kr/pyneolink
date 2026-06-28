@@ -1,8 +1,8 @@
 # Connection Flow
 
-Основний клас підключення: `pyneolink.camera.Camera`.
+The main connection class is `pyneolink.camera.Camera`.
 
-`Camera` приймає або готовий `CameraConfig`, або параметри напряму:
+`Camera` accepts either a ready `CameraConfig` object or direct keyword arguments:
 
 - `uuid` / `uid`;
 - `address`;
@@ -14,86 +14,86 @@
 - `state_path`;
 - `debug`.
 
-## Вхідна точка
+## Entry Point
 
-Типовий шлях:
+Typical usage:
 
 ```python
 with Camera(uuid="ABCDEF0123456789", password="password") as camera:
     info = camera.info()
 ```
 
-`__enter__()` викликає:
+`__enter__()` calls:
 
 1. `connect()`
 2. `login()`
 
-Після цього `camera.sock`, `camera.cipher`, `camera.login_xml` готові для команд.
+After that, `camera.sock`, `camera.cipher`, and `camera.login_xml` are ready for commands.
 
 ## `connect()`
 
-`connect()` вибирає транспорт у такому порядку.
+`connect()` chooses a transport in the order below.
 
-### 1. Local UDP P2P probe для UID
+### 1. Local UDP P2P Probe For UID
 
-Якщо є `uid`, немає `address`/`cached_address`, і `discovery` дозволяє UID discovery, `Camera.connect()` спочатку пробує:
+When `uid` is present, `address` and `cached_address` are not set, and `discovery` allows UID discovery, `Camera.connect()` first tries:
 
 ```python
 connect_local_direct(uid)
 ```
 
-Це локальний UDP handshake з камерою через broadcast. Якщо камера доступна в локальній мережі і відповідає, повертається `UdpBcConnection`.
+This is a local UDP handshake with the camera through broadcast. If the camera is reachable on the LAN and replies, the result is a `UdpBcConnection`.
 
-Після успіху:
+After success:
 
 - `self.sock = UdpBcConnection(...)`;
 - `self.connected_address = sock.addr`;
-- `.pyneolink_state.json` оновлюється з `transport="udp-local"`.
+- `.pyneolink_state.json` is updated with `transport="udp-local"`.
 
-Якщо локальний шлях не спрацював:
+If the local path fails:
 
-- при `discovery="local"` помилка пробрасывається;
-- в інших режимах код переходить до наступного способу.
+- with `discovery="local"`, the error is propagated;
+- in other modes, the code moves to the next connection method.
 
 ### 2. Explicit `address`
 
-Якщо в конфігу є `address`, `_resolve_address()` повертає `host:port`. Далі:
+If the config contains `address`, `_resolve_address()` returns `host:port`. Then `connect()` opens:
 
 ```python
 socket.create_connection((host, port))
 ```
 
-Це TCP Baichuan шлях. За замовчуванням port `9000`, якщо порт не вказаний.
+This is the TCP Baichuan path. The default port is `9000` when no port is specified.
 
 ### 3. `cached_address`
 
-Якщо є `cached_address`, використовується він. Це теж TCP шлях, якщо address не позначений як relay.
+If `cached_address` is set, it is used as the next candidate. This is also a TCP path unless the cached address marks a relay transport.
 
-### 4. Cached TCP state
+### 4. Cached TCP State
 
-Якщо є `state_path`, `ConnectionState.get_address(camera_name, transport="tcp")` може повернути попередню TCP адресу.
+If `state_path` is enabled, `ConnectionState.get_address(camera_name, transport="tcp")` may return a previously working TCP address.
 
-### 5. UDP relay
+### 5. UDP Relay
 
-Якщо є `uid` і `discovery` дорівнює `relay` або `cellular`, `_resolve_address()` повертає спеціальний marker:
+If `uid` is present and `discovery` is `relay` or `cellular`, `_resolve_address()` returns a special marker:
 
 ```python
 ("", 0, "udp-relay")
 ```
 
-Після цього `connect()` викликає:
+Then `connect()` calls:
 
 ```python
 connect_relay(uid)
 ```
 
-Це відкриває UDP P2P канал через Reolink register/relay інфраструктуру. Результат також `UdpBcConnection`.
+This opens a UDP P2P channel through the Reolink register/relay infrastructure. The result is also a `UdpBcConnection`.
 
-Після успіху state оновлюється з `transport="udp-relay"`.
+After success, state is updated with `transport="udp-relay"`.
 
 ## `ensure_connected()`
 
-Більшість публічних методів не вимагають, щоб користувач вручну викликав `connect()`:
+Most public methods do not require the caller to manually call `connect()`:
 
 ```python
 def ensure_connected(self):
@@ -103,27 +103,27 @@ def ensure_connected(self):
         self.login()
 ```
 
-Тобто `camera.info()`, `camera.command()`, `camera.sd_card()...` можуть самі підняти connection/login.
+This means `camera.info()`, `camera.command()`, and `camera.sd_card()` operations can bring up connection/login on demand.
 
 ## `reconnect()`
 
-`reconnect()` завжди робить:
+`reconnect()` always performs:
 
 1. `close()`
 2. `connect()`
 3. `login()`
 
-Це використовується, коли запит отримує timeout/EOF/OSError, наприклад у battery polling або після невдалої download спроби.
+It is used when an operation receives timeout/EOF/OSError conditions, for example during battery polling or after an interrupted SD-card download.
 
-## Online lease
+## Online Lease
 
-`Camera.require_online()` повертає context manager, який збільшує `_online_required`.
+`Camera.require_online()` returns a context manager that increments `_online_required`.
 
-Це потрібно для сценаріїв, де камера має залишатися online:
+This is used for scenarios where the camera must stay online:
 
 - live stream;
 - HLS session;
 - battery `mode="online"`;
-- довгі операції, де не можна закривати socket між запитами.
+- long operations where the socket must not be closed between requests.
 
-Поки `online_required == True`, інші компоненти, які зазвичай могли б закрити connection, не повинні ламати поточний online сценарій.
+While `online_required == True`, components that normally might close or reconnect should avoid breaking the active online scenario.

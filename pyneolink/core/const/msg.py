@@ -4,6 +4,8 @@ from enum import StrEnum
 
 
 class Error(StrEnum):
+    """Centralized user-facing error message templates."""
+
     LoginNonce = "Camera did not return a login nonce"
     UdpRelayRequiresUid = "UDP relay requires a camera UID"
     CameraAddressRequired = "Camera needs address, cached_address, or a UID reachable by discovery"
@@ -85,6 +87,8 @@ class Error(StrEnum):
 
 
 class Log(StrEnum):
+    """Centralized CLI/debug log message templates."""
+
     Stopped = "stopped"
     NoUidAddresses = "No camera addresses found for this UID."
 

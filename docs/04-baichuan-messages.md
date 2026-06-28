@@ -1,146 +1,140 @@
 # Baichuan Messages
 
-Baichuan - це протокольний шар, у якому PyNeolink надсилає команди і читає відповіді камери.
+Baichuan is the protocol layer used by PyNeolink to send commands and read camera replies.
 
-Низькорівнева реалізація: `pyneolink/core/bc.py`.
+Low-level implementation: `pyneolink/core/bc.py`.
 
-Верхній API для команд: `Camera.command()` і `Camera.send()`.
+High-level command API: `Camera.command()` and `Camera.send()`.
 
 ## Header
 
-`Header.pack()` пише little-endian структуру:
+`Header.pack()` writes a little-endian structure:
 
 ```text
-magic        uint32
-msg_id       uint32
-body_len     uint32
-channel_id   uint8
-stream_type  uint8
-msg_num      uint16
-response     uint16
-msg_class    uint16
-[payload_offset uint32 для modern/file/replay]
+magic          uint32
+msg_id         uint32
+body_len       uint32
+channel_id     uint8
+reserved       uint8
+msg_num        uint16
+response_code  uint16
+msg_class      uint16
+[payload_offset uint32 for modern/file/replay]
 ```
 
-Valid magic:
+The magic value is usually:
 
-- `0x0ABCDEF0`;
-- `0x0FEDCBA0`.
+```text
+0x2a87cf10
+```
 
-Якщо magic інший, кидається `InvalidMagicError`. Download code іноді обробляє це як raw tail, бо деякі камери після Baichuan response можуть продовжити media bytes без стандартного header.
+If the magic is different, `InvalidMagicError` is raised. SD-card download code may treat this as a raw media tail because some cameras send media bytes after a Baichuan response without another standard header.
 
-## Message classes
+## Message Classes
 
-Основні класи:
+Important classes:
 
-- `MSG_CLASS.LEGACY = 0x6514`: перший legacy login;
-- `MSG_CLASS.MODERN = 0x6414`: звичайні XML-команди;
-- `MSG_CLASS.MODERN_REPLY = 0x6614`: modern reply class;
-- `MSG_CLASS.FILE_DOWNLOAD = 0x6482`: file download payload;
-- `MSG_CLASS.MODERN_ZERO = 0x0000`: деякі відповіді камери.
+- `MSG_CLASS.LEGACY = 0x6514`: first legacy login;
+- `MSG_CLASS.MODERN = 0x6414`: normal XML commands;
+- `MSG_CLASS.FILE_DOWNLOAD = 0x6482`: SD-card file download;
+- `MSG_CLASS.FILE_REPLAY = 0x6512`: replay/download path on some cameras;
+- `MSG_CLASS.MODERN_ZERO = 0x0000`: some camera replies.
 
-Для modern/file/replay header має `payload_offset`. Це довжина extension частини перед основним payload.
+For modern/file/replay messages, the header includes `payload_offset`. It is the length of the extension block before the main payload.
 
-## Message ids
+## Message IDs
 
-Найважливіші ids у поточному коді:
+Important IDs in the current code:
 
-- `MSG.LOGIN = 1`;
-- `MSG.VIDEO = 3`;
-- `MSG.VIDEO_STOP = 4`;
-- `MSG.FILE_REPLAY = 5`;
-- `MSG.FILE_REPLAY_STOP = 7`;
-- `MSG.FILE_DOWNLOAD_VIDEO = 8`;
-- `MSG.FILE_DOWNLOAD = 13`;
-- `MSG.FILE_INFO_LIST = 14`;
-- `MSG.FILE_INFO_LIST_ALT = 15`;
-- `MSG.FILE_INFO_LIST_ALT2 = 16`;
-- `MSG.REBOOT = 23`;
-- `MSG.HDD_INFO = 102`;
-- `MSG.HDD_INIT = 103`;
-- `MSG.UID = 114`;
-- `MSG.REPLAY_SEEK = 123`;
-- `MSG.DAY_RECORDS = 142`;
-- `MSG.FILE_PLAYBACK = 143`;
-- `MSG.FILE_PLAYBACK_STOP = 144`;
-- `MSG.GET_LED = 208`;
-- `MSG.SET_LED = 209`;
-- `MSG.UDP_KEEPALIVE = 234`;
-- `MSG.BATTERY = 253`.
+- `MSG.LOGIN`
+- `MSG.LOGOUT`
+- `MSG.VIDEO`
+- `MSG.FILE_REPLAY`
+- `MSG.FILE_DOWNLOAD`
+- `MSG.FILE_DOWNLOAD_VIDEO`
+- `MSG.FILE_PLAYBACK`
+- `MSG.FILE_PLAYBACK_STOP`
+- `MSG.SNAP`
+- `MSG.BATTERY`
+- `MSG.MOTION_REQUEST`
+- `MSG.MOTION`
+- `MSG.TALKABILITY`
+- `MSG.TALKCONFIG`
+- `MSG.TALK`
+- `MSG.TALKRESET`
+- `MSG.PLAY_AUDIO`
+- `MSG.GET_PIR_ALARM`
+- `MSG.SET_PIR_ALARM`
+- `MSG.GET_LED`
+- `MSG.SET_LED`
 
-## Request lifecycle
+See `pyneolink/core/const/flags.py` for the full list.
 
-Звичайний command flow:
+## Command Flow
 
-1. `Camera.command(msg_id, payload, extension=...)`
-2. `ensure_connected()`
-3. `send()`
-4. `encode_modern()`
-5. socket `sendall()`
-6. loop `_recv()` until response with the same `msg_num`
-7. `recv_message()` returns `Message`
-8. if `msg_num` matched, command returns it
+Normal command flow:
 
-`msg_num` - це correlation id. Камера може прислати unrelated packet, keepalive або stream data. `Camera.command()` ігнорує unmatched `msg_num`, поки не дочекається потрібної відповіді або timeout.
+```python
+msg_num = camera.send(msg_id, payload)
+reply = camera._recv_expected(msg_num)
+```
 
-## `send()` vs `command()`
+`msg_num` is the correlation id. A camera may send unrelated packets, keepalive packets, or stream data. `Camera.command()` ignores unmatched `msg_num` values until it receives the expected reply or times out.
 
-`command()` підходить для XML request -> XML response.
+## `command()` vs `send()`
 
-`send()` тільки відправляє packet і повертає `msg_num`. Воно використовується для:
+`command()` is for one XML request followed by one XML response.
 
-- stream start/stop;
-- download, де відповідей багато;
-- keepalive;
-- випадків з custom `msg_class`, `channel_id`, `msg_num`.
+`send()` only writes a packet and returns the `msg_num`. It is used for:
 
-## Extension
+- stream start, where media messages continue afterwards;
+- SD-card downloads, where many messages may follow;
+- custom `msg_class`, `channel_id`, or `msg_num` cases.
 
-`extension_xml()` створює XML extension:
+## Extensions
+
+`extension_xml()` creates an XML extension:
 
 ```xml
 <Extension version="1.1">
   <channelId>0</channelId>
-  <binaryData>1</binaryData>
 </Extension>
 ```
 
-Extension шифрується окремо від payload. У header `payload_offset` показує, де закінчується extension і починається payload.
+Extensions are encrypted separately from payloads. In the header, `payload_offset` marks where the extension ends and the payload begins.
 
-## XML payload
+## XML Payloads
 
-`xml_document(inner)` загортає XML у:
+`xml_document(inner)` wraps XML into:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8" ?>
-<body>
-...
-</body>
+<body>...</body>
 ```
 
-Більшість запитів до камери - це XML payload.
+Most camera requests use XML payloads.
 
-## Response handling
+## Receiving
 
-`recv_message()`:
+`recv_message(sock, cipher)`:
 
-1. читає header;
-2. дочитує optional `payload_offset`;
-3. читає body;
-4. розділяє body на extension і payload;
-5. вибирає cipher для reply;
-6. дешифрує extension;
-7. визначає, чи payload binary;
-8. дешифрує або залишає payload raw;
-9. повертає `Message`.
+1. reads the header;
+2. reads the optional `payload_offset`;
+3. reads the body;
+4. splits the body into extension and payload;
+5. chooses the reply cipher;
+6. decrypts the extension;
+7. detects whether the payload is binary;
+8. decrypts or keeps the payload raw;
+9. returns `Message`.
 
-Для XML відповідей `Message.xml_text` і `Message.xml_root` дають готовий доступ до тексту/XML tree.
+For XML replies, `Message.xml_text` and `Message.xml_root` provide ready access to the response text/tree.
 
 ## Keepalive
 
-Якщо `_recv()` отримує `MSG.UDP_KEEPALIVE`, камера відповідає автоматично через `_reply_keepalive()`.
+If `_recv()` receives `MSG.UDP_KEEPALIVE`, the camera is answered automatically through `_reply_keepalive()`.
 
-Для UDP stream/download також є активні keepalive packets:
+UDP stream/download paths also send active keepalive packets:
 
-- `Camera.read_stream_payloads()` періодично відправляє `MSG.UDP_KEEPALIVE`;
-- `SdCard._send_download_keepalive()` робить те саме під час download.
+- `Camera.read_stream_payloads()` periodically sends `MSG.UDP_KEEPALIVE`;
+- `SdCard._send_download_keepalive()` does the same during downloads.

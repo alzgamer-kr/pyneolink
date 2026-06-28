@@ -4,6 +4,7 @@ from .camera import Camera
 from .battery import Battery, BatteryInfo, BatteryInfoUpdates, parse_battery_xml
 from .config import CameraConfig, Config, config_from_dict, load_config
 from .core.const import EVENTS
+from .errors import CameraConnectionError
 from .motion import CameraEvent, CameraEvents, Motion, parse_motion_events
 from .recorder import StreamRecorder
 from .sd_card import DangerousSdCardOperation, DownloadSizeMismatch, SdCard, SdCardFile
@@ -13,6 +14,7 @@ from .voice import TalkConfig, Voice
 
 __all__ = [
     "Camera",
+    "CameraConnectionError",
     "CameraConfig",
     "CameraEvent",
     "CameraEvents",
@@ -40,4 +42,4 @@ __all__ = [
     "serve_streams",
     "__version__",
 ]
-__version__ = "0.3.1"
+__version__ = "0.3.2"

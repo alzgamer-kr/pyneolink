@@ -6,6 +6,13 @@ from xml.sax.saxutils import escape as _xml_escape
 
 @dataclass(frozen=True)
 class XmlTemplate:
+    """XML payload template that escapes formatted values by default.
+
+    :param template: XML template string.
+    :param document: Wrap formatted XML in the standard `<body>` document.
+    :param binary: Return bytes when `True`, otherwise return text.
+    """
+
     template: str
     document: bool = True
     binary: bool = True
@@ -34,6 +41,11 @@ class XmlTemplate:
 
 @dataclass(frozen=True)
 class Raw:
+    """Wrapper for XML fragments that must not be escaped.
+
+    :param value: Raw value to insert into an XML template.
+    """
+
     value: object
 
 

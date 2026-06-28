@@ -1,18 +1,18 @@
 # SD Card And Downloads
 
-SD-card API живе у `pyneolink/sd_card.py`.
+The SD-card API lives in `pyneolink/sd_card.py`.
 
-Публічна точка входу:
+Public entry point:
 
 ```python
 sd = camera.sd_card()
 files = sd.list(start="2026-06-03", end="2026-06-03")
-sd.download(files[-1], "downloads", quality="high")
+sd.download(files[-1], "downloads", quality="high", rewrite_exists=False)
 ```
 
-## Об'єкти
+## Objects
 
-`SdCardFile` - нормалізований запис про файл:
+`SdCardFile` is a normalized recording/file item:
 
 - `file_name`;
 - `path`;
@@ -24,36 +24,36 @@ sd.download(files[-1], "downloads", quality="high")
 - `channel_id`;
 - `raw`.
 
-`raw` зберігає оригінальні поля камери. Download часто потребує саме їх.
+`raw` keeps the original camera fields. Download often needs those fields.
 
-## List flow
+## List Flow
 
 `SdCard.list()`:
 
-1. нормалізує `start`/`end` у datetime range;
-2. пробує `_recorded_days()` через `MSG.DAY_RECORDS`;
-3. якщо камера не повернула дні, перебирає всі дні в range;
-4. для кожного дня викликає `_list_day_files()`;
-5. сортує записи через `_sort_recordings()`;
-6. повертає list of dict або list of `SdCardFile`.
+1. normalizes `start`/`end` into a datetime range;
+2. tries `_recorded_days()` through `MSG.DAY_RECORDS`;
+3. if the camera does not return recorded days, iterates through every day in the range;
+4. calls `_list_day_files()` for each day;
+5. sorts recordings through `_sort_recordings()`;
+6. returns either a list of dicts or a list of `SdCardFile` objects.
 
-## Recorded days
+## Recorded Days
 
-`_recorded_days()` будує `_day_records_range_query()`:
+`_recorded_days()` builds `_day_records_range_query()`:
 
 - `msg_id = MSG.DAY_RECORDS`;
-- payload містить channel і start/end date range.
+- payload contains channel and start/end date range.
 
-Якщо камера повернула `dayType/index`, код перетворює index у конкретну дату.
+If the camera returns `dayType/index`, the code converts the index into a concrete date.
 
-## Handle discovery
+## Handle Discovery
 
-Багато камер не повертають одразу весь список файлів. Тому list flow має два етапи:
+Many cameras do not return the full file list immediately. The list flow therefore has two stages:
 
-1. `_handle_queries()` отримує `handle`;
-2. `_handle_detail_queries()` використовує цей handle, щоб читати сторінки.
+1. `_handle_queries()` gets a `handle`;
+2. `_handle_detail_queries()` uses that handle to read pages.
 
-Практично це виглядає так:
+In practice this looks like:
 
 - `handle/mainStream`;
 - `files/handle-1`;
@@ -61,106 +61,117 @@ sd.download(files[-1], "downloads", quality="high")
 - `files/handle-1/page-3`;
 - ...
 
-Код продовжує сторінки, доки камера повертає нові `FileInfo`.
+The code continues reading pages while the camera returns new `FileInfo` entries.
 
 ## Pagination
 
-`_list_handle_files(..., max_pages=64)` повторює той самий detail query. Камера сама повертає наступну сторінку для активного handle.
+`_list_handle_files(..., max_pages=64)` repeats the same detail query. The camera advances the active handle internally and returns the next page.
 
-Зупинка:
+Pagination stops when:
 
-- response не `200`;
-- немає `FileInfo`;
-- нових файлів не додано;
-- досягнуто `max_pages`.
+- response is not `200`;
+- no `FileInfo` is returned;
+- no new files are added;
+- `max_pages` is reached.
 
 ## Filter
 
-`SdCard.filter()` працює вже на отриманому списку:
+`SdCard.filter()` works on an already loaded list:
 
-- фільтр по `start`/`end`;
-- substring по `name`;
+- `start`/`end` filter;
+- substring match on `name`;
 - exact `file_type`;
 - exact `stream_type`.
 
-Це не новий запит до камери, якщо `files` передано явно.
+This is not a new camera request when `files` is passed explicitly.
 
-## Download flow
+## Download Flow
 
 `SdCard.download()`:
 
-1. приводить file до dict;
-2. бере `raw` через `_download_raw()`;
-3. застосовує `quality` або `stream_type`;
-4. генерує temporary playback channel id;
-5. формує output path;
-6. рахує expected size з `size`, `sizeL`, `sizeH`;
-7. перебирає download strategies з `_download_queries()`;
-8. пише у `*.part`;
-9. перевіряє size;
-10. фіналізує файл через `_finalize_download()`.
+1. converts `file` to a dict;
+2. extracts `raw` through `_download_raw()`;
+3. applies `quality` or `stream_type`;
+4. builds the output path;
+5. calculates expected size from `size`, `sizeL`, and `sizeH`;
+6. if `rewrite_exists=False` and the local file has the same size, returns it without downloading;
+7. generates a temporary playback channel id;
+8. tries download strategies from `_download_queries()`;
+9. writes to `*.part`;
+10. validates size;
+11. on `DownloadSizeMismatch` or `TimeoutError`, waits 5 seconds, reconnects, and restarts the file download according to `reconnect_retries`;
+12. finalizes the file through `_finalize_download()`.
 
-## Download strategies
+Useful download options:
 
-Через різні моделі/firmware код пробує кілька способів.
+- `reconnect_retries=3` limits reconnect attempts after one interrupted download; after a successful reconnect, the file download is started again.
+- `rewrite_exists=False` skips a local file when its size already matches the camera file.
+- For `.mp4` outputs, any non-empty final `.mp4` is treated as complete because PyNeolink only creates the final file after successful finalization; interrupted downloads remain as `.part` files.
+- `progress=True` prints skip/retry/download progress messages.
 
-Для high quality (`mainStream`) forced path:
+If reconnect fails after the configured number of attempts, `CameraConnectionError` is raised. This lets caller code stop a batch job cleanly when the camera is unavailable.
+
+## Download Strategies
+
+Different camera models and firmware versions accept different XML shapes and message classes, so PyNeolink tries several strategies.
+
+For forced high quality (`mainStream`):
 
 - `download13/full-high/class6482`;
 - `download8/full-high/class6482`.
 
-Для generic path:
+For the generic path:
 
 - `download13/id/class6482`;
 - `playback143/range-.../bcmedia`;
 - `download8/id/class6482`;
 - `replay5/start/bcmedia`;
-- інші варіанти `filename`, `name`, `full`;
-- fallback з `class6414`.
+- other `filename`, `name`, and `full` variants;
+- fallback variants with `class6414`.
 
-Це не елегантно, але практично: різні камери приймають різні XML shape/message class.
+This is not elegant, but it is practical: different cameras accept different request shapes.
 
-## Binary download receive loop
+## Binary Download Receive Loop
 
 `_download_with_query()`:
 
-1. відправляє query через `camera.send()`;
-2. приймає багато `Message`;
-3. приймає continuation messages, навіть якщо `msg_num` змінюється;
-4. якщо extension містить `<binaryData>1</binaryData>`, додає msg_num до `binary_msg_nums`;
-5. пише payload у `.part`;
-6. шле download keepalive;
-7. завершує по XML done, response `201`/`300`, timeout після прогресу або expected size.
+1. sends a query through `camera.send()`;
+2. receives many `Message` objects;
+3. accepts continuation messages, even when `msg_num` changes;
+4. if the extension contains `<binaryData>1</binaryData>`, adds msg numbers to `binary_msg_nums`;
+5. writes payload to `.part`;
+6. sends download keepalive;
+7. finishes on XML done, response `201`/`300`, timeout after progress, or expected size.
 
-Для download важливо, що payload може бути:
+For downloads, payload may be:
 
 - XML metadata;
-- Baichuan binary message;
-- raw BCMedia tail після invalid magic.
+- a Baichuan binary message;
+- raw BCMedia tail after invalid magic.
 
-Тому download loop складніший за звичайний `Camera.command()`.
+This is why the download loop is more complex than normal `Camera.command()`.
 
 ## Finalize
 
 `_finalize_download()`:
 
-- перевіряє expected size, якщо він відомий;
-- якщо output `.mp4`, але downloaded file виглядає як BCMedia, викликає `bcmedia_to_mp4()`;
-- якщо conversion failed, пробує `extract_embedded_mp4()`;
-- якщо і це не допомогло, зберігає raw як `*.mp4.bcmedia` і кидає `ProtocolError`.
+- validates expected size when known;
+- if output is `.mp4` but the downloaded file looks like BCMedia, calls `bcmedia_to_mp4()`;
+- if conversion fails, tries `extract_embedded_mp4()`;
+- if that also fails, saves the raw stream as `*.mp4.bcmedia` and raises `ProtocolError`.
 
-## Remove and format
+## Remove And Format
 
-`remove()` поки не підключений:
+`remove()` is not wired yet:
 
 ```python
 raise NotImplementedError(...)
 ```
 
-`format()` існує, але захищений:
+`format()` exists, but it is guarded:
 
-- потрібен `confirm=True`;
-- потрібен `confirmation_text="FORMAT SD CARD"`;
-- тільки після цього надсилається `MSG.HDD_INIT`.
+- requires `confirm=True`;
+- requires `confirmation_text="FORMAT SD CARD"`;
+- only then sends `MSG.HDD_INIT`.
 
-Це свідомий захист від випадкового форматування SD-card.
+This is an intentional guard against accidental SD-card formatting.

@@ -47,11 +47,26 @@ def neolink_crc32(data: bytes) -> int:
 
 @dataclass
 class Cipher:
+    """Payload cipher wrapper.
+
+    :param name: Cipher name: `none`, `bc`, or `aes`.
+    :param key: AES key when `name="aes"`.
+    :param full_media: Whether AES also applies to media payload data.
+    """
+
     name: str = "bc"
     key: bytes | None = None
     full_media: bool = False
 
     def encrypt(self, offset: int, data: bytes, *, media: bool = False) -> bytes:
+        """
+        Encrypt payload bytes for the wire format.
+
+        :param offset: Baichuan payload offset used by the XOR cipher.
+        :param data: Plain payload bytes.
+        :param media: Whether the payload contains media data.
+        """
+
         if self.name == "none":
             return data
         if self.name == "bc" or (media and not self.full_media):
@@ -59,6 +74,14 @@ class Cipher:
         return self._aes(data, True)
 
     def decrypt(self, offset: int, data: bytes, *, media: bool = False) -> bytes:
+        """
+        Decrypt payload bytes from the wire format.
+
+        :param offset: Baichuan payload offset used by the XOR cipher.
+        :param data: Encrypted payload bytes.
+        :param media: Whether the payload contains media data.
+        """
+
         if self.name == "none":
             return data
         if self.name == "bc" or (media and not self.full_media):

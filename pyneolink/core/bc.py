@@ -10,11 +10,20 @@ from .const import MAGIC, MSG, MSG_CLASS, msg
 
 
 class ProtocolError(RuntimeError):
+    """Raised for Baichuan protocol errors."""
+
     pass
 
 
 class InvalidMagicError(ProtocolError):
+    """Raised when a Baichuan header has an unexpected magic value."""
+
     def __init__(self, magic: int, data: bytes) -> None:
+        """Create an invalid magic error.
+
+        :param magic: Parsed magic value.
+        :param data: Raw bytes used to parse the header.
+        """
         super().__init__(msg.Error.InvalidBaichuanMagic.format(magic=magic))
         self.magic = magic
         self.data = data
@@ -22,6 +31,18 @@ class InvalidMagicError(ProtocolError):
 
 @dataclass
 class Header:
+    """Baichuan message header.
+
+    :param msg_id: Baichuan message id.
+    :param body_len: Body length in bytes.
+    :param channel_id: Camera channel id.
+    :param stream_type: Raw stream type code.
+    :param msg_num: Message correlation number.
+    :param response_code: Camera response/status code.
+    :param msg_class: Baichuan message class.
+    :param payload_offset: Optional extension length before payload.
+    """
+
     msg_id: int
     body_len: int
     channel_id: int
@@ -57,6 +78,12 @@ class Header:
 
     @classmethod
     def unpack_from(cls, data: bytes) -> "Header":
+        """
+        Parse a Baichuan header from bytes.
+
+        :param data: Header bytes, optionally followed by payload data.
+        """
+
         if len(data) < 20:
             raise ProtocolError(msg.Error.ShortBaichuanHeader)
         magic, msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class = struct.unpack(
@@ -74,6 +101,15 @@ class Header:
 
 @dataclass
 class Message:
+    """Parsed Baichuan message.
+
+    :param header: Parsed message header.
+    :param extension: Decrypted extension bytes.
+    :param payload: Decrypted or raw payload bytes.
+    :param raw_payload_len: Payload length before decryption/splitting.
+    :param encrypted_len: Number of encrypted payload bytes when known.
+    """
+
     header: Header
     extension: bytes = b""
     payload: bytes = b""

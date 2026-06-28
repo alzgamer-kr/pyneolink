@@ -1,63 +1,64 @@
 # Authentication And Encryption
 
-Авторизація відбувається у `Camera.login()` і складається з двох кроків:
+Authentication happens in `Camera.login()` and has two stages:
 
-1. legacy login request для отримання nonce і режиму шифрування;
-2. modern login request з MD5 username/password.
+1. a legacy login request that asks the camera for a nonce and encryption mode;
+2. a modern login request with MD5 username/password values.
 
-## Крок 1: legacy login
+## Step 1: Legacy Login
 
-`Camera.login()` бере новий `msg_num`:
-
-```python
-msg_num = self._next_msg()
-```
-
-Потім відправляє legacy packet:
+`Camera.login()` gets a new `msg_num`:
 
 ```python
-encode_legacy_login(msg_num, max_encryption="aes", channel_id=...)
+msg_num = self._next_msg_num()
 ```
 
-У `bc.py` це packet з:
-
-- `msg_id = MSG.LOGIN`;
-- `msg_class = MSG_CLASS.LEGACY`;
-- `response_code = 0xDC12` для `max_encryption="aes"`.
-
-Камера відповідає XML, у якому має бути `nonce`.
-
-## Вибір cipher
-
-Після першої відповіді `Camera.login()` дивиться на low byte `response_code`:
+Then it sends a legacy packet:
 
 ```python
-low = reply.header.response_code & 0xFF
+encode_legacy_login(msg_num, username, max_encryption="aes")
 ```
 
-Поточна логіка:
+In `bc.py`, this packet uses:
 
-- `0`: `Cipher("none")`;
-- `1`: `Cipher("bc")`;
-- `2`, `3`, `0x12`: `Cipher("aes", make_aes_key(...))`;
-- `0x12`: AES з `full_media=True`.
+- `MSG.LOGIN`;
+- `MSG_CLASS.LEGACY`;
+- a legacy XML body;
+- `response_code = 0xDC12` for `max_encryption="aes"`.
 
-`full_media=True` означає, що для binary/media payload камера може шифрувати більшу частину потоку, а не тільки XML.
+The camera should reply with XML that contains a `nonce`.
 
-## Крок 2: modern login
+## Cipher Selection
 
-Коли nonce отримано, username/password не відправляються як plain text.
-
-Код робить:
+After the first reply, `Camera.login()` inspects the low byte of `response_code`:
 
 ```python
-username = md5_hex(username + nonce)
-password = md5_hex(password + nonce)
+mode = reply.header.response_code & 0xFF
 ```
 
-`md5_hex()` повертає uppercase MD5 і за замовчуванням обрізає до 31 символа. Це відповідає поведінці, яку очікує камера.
+Current behavior:
 
-Далі формується XML:
+- `0`: no encryption;
+- `1`: BC XOR;
+- `2`: AES;
+- `0x12`: AES with `full_media=True`.
+
+`full_media=True` means binary/media payloads may have more of the stream encrypted, not only XML metadata.
+
+## Step 2: Modern Login
+
+Once the nonce is available, username and password are not sent as plain text.
+
+The code computes:
+
+```python
+login_username = md5_hex(username + nonce)
+login_password = md5_hex(password + nonce)
+```
+
+`md5_hex()` returns uppercase MD5 and truncates to 31 characters by default. This matches what the camera expects.
+
+The login XML is then built:
 
 ```xml
 <LoginUser version="1.1">
@@ -71,68 +72,68 @@ password = md5_hex(password + nonce)
 </LoginNet>
 ```
 
-Цей XML загортається через `xml_document()` у `<body>...</body>` і відправляється як modern `MSG.LOGIN`.
+This XML is wrapped with `xml_document()` into `<body>...</body>` and sent as modern `MSG.LOGIN`.
 
-## Чому AES login все одно йде через BC
+## Why AES Login Still Uses BC
 
-У `encode_modern()` є спеціальний випадок:
+`encode_modern()` has a special case:
 
 ```python
-wire_cipher = Cipher("bc") if msg_id == MSG.LOGIN and cipher.name == "aes" else cipher
+if msg_id == MSG.LOGIN:
+    wire_cipher = Cipher("bc")
 ```
 
-Тобто навіть якщо майбутній режим AES, modern login payload кодується BC XOR. Після успішного login наступні запити вже використовують обраний `self.cipher`.
+So even when the negotiated future mode is AES, the modern login payload itself is encoded with BC XOR. After login succeeds, later requests use the selected `self.cipher`.
 
 ## BC XOR
 
-`bc_xor(offset, data)` використовує `BC_XML_KEY` і `channel_id` як offset.
+`bc_xor(offset, data)` uses `BC_XML_KEY` and `channel_id` as the offset.
 
-Властивість XOR: одна й та сама функція використовується для encrypt і decrypt.
+Because XOR is symmetric, the same function is used for encryption and decryption.
 
-У `Cipher.encrypt()` / `Cipher.decrypt()`:
+In `Cipher.encrypt()` / `Cipher.decrypt()`:
 
-- `name == "none"` повертає data як є;
-- `name == "bc"` застосовує `bc_xor()`;
-- `name == "aes"` застосовує AES, крім media fallback випадку.
+- `name == "none"` returns data unchanged;
+- `name == "bc"` applies `bc_xor()`;
+- `name == "aes"` applies AES except for media fallback cases.
 
 ## AES-CFB
 
-AES ключ:
+AES key derivation:
 
 ```python
 make_aes_key(nonce, password)
 ```
 
-Формула:
+Formula:
 
 ```text
-MD5("{nonce}-{password}").upper() + "\0"
+md5_hex(nonce + "-" + password)[:16].encode("ascii")
 ```
 
-Після цього беруться перші 16 ASCII bytes.
+The first 16 ASCII bytes become the AES key.
 
-AES mode:
+The IV is:
 
-```python
-AES-CFB
-IV = b"0123456789abcdef"
+```text
+b"\x00" * 16
 ```
 
-Реалізація використовує пакет `cryptography`.
+The implementation uses the `cryptography` package.
 
-## Binary payload і `encryptLen`
+## Binary Payloads And `encryptLen`
 
-`recv_message()` дешифрує extension окремо від payload. Якщо extension містить:
+`recv_message()` decrypts extension data separately from payload data. If the extension contains:
 
 ```xml
 <binaryData>1</binaryData>
 ```
 
-payload вважається binary.
+the payload is treated as binary.
 
-Якщо в extension є `encryptLen`, а cipher AES з `full_media=True`, тоді:
+If the extension contains `encryptLen` and the cipher is AES with `full_media=True`, then:
 
-1. перші `encryptLen` bytes payload дешифруються;
-2. хвіст payload додається як raw bytes.
+1. the first `encryptLen` payload bytes are decrypted;
+2. the remaining payload bytes are kept as raw bytes.
 
-Це важливо для live media і download, де камера може змішувати encrypted header/metadata і raw media data.
+This matters for live media and SD-card downloads, where the camera can mix encrypted headers/metadata with raw media bytes.
