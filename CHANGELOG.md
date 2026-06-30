@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0
+
+SD-card file API and preview playback work.
+
+### Added
+
+- Added `SDFile` wrappers for SD-card recordings with `info()`, `download()`, and `preview()`.
+- Added `SdCard.files()` and `SdCard.file(...)` helpers.
+- Added cached SD-card preview playback with an HTTP stream helper for players such as VLC.
+- Updated `examples/sd_card_example.py` with list, download, preview, remove, and format examples.
+
+### Changed
+
+- Moved public recording downloads from `SdCard.download(file, ...)` to `SDFile.download(...)`.
+- Updated README, docs, and examples to use the new SD-card file API.
+- Use camera `file_name` plus the media extension for finalized download filenames.
+
+### Fixed
+
+- Treat camera `400` responses after partial SD-card download data as interrupted downloads so reconnect/retry handling can recover.
+
+---
+
 ## 0.3.2
 
 Downloader reliability improvements.

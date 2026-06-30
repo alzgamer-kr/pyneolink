@@ -2,7 +2,7 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.3.2` alpha.
+Version: `0.4.0` alpha.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -22,6 +22,7 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 - Battery status, including reconnect and online polling modes
 - SD-card recording list with pagination and time sorting
 - SD-card recording download with high/low quality selection
+- SD-card preview playback cache with an HTTP stream helper for players such as VLC
 - Snapshot download to bytes or JPEG file
 - Local MPEG-TS recording from the live stream
 - Live HTTP MPEG-TS viewing with H264/H265 video and AAC audio
@@ -46,13 +47,13 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 From PyPI:
 
 ```powershell
-python -m pip install pyneolink==0.3.1
+python -m pip install pyneolink==0.4.0
 ```
 
 With microphone voice input support:
 
 ```powershell
-python -m pip install "pyneolink[voice]==0.3.1"
+python -m pip install "pyneolink[voice]==0.4.0"
 ```
 
 For local development from a checkout:
@@ -221,10 +222,9 @@ from pyneolink import Camera
 
 with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
     sd = camera.sd_card()
-    files = sd.list(start="2026-06-03", end="2026-06-03")
-    videos = sd.filter(files, name=".mp4")
+    videos = sd.files(start="2026-06-03", end="2026-06-03", name=".mp4")
     if videos:
-        sd.download(videos[-1], "downloads", quality="high", rewrite_exists=False, progress=True)
+        videos[-1].download("downloads", quality="high", rewrite_exists=False, progress=True)
 ```
 
 Motion:
@@ -306,7 +306,7 @@ StreamServer(config, buffer_seconds=1.5, hls_buffer_mb=100, hls_segment_seconds=
 See the `examples/` directory:
 
 - `camera_example.py`: info, snapshot, LED, and guarded reboot helpers
-- `sd_card_example.py`: list, filter, download, remove, and guarded format calls
+- `sd_card_example.py`: list, filter, download, preview playback, remove, and guarded format calls
 - `battery_example.py`: one-shot battery status plus reconnect/online polling
 - `motion_example.py`: motion status and watch mode
 - `record_example.py`: duration and manual local stream recording

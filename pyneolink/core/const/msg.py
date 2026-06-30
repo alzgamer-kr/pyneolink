@@ -75,6 +75,7 @@ class Error(StrEnum):
     FfmpegNoOutput = "ffmpeg created no output from {frames} {codec} frames"
     SdBestAttemptMismatch = "Best attempt {label} downloaded {written} bytes, expected {expected_size} bytes. Tried: {attempts}"
     SdDownloadFailed = "SD download failed. Tried: {attempts}"
+    SdPreviewFailed = "SD preview failed. Tried: {attempts}"
     Response = "response {response_code}"
     ReplaySeekFailed = "ReplaySeek failed with response {response_code}"
     ReplayFileDetailFailed = "Replay file detail failed with response {response_code}"
