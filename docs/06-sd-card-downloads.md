@@ -6,13 +6,16 @@ Public entry point:
 
 ```python
 sd = camera.sd_card()
-files = sd.list(start="2026-06-03", end="2026-06-03")
-sd.download(files[-1], "downloads", quality="high", rewrite_exists=False)
+files = sd.files(start="2026-06-03", end="2026-06-03")
+files[-1].download("downloads", quality="high", rewrite_exists=False)
+
+for video in sd.files(start="2026-06-03", end="2026-06-03", name=".mp4"):
+    print(video.info()["file_name"])
 ```
 
 ## Objects
 
-`SdCardFile` is a normalized recording/file item:
+`SdCardFile` is a normalized recording/file metadata item:
 
 - `file_name`;
 - `path`;
@@ -25,6 +28,17 @@ sd.download(files[-1], "downloads", quality="high", rewrite_exists=False)
 - `raw`.
 
 `raw` keeps the original camera fields. Download often needs those fields.
+
+`SDFile` wraps one recording and exposes actions for that recording:
+
+- `info()`;
+- `download(...)`;
+- `preview(...)`.
+
+`SdCard.files()` returns `SDFile` objects directly and can apply a simple
+`name` substring filter, for example `sd.files(name=".mp4")`. `SdCard.list()`
+remains available when plain dictionaries or `SdCardFile` metadata objects are
+more convenient.
 
 ## List Flow
 
@@ -87,9 +101,9 @@ This is not a new camera request when `files` is passed explicitly.
 
 ## Download Flow
 
-`SdCard.download()`:
+`SDFile.download()`:
 
-1. converts `file` to a dict;
+1. converts the wrapped file metadata to a dict;
 2. extracts `raw` through `_download_raw()`;
 3. applies `quality` or `stream_type`;
 4. builds the output path;
@@ -110,6 +124,37 @@ Useful download options:
 - `progress=True` prints skip/retry/download progress messages.
 
 If reconnect fails after the configured number of attempts, `CameraConnectionError` is raised. This lets caller code stop a batch job cleanly when the camera is unavailable.
+
+## Preview Playback
+
+`SDFile.preview()` opens the camera preview/playback stream for one recording
+and caches the embedded MP4 to a local file. The cache is file based on purpose:
+players and HTTP clients can read a growing file efficiently, while PyNeolink
+does not need to keep large video data in memory.
+
+Basic cache use:
+
+```python
+with file.preview(cleanup=True, progress=True) as preview:
+    preview.wait_ready(timeout=15)
+    print(preview.path)
+```
+
+For players such as VLC, serve the preview cache over HTTP:
+
+```python
+with file.preview(cleanup=True, progress=True) as preview:
+    with preview.serve(port=8560) as server:
+        print(server.url)
+        input("Press Enter to stop preview...")
+```
+
+The HTTP reader starts from the beginning of the cached MP4. If it reaches the
+current end of the cache while the camera is still sending data, it waits for
+more bytes instead of closing the response. When the last connected player
+disconnects, the preview cache is closed and removed when `cleanup=True`.
+When `cache` is omitted, preview files are stored under
+`.tmp/pyneolink-preview-cache/`, which is ignored by Git.
 
 ## Download Strategies
 

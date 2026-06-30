@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyneolink"
-version = "0.3.2"
+version = "0.4.0"
 description = "Experimental Python client for Reolink cameras"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
@@ -70,5 +70,4 @@ exclude = ["docs*", "examples*", "tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--basetemp=.tmp/pytest"]
 cache_dir = ".tmp/pytest-cache"

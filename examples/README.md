@@ -3,7 +3,7 @@
 Small library-use examples for PyNeolink.
 
 - `camera_example.py`: camera info, snapshot, LED read/set, and guarded reboot helper.
-- `sd_card_example.py`: list recordings, download a recording, and guarded remove/format helpers.
+- `sd_card_example.py`: list recordings as `SDFile` objects, download through `file.download()`, serve preview playback, and guarded remove/format helpers.
 - `battery_example.py`: one-shot battery info plus reconnect and online polling modes.
 - `motion_example.py`: current motion status and event watch mode.
 - `record_example.py`: local MPEG-TS recording for a fixed duration or until Ctrl+C.

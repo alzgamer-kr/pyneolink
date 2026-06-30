@@ -1,6 +1,6 @@
 from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, Settings, StreamServer, Voice, config_from_dict
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
-from pyneolink.sd_card import DownloadSizeMismatch, SdCard
+from pyneolink.sd_card import DownloadSizeMismatch, SDFilePreview, SdCard
 from pyneolink.core.bc import Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
@@ -13,6 +13,7 @@ from pyneolink.cli import CLI
 import queue
 import struct
 import threading
+import urllib.request
 from pathlib import Path
 
 from pyneolink.stream_server import (
@@ -30,6 +31,8 @@ from pyneolink.stream_server import (
 from datetime import datetime
 
 from pyneolink.sd_card import (
+    _FileInfoQuery,
+    _download_output_file_name,
     _download_queries,
     _download_raw,
     _normalize_download_stream_type,
@@ -477,6 +480,17 @@ def test_download_raw_enriches_normalized_file_fields_for_replay():
     assert "replay5/start/bcmedia" in labels
 
 
+def test_download_output_file_name_prefers_camera_file_name_with_path_extension():
+    item = {
+        "file_name": "0120260630132422",
+        "path": "/mnt/sda/Mp4Record/2026-06-30/RecM05_DST20260630_132422_132457_0_451E82100_96D78C.mp4",
+        "file_type": "mp4",
+    }
+    raw = _download_raw(item)
+
+    assert _download_output_file_name(item, raw, raw["Id"], "fallback") == "0120260630132422.mp4"
+
+
 def test_hash_shapes():
     assert len(md5_hex("adminnonce")) == 31
     assert "\0" not in md5_hex("adminnonce")
@@ -793,8 +807,10 @@ def test_camera_sd_card_api_is_available():
     camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     sd_card = camera.sd_card()
     assert hasattr(sd_card, "list")
+    assert hasattr(sd_card, "files")
+    assert hasattr(sd_card, "file")
     assert hasattr(sd_card, "filter")
-    assert hasattr(sd_card, "download")
+    assert hasattr(sd_card.file({"file_name": "clip.mp4"}), "download")
     assert hasattr(sd_card, "remove")
     assert hasattr(sd_card, "format")
 
@@ -1437,8 +1453,7 @@ def test_sd_card_download_skips_existing_file(tmp_path):
     messages = []
     sd_card = SdCard(FakeCamera())
 
-    result = sd_card.download(
-        {"file_name": "clip.mp4", "size": 5},
+    result = sd_card.file({"file_name": "clip.mp4", "size": 5}).download(
         tmp_path,
         rewrite_exists=False,
         progress=messages.append,
@@ -1459,8 +1474,7 @@ def test_sd_card_download_skips_existing_mp4_even_when_camera_size_differs(tmp_p
     messages = []
     sd_card = SdCard(FakeCamera())
 
-    result = sd_card.download(
-        {"file_name": "clip.mp4", "size": 999999},
+    result = sd_card.file({"file_name": "clip.mp4", "size": 999999}).download(
         tmp_path,
         rewrite_exists=False,
         progress=messages.append,
@@ -1498,8 +1512,7 @@ def test_sd_card_download_reconnects_after_size_mismatch(tmp_path, monkeypatch):
     monkeypatch.setattr(sd_card, "_download_once", fake_download_once)
     monkeypatch.setattr("pyneolink.sd_card.monotonic_clock.sleep", lambda seconds: None)
 
-    result = sd_card.download(
-        {"file_name": "clip.mp4", "size": 5},
+    result = sd_card.file({"file_name": "clip.mp4", "size": 5}).download(
         tmp_path,
         reconnect_retries=1,
         progress=messages.append,
@@ -1527,11 +1540,258 @@ def test_sd_card_download_raises_camera_connection_error_when_reconnect_fails(tm
     monkeypatch.setattr("pyneolink.sd_card.monotonic_clock.sleep", lambda seconds: None)
 
     try:
-        sd_card.download({"file_name": "clip.mp4", "size": 5}, tmp_path, reconnect_retries=2)
+        sd_card.file({"file_name": "clip.mp4", "size": 5}).download(tmp_path, reconnect_retries=2)
     except CameraConnectionError as exc:
         assert "Camera connection is unavailable after 2 reconnect attempt(s)" in str(exc)
     else:
         raise AssertionError("download must raise CameraConnectionError when reconnect fails")
+
+
+def test_sd_card_download_treats_400_after_partial_data_as_interrupted_download(tmp_path):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+        sock = None
+        binary_msg_nums = set()
+
+        def __init__(self):
+            self.next_msg_num = 0
+            self.replies = [
+                Message(Header(MSG.FILE_DOWNLOAD, 0, 0, 0, 1, 400, MSG_CLASS.MODERN)),
+                Message(Header(MSG.FILE_DOWNLOAD_VIDEO, 4, 0, 0, 2, 200, MSG_CLASS.FILE_DOWNLOAD), payload=b"1234"),
+                Message(Header(MSG.FILE_DOWNLOAD_VIDEO, 0, 0, 0, 2, 400, MSG_CLASS.MODERN)),
+            ]
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            if kwargs.get("msg_num") is not None:
+                return kwargs["msg_num"]
+            if msg_id == MSG.UDP_KEEPALIVE:
+                return 0
+            self.next_msg_num += 1
+            return self.next_msg_num
+
+        def _recv(self, timeout=None):
+            if not self.replies:
+                raise TimeoutError("no more replies")
+            return self.replies.pop(0)
+
+        def close(self):
+            pass
+
+        def connect(self):
+            pass
+
+        def login(self):
+            pass
+
+    sd_card = SdCard(FakeCamera())
+
+    try:
+        sd_card.file(
+            {
+                "file_name": "clip.mp4",
+                "size": 8,
+                "start_time": "2026-06-01T10:00:00",
+                "end_time": "2026-06-01T10:00:30",
+            }
+        ).download(
+            tmp_path,
+            quality="high",
+            max_attempts=2,
+            reconnect_retries=0,
+        )
+    except CameraConnectionError as exc:
+        assert "DownloadSizeMismatch" in str(exc)
+    else:
+        raise AssertionError("partial 400 download must trigger reconnect handling")
+    assert any("stopped after response 400" in attempt for attempt in sd_card.last_download_attempts)
+
+
+def test_sd_card_preview_debug_returns_probe_responses():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.sent = []
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            self.sent.append((msg_id, payload, kwargs))
+            return 17
+
+        def _recv_matching(self, msg_id, msg_num):
+            if len(self.sent) == 1:
+                return Message(
+                    Header(msg_id, 0, 0, 0, msg_num, 200, MSG_CLASS.MODERN),
+                    payload=xml_document(
+                        '<FileInfoList version="1.1"><FileInfo><handle>2</handle></FileInfo></FileInfoList>'
+                    ),
+                )
+            return Message(Header(msg_id, 0, 0, 0, msg_num, 400, MSG_CLASS.MODERN), payload=b"")
+
+    camera = FakeCamera()
+    sd_card = SdCard(camera)
+
+    result = sd_card.preview(
+        {"file_name": "clip.mp4", "start_time": "2026-06-01T10:00:00", "end_time": "2026-06-01T10:00:30"},
+        debug=True,
+        max_attempts=40,
+    )
+
+    assert result[0]["label"] == "preview15/thumbnail/full"
+    assert result[0]["response_code"] == 200
+    assert b"<thumbnail>1</thumbnail>" in camera.sent[0][1]
+    assert any(item["label"] == "preview15/thumbnail/full/handle-2/msg15/thumbnail" for item in result)
+    assert any(b"<handle>2</handle>" in payload for _msg_id, payload, _kwargs in camera.sent)
+
+
+def test_sd_card_preview_debug_collects_bcmedia_continuation(monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            return 5
+
+        def _recv_matching(self, msg_id, msg_num):
+            return Message(
+                Header(msg_id, 32, 0, 0, msg_num, 200, MSG_CLASS.FILE_DOWNLOAD),
+                extension=b"<Extension><binaryData>1</binaryData></Extension>",
+                payload=_bcmedia_info(fps=15),
+            )
+
+        def _recv(self, timeout=None):
+            if getattr(self, "sent_frame", False):
+                raise TimeoutError("done")
+            self.sent_frame = True
+            return Message(
+                Header(MSG.FILE_DOWNLOAD_VIDEO, 0, 0, 0, 5, 200, MSG_CLASS.FILE_DOWNLOAD),
+                payload=_bcmedia_iframe(),
+            )
+
+    monkeypatch.setattr(
+        "pyneolink.sd_card._preview_queries",
+        lambda channel, file_id, raw: [
+            _FileInfoQuery("preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, b"", msg_class=MSG_CLASS.FILE_DOWNLOAD)
+        ],
+    )
+
+    result = SdCard(FakeCamera()).preview({"file_name": "clip.mp4"}, debug=True)
+
+    assert result[0]["binary_probe_len"] > 32
+    assert result[0]["has_video_frame"] is True
+    assert [packet["kind"] for packet in result[0]["media_packets"]] == ["info", "iframe"]
+
+
+def test_sd_card_preview_debug_reports_embedded_mp4(monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            return 5
+
+        def _recv_matching(self, msg_id, msg_num):
+            return Message(
+                Header(msg_id, 32, 0, 0, msg_num, 200, MSG_CLASS.FILE_DOWNLOAD),
+                extension=b"<Extension><binaryData>1</binaryData></Extension>",
+                payload=_bcmedia_info(fps=15),
+            )
+
+        def _recv(self, timeout=None):
+            if getattr(self, "sent_mp4", False):
+                raise TimeoutError("done")
+            self.sent_mp4 = True
+            mp4 = (
+                b"\x00\x00\x00\x18ftypisof\x00\x00\x00\x01isofhvc1"
+                b"\x00\x00\x00\x08moov"
+                b"\x00\x00\x00\x0cmdatdata"
+            )
+            return Message(
+                Header(MSG.FILE_DOWNLOAD_VIDEO, 0, 0, 0, 5, 200, MSG_CLASS.FILE_DOWNLOAD),
+                payload=mp4,
+            )
+
+    monkeypatch.setattr(
+        "pyneolink.sd_card._preview_queries",
+        lambda channel, file_id, raw: [
+            _FileInfoQuery("preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, b"", msg_class=MSG_CLASS.FILE_DOWNLOAD)
+        ],
+    )
+
+    result = SdCard(FakeCamera()).preview({"file_name": "clip.mp4"}, debug=True)
+
+    assert result[0]["embedded_mp4"]["offset"] == 32
+    assert result[0]["embedded_mp4"]["has_moov"] is True
+    assert result[0]["embedded_mp4"]["has_mdat"] is True
+    assert result[0]["has_video_frame"] is True
+
+
+def test_sd_card_preview_dump_writes_embedded_mp4(tmp_path):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            self.sent = (msg_id, payload, kwargs)
+            return 5
+
+        def _recv_matching(self, msg_id, msg_num):
+            mp4 = (
+                b"\x00\x00\x00\x18ftypisof\x00\x00\x00\x01isofhvc1"
+                b"\x00\x00\x00\x08moov"
+                b"\x00\x00\x00\x0cmdatdata"
+            )
+            return Message(
+                Header(msg_id, len(mp4) + 32, 0, 0, msg_num, 200, MSG_CLASS.FILE_DOWNLOAD),
+                extension=b"<Extension><binaryData>1</binaryData></Extension>",
+                payload=_bcmedia_info(fps=15) + mp4,
+            )
+
+        def _recv(self, timeout=None):
+            raise TimeoutError("done")
+
+    path = SdCard(FakeCamera()).preview_dump({"file_name": "clip.mp4"}, tmp_path)
+
+    assert path == tmp_path / "clip.preview.mp4"
+    data = path.read_bytes()
+    assert data.startswith(b"\x00\x00\x00\x18ftyp")
+    assert b"mdatdata" in data
+
+
+def test_sd_card_file_wrapper_exposes_info_download_and_preview(tmp_path):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    sd_card = SdCard(FakeCamera())
+    sd_file = sd_card.file({"file_name": "clip.mp4", "size": 12})
+
+    assert sd_file.info()["file_name"] == "clip.mp4"
+    preview = sd_file.preview(cache=tmp_path)
+
+    assert isinstance(preview, SDFilePreview)
+    assert preview.path == tmp_path / "clip.preview.mp4"
+
+
+def test_sd_card_preview_default_cache_uses_local_tmp_directory():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    preview = SdCard(FakeCamera()).file({"file_name": "clip.mp4"}).preview()
+
+    assert preview.path == Path(".tmp") / "pyneolink-preview-cache" / "clip.preview.mp4"
+
+
+def test_sd_card_preview_server_streams_from_start_and_cleans_after_disconnect(tmp_path):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    preview = SdCard(FakeCamera()).file({"file_name": "clip.mp4"}).preview(cache=tmp_path)
+    preview.path.parent.mkdir(parents=True, exist_ok=True)
+    preview.path.write_bytes(b"preview-data")
+    preview.ready.set()
+    preview.done.set()
+
+    with preview.serve(port=0) as server:
+        with urllib.request.urlopen(server.url, timeout=5) as response:
+            assert response.read() == b"preview-data"
+
+    assert not preview.path.exists()
 
 
 def test_sd_card_list_parses_file_info_reply():
@@ -1560,6 +1820,29 @@ def test_sd_card_list_parses_file_info_reply():
     assert files[0]["file_name"] == "01_20260601120000.mp4"
     assert files[0]["size"] == 123
     assert b"<FileInfoList" in camera.payload
+
+
+def test_sd_card_files_filters_by_name_and_returns_file_objects():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def command(self, msg_id, payload=b"", extension=b""):
+            xml = b"""<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo><fileName>clip.mp4</fileName></FileInfo>
+<FileInfo><fileName>snapshot.jpg</fileName></FileInfo>
+</FileInfoList>
+</body>"""
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+    files = SdCard(FakeCamera()).files(start="2026-06-01", end="2026-06-01", name=".mp4")
+
+    assert len(files) == 1
+    assert files[0].info()["file_name"] == "clip.mp4"
+    assert hasattr(files[0], "info")
+    assert hasattr(files[0], "download")
+    assert hasattr(files[0], "preview")
 
 
 def test_sd_card_list_sorts_recordings_by_time():
