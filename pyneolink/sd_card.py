@@ -829,11 +829,12 @@ class SdCard:
         next_progress_at = 0
         progress_step = 512 * 1024
         next_keepalive_at = monotonic_clock.monotonic()
+        recv_options = {"binary_playback_331": True} if playback_mode else {}
         with output_path.open("wb") as fh:
             while True:
                 next_keepalive_at = self._send_download_keepalive(next_keepalive_at)
                 try:
-                    msg = self.camera._recv(timeout=recv_timeout)
+                    msg = self.camera._recv(timeout=recv_timeout, **recv_options)
                 except InvalidMagicError as exc:
                     if exc.data:
                         payload = _clip_payload(exc.data, written, effective_expected_size)
@@ -952,6 +953,8 @@ class SdCard:
                         break
                     continue
                 if not msg.payload:
+                    if playback_continuation:
+                        continue
                     if effective_expected_size is not None and written < effective_expected_size and monotonic_clock.monotonic() - last_progress < active_idle_seconds:
                         continue
                     if written:
