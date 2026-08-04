@@ -99,6 +99,46 @@ def test_full_aes_binary_keeps_raw_tail_after_encrypt_len():
     assert msg.encrypted_len == 4
 
 
+def test_camera_recv_scoped_playback_331_keeps_changed_number_media_raw():
+    class FakeSocket:
+        def __init__(self, data):
+            self.data = bytearray(data)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self, size):
+            chunk = bytes(self.data[:size])
+            del self.data[:size]
+            return chunk
+
+    cipher = Cipher("bc")
+    raw_media = b"\x00\x00\x01\x65raw-media-from-camera"
+    header = Header(
+        MSG.FILE_PLAYBACK,
+        len(raw_media),
+        29,
+        0,
+        22,
+        331,
+        MSG_CLASS.MODERN,
+        0,
+    )
+    wire = header.pack() + raw_media
+
+    camera = Camera(state_path=None)
+    camera.sock = FakeSocket(wire)
+    camera.cipher = cipher
+    scoped = camera._recv(binary_playback_331=True)
+    unscoped = recv_message(FakeSocket(wire), cipher)
+
+    assert scoped.header.msg_num == 22
+    assert scoped.header.response_code == 331
+    assert scoped.payload == raw_media
+    assert unscoped.payload == bc_xor(29, raw_media)
+    assert unscoped.payload != raw_media
+
+
 def test_outgoing_binary_payload_is_not_encrypted():
     extension = payloads.extension_binary_data.format(channel_id=0)
     payload = b"raw-talk-data"
@@ -1604,6 +1644,213 @@ def test_sd_card_download_treats_400_after_partial_data_as_interrupted_download(
     else:
         raise AssertionError("partial 400 download must trigger reconnect handling")
     assert any("stopped after response 400" in attempt for attempt in sd_card.last_download_attempts)
+
+
+def test_playback_331_preserves_payload_and_continues_to_normal_completion(tmp_path):
+    class FakeCamera:
+        sock = None
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.recv_scopes = []
+            self.continuation = Message(
+                Header(MSG.FILE_PLAYBACK, 0, 29, 0, 0, 331, MSG_CLASS.MODERN),
+            )
+            self.replies = [
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 5, 29, 0, 0, 200, MSG_CLASS.MODERN),
+                    payload=b"first",
+                ),
+                self.continuation,
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 6, 29, 0, 0, 200, MSG_CLASS.MODERN),
+                    payload=b"second",
+                ),
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 0, 29, 0, 0, 300, MSG_CLASS.MODERN),
+                ),
+            ]
+
+        def send(self, _msg_id, payload=b"", **kwargs):
+            return kwargs.get("msg_num", 1)
+
+        def _recv(self, timeout=None, *, binary_playback_331=False):
+            self.recv_scopes.append(binary_playback_331)
+            if not self.replies:
+                raise TimeoutError("no more replies")
+            return self.replies.pop(0)
+
+    output = tmp_path / "playback.bcmedia"
+    camera = FakeCamera()
+    sd_card = SdCard(camera)
+    written = sd_card._download_with_query(
+        _FileInfoQuery(
+            "playback143/range-subStream/bcmedia",
+            MSG.FILE_PLAYBACK,
+            b"request",
+            msg_class=MSG_CLASS.MODERN,
+            channel_id=29,
+            msg_num=0,
+        ),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert written == 11
+    assert output.read_bytes() == b"firstsecond"
+    assert camera.continuation.header.response_code == 331
+    assert camera.continuation.payload == b""
+    assert camera.recv_scopes == [True, True, True, True]
+    assert "playback finished response=300" in sd_card._last_download_detail
+
+
+def test_response_331_remains_terminal_for_non_playback_downloads(tmp_path):
+    class FakeCamera:
+        sock = None
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.replies = [
+                Message(
+                    Header(MSG.FILE_DOWNLOAD, 5, 0, 0, 7, 200, MSG_CLASS.FILE_DOWNLOAD),
+                    payload=b"first",
+                ),
+                Message(
+                    Header(MSG.FILE_DOWNLOAD, 6, 0, 0, 7, 331, MSG_CLASS.FILE_DOWNLOAD),
+                    payload=b"second",
+                ),
+            ]
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            if msg_id == MSG.UDP_KEEPALIVE:
+                return 0
+            return 7
+
+        def _recv(self, timeout=None):
+            return self.replies.pop(0)
+
+    output = tmp_path / "download.part"
+    sd_card = SdCard(FakeCamera())
+    written = sd_card._download_with_query(
+        _FileInfoQuery(
+            "download13/id/class6482",
+            MSG.FILE_DOWNLOAD,
+            b"request",
+            msg_class=MSG_CLASS.FILE_DOWNLOAD,
+        ),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert written == 5
+    assert output.read_bytes() == b"first"
+    assert "stopped after response 331" in sd_card._last_download_detail
+
+
+def test_playback_statuses_other_than_331_remain_terminal(tmp_path):
+    class FakeCamera:
+        sock = None
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.replies = [
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 5, 29, 0, 0, 200, MSG_CLASS.MODERN),
+                    payload=b"first",
+                ),
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 6, 29, 0, 0, 332, MSG_CLASS.MODERN),
+                    payload=b"second",
+                ),
+            ]
+
+        def send(self, _msg_id, payload=b"", **kwargs):
+            return kwargs.get("msg_num", 1)
+
+        def _recv(self, timeout=None, **_kwargs):
+            return self.replies.pop(0)
+
+    output = tmp_path / "playback.bcmedia"
+    sd_card = SdCard(FakeCamera())
+    written = sd_card._download_with_query(
+        _FileInfoQuery(
+            "playback143/range-subStream/bcmedia",
+            MSG.FILE_PLAYBACK,
+            b"request",
+            msg_class=MSG_CLASS.MODERN,
+            channel_id=29,
+            msg_num=0,
+        ),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert written == 5
+    assert output.read_bytes() == b"first"
+    assert "stopped after response 332" in sd_card._last_download_detail
+
+
+def test_preview143_response_331_does_not_enable_playback_compatibility(tmp_path):
+    class FakeCamera:
+        sock = None
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.recv_options = []
+            self.replies = [
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 5, 29, 0, 0, 200, MSG_CLASS.MODERN),
+                    payload=b"first",
+                ),
+                Message(
+                    Header(MSG.FILE_PLAYBACK, 6, 29, 0, 0, 331, MSG_CLASS.MODERN),
+                    payload=b"second",
+                ),
+            ]
+
+        def send(self, _msg_id, payload=b"", **kwargs):
+            return kwargs.get("msg_num", 1)
+
+        def _recv(self, timeout=None, **kwargs):
+            self.recv_options.append(kwargs)
+            return self.replies.pop(0)
+
+    output = tmp_path / "preview.part"
+    camera = FakeCamera()
+    sd_card = SdCard(camera)
+    written = sd_card._download_with_query(
+        _FileInfoQuery(
+            "preview143/range-subStream",
+            MSG.FILE_PLAYBACK,
+            b"request",
+            msg_class=MSG_CLASS.MODERN,
+            channel_id=29,
+            msg_num=0,
+        ),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert written == 5
+    assert output.read_bytes() == b"first"
+    assert camera.recv_options == [{}, {}]
+    assert "stopped after response 331" in sd_card._last_download_detail
 
 
 def test_sd_card_preview_debug_returns_probe_responses():

@@ -593,10 +593,21 @@ class Camera(AbstractContextManager["Camera"]):
             raise RuntimeError(msg.Error.CameraNotConnected)
         self.sock.sendall(data)
 
-    def _recv(self, timeout: float | None = None):
+    def _recv(
+        self,
+        timeout: float | None = None,
+        *,
+        binary_playback_331: bool = False,
+    ):
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        msg = recv_message(self.sock, self.cipher, timeout=self.timeout if timeout is None else timeout, binary_msg_nums=self.binary_msg_nums)
+        msg = recv_message(
+            self.sock,
+            self.cipher,
+            timeout=self.timeout if timeout is None else timeout,
+            binary_msg_nums=self.binary_msg_nums,
+            binary_playback_331=binary_playback_331,
+        )
         if msg.header.msg_id == MSG.UDP_KEEPALIVE:
             self._reply_keepalive(msg)
         return msg
