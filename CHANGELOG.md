@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0.post1 (megablocks fork)
+## 0.4.0.post1 (megablocks fork, unreleased)
 
 Fork maintenance build based on upstream PyNeolink `v0.4.0` at commit
 `d8c314b652ebf3a526f8cff88a8873d4cca533fb`.
@@ -13,8 +13,10 @@ Fork maintenance build based on upstream PyNeolink `v0.4.0` at commit
 
 ### Notes
 
-- The compatibility patch is maintained in the `megablocks/pyneolink` fork.
+- The compatibility patch is maintained by Megablocks in the
+  `megablocks/pyneolink` fork.
 - It has not been accepted or released by the upstream project.
+- No fork tag or GitHub release has been created yet.
 
 ## 0.4.0
 
