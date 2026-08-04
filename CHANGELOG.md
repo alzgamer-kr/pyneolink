@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0.post1 (megablocks fork, unreleased)
+
+Fork maintenance build based on upstream PyNeolink `v0.4.0` at commit
+`d8c314b652ebf3a526f8cff88a8873d4cca533fb`.
+
+### Fixed
+
+- Treat response `331` from message-143 SD-card playback as an intermediate
+  continuation so its media payload is preserved and playback continues to
+  the normal completion response.
+
+### Notes
+
+- The compatibility patch is maintained by Megablocks in the
+  `megablocks/pyneolink` fork.
+- It has not been accepted or released by the upstream project.
+- No fork tag or GitHub release has been created yet.
+
 ## 0.4.0
 
 SD-card file API and preview playback work.

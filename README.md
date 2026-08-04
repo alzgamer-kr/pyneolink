@@ -1,8 +1,16 @@
 # PyNeolink
 
+> **Fork provenance:** `megablocks/pyneolink` version `0.4.0.post1` is based
+> on upstream PyNeolink `v0.4.0` at commit
+> `d8c314b652ebf3a526f8cff88a8873d4cca533fb`. It carries a narrow Tree360
+> compatibility patch that treats response `331` during message-143 SD-card
+> playback as an intermediate continuation. The patch is maintained by
+> Megablocks in this fork and has not been accepted or released by the
+> upstream project.
+
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.4.0` alpha.
+Version: `0.4.0.post1` alpha fork build.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -44,24 +52,40 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 
 ## Install
 
+### Megablocks fork
+
+No fork release has been published yet. After a future GitHub release is
+created, download its `pyneolink-0.4.0.post1-py3-none-any.whl` release asset
+and install the downloaded file locally:
+
+```powershell
+python -m pip install .\pyneolink-0.4.0.post1-py3-none-any.whl
+```
+
+Until a reviewed release exists, install the fork only from a trusted local
+checkout for development:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -e ".[dev,voice]"
+```
+
+### Upstream package from PyPI
+
+The commands below install upstream PyNeolink `0.4.0`. They do not include
+the fork's Tree360 response-331 compatibility patch.
+
 From PyPI:
 
 ```powershell
 python -m pip install pyneolink==0.4.0
 ```
 
-With microphone voice input support:
+With upstream microphone voice input support:
 
 ```powershell
 python -m pip install "pyneolink[voice]==0.4.0"
-```
-
-For local development from a checkout:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install -e ".[dev,voice]"
 ```
 
 The `cryptography` package is required for AES-encrypted cameras. It is installed automatically when installing the package.
