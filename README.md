@@ -5,8 +5,8 @@
 > `d8c314b652ebf3a526f8cff88a8873d4cca533fb`. It carries a narrow Tree360
 > compatibility patch that treats response `331` during message-143 SD-card
 > playback as an intermediate continuation. The patch is maintained by
-> Megablocks in this fork and has not been accepted or released by the
-> upstream project.
+> Megablocks in this fork. This is a fork-only release, not an upstream
+> PyNeolink release, and the patch has not been accepted upstream.
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
@@ -52,18 +52,17 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 
 ## Install
 
-### Megablocks fork
+### Megablocks fork from GitHub Releases
 
-No fork release has been published yet. After a future GitHub release is
-created, download its `pyneolink-0.4.0.post1-py3-none-any.whl` release asset
-and install the downloaded file locally:
+The Megablocks fork is distributed from GitHub Releases, not PyPI. Install
+the wheel attached to tag `v0.4.0.post1` directly from its deterministic
+release-asset URL:
 
 ```powershell
-python -m pip install .\pyneolink-0.4.0.post1-py3-none-any.whl
+python -m pip install "https://github.com/megablocks/pyneolink/releases/download/v0.4.0.post1/pyneolink-0.4.0.post1-py3-none-any.whl"
 ```
 
-Until a reviewed release exists, install the fork only from a trusted local
-checkout for development:
+For local development from a trusted checkout:
 
 ```powershell
 python -m venv .venv
