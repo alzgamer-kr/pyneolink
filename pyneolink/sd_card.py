@@ -872,7 +872,13 @@ class SdCard:
                         self._last_download_detail = f"idle timeout after {deadline_misses} recv timeouts, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
                         break
                     raise
-                if not _is_download_message(msg, query.msg_id, accepted_msg_nums, written > 0):
+                if not _is_download_message(
+                    msg,
+                    query.msg_id,
+                    accepted_msg_nums,
+                    written > 0,
+                    allow_playback_331=playback_mode,
+                ):
                     idle_limit = active_idle_seconds if written else startup_idle_seconds
                     if monotonic_clock.monotonic() - last_progress >= idle_limit:
                         if written:
@@ -890,6 +896,7 @@ class SdCard:
                 if getattr(msg, "encrypted_len", None) is not None:
                     encrypted_lens.add(msg.encrypted_len)
                 replay_payload = replay_mode and msg.header.msg_id == MSG.FILE_REPLAY and bool(msg.payload)
+                playback_continuation = _is_playback_continuation_response(msg, query.msg_id, playback_mode)
                 if replay_mode and msg.header.response_code == 201:
                     if msg.payload:
                         payload = _clip_payload(msg.payload, written, effective_expected_size)
@@ -900,7 +907,7 @@ class SdCard:
                 if playback_mode and msg.header.response_code == 300:
                     self._last_download_detail = f"playback finished response=300, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
                     break
-                if msg.header.response_code not in (0, 200) and not replay_payload:
+                if msg.header.response_code not in (0, 200) and not replay_payload and not playback_continuation:
                     if written:
                         self._last_download_detail = (
                             f"stopped after response {msg.header.response_code}, chunks={chunks}, "
@@ -2303,10 +2310,18 @@ def _one_line_preview(value: str | bytes, limit: int = 320) -> str:
     return text if len(text) <= limit else f"{text[:limit]}..."
 
 
-def _is_download_continuation(msg, query_msg_id: int, download_started: bool) -> bool:
+def _is_download_continuation(
+    msg,
+    query_msg_id: int,
+    download_started: bool,
+    *,
+    allow_playback_331: bool = False,
+) -> bool:
     if msg.header.msg_id not in (query_msg_id, MSG.FILE_REPLAY, MSG.FILE_DOWNLOAD_VIDEO, MSG.FILE_DOWNLOAD):
         return False
-    if msg.header.response_code not in (0, 200):
+    if msg.header.response_code not in (0, 200) and not _is_playback_continuation_response(
+        msg, query_msg_id, allow_playback_331
+    ):
         return False
     if msg.header.msg_class == MSG_CLASS.FILE_DOWNLOAD:
         return True
@@ -2315,12 +2330,45 @@ def _is_download_continuation(msg, query_msg_id: int, download_started: bool) ->
     return download_started and bool(msg.payload)
 
 
-def _is_download_message(msg, query_msg_id: int, accepted_msg_nums: set[int], download_started: bool) -> bool:
+def _is_playback_continuation_response(msg, query_msg_id: int, playback_mode: bool) -> bool:
+    """Return whether a message-143 response is an intermediate media chunk.
+
+    Tree360 cameras can emit response 331 between valid playback payloads.
+    This exception deliberately applies only while processing message 143 and
+    leaves the original response code and payload intact.
+    """
+
+    return (
+        playback_mode
+        and query_msg_id == MSG.FILE_PLAYBACK
+        and msg.header.msg_id == MSG.FILE_PLAYBACK
+        and msg.header.response_code == 331
+    )
+
+
+def _is_download_message(
+    msg,
+    query_msg_id: int,
+    accepted_msg_nums: set[int],
+    download_started: bool,
+    *,
+    allow_playback_331: bool = False,
+) -> bool:
     if msg.header.msg_num in accepted_msg_nums:
         if msg.header.msg_num != 0:
             return True
-        return msg.header.msg_id == query_msg_id or _is_download_continuation(msg, query_msg_id, download_started)
-    return _is_download_continuation(msg, query_msg_id, download_started)
+        return msg.header.msg_id == query_msg_id or _is_download_continuation(
+            msg,
+            query_msg_id,
+            download_started,
+            allow_playback_331=allow_playback_331,
+        )
+    return _is_download_continuation(
+        msg,
+        query_msg_id,
+        download_started,
+        allow_playback_331=allow_playback_331,
+    )
 
 
 def _emit_progress(progress, written: int, expected_size: int | None, chunks: int, sock) -> None:
