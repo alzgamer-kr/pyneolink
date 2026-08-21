@@ -1,4 +1,14 @@
-from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, Settings, StreamServer, Voice, config_from_dict
+from pyneolink import (
+    Camera,
+    CameraConfig,
+    Config,
+    DangerousSdCardOperation,
+    EVENTS,
+    Settings,
+    StreamServer,
+    Voice,
+    config_from_dict,
+)
 from pyneolink.config import load_config
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
 from pyneolink.sd_card import DownloadSizeMismatch, SDFilePreview, SdCard
@@ -56,7 +66,7 @@ from pyneolink.internal.voice import (
 
 
 def test_bc_xor_roundtrip():
-    data = b"<?xml version=\"1.0\"?><body/>"
+    data = b'<?xml version="1.0"?><body/>'
     assert bc_xor(3, bc_xor(3, data)) == data
 
 
@@ -66,7 +76,7 @@ def test_udp_xor_roundtrip():
 
 
 def test_modern_packet_header_roundtrip():
-    payload = xml_document("<Ping version=\"1.1\" />")
+    payload = xml_document('<Ping version="1.1" />')
     packet = encode_modern(93, 7, payload)
     header = Header.unpack_from(packet[:24])
     assert header.msg_id == 93
@@ -287,7 +297,9 @@ def test_mpegts_muxer_emits_video_and_aac_packets():
     )
     chunks = []
     chunks.extend(muxer.feed(next(iframe)))
-    chunks.extend(muxer.feed(type("Packet", (), {"kind": "aac", "data": b"\xff\xf1\x50\x80\x00\x1f\xfc", "timestamp_us": None})()))
+    chunks.extend(
+        muxer.feed(type("Packet", (), {"kind": "aac", "data": b"\xff\xf1\x50\x80\x00\x1f\xfc", "timestamp_us": None})())
+    )
     assert chunks
     assert all(len(chunk) == 188 and chunk[0] == 0x47 for chunk in chunks)
     assert any((((chunk[1] & 0x1F) << 8) | chunk[2]) == MpegTsMuxer.AUDIO_PID for chunk in chunks)
@@ -651,6 +663,7 @@ def test_camera_battery_info_requests_channel_extension():
     assert b"<channelId>2</channelId>" in extension
     assert camera.sock.discarded == 1
 
+
 def test_camera_command_reconnects_once_after_timeout():
     camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     calls = {"send": 0, "recv": 0, "reconnect": 0, "ensure": 0}
@@ -926,10 +939,14 @@ def test_camera_sd_card_api_is_available():
 def test_motion_events_parse_alarm_event_list():
     xml = xml_document(
         '<AlarmEventList version="1.1">'
-        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>people</AItype><recording>1</recording><timeStamp>42</timeStamp></AlarmEvent>'
-        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>vehicle</AItype><recording>1</recording><timeStamp>43</timeStamp></AlarmEvent>'
-        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>none</AItype><recording>1</recording><timeStamp>44</timeStamp></AlarmEvent>'
-        '<AlarmEvent version="1.1"><channelId>0</channelId><status>none</status><AItype>none</AItype><recording>0</recording><timeStamp>0</timeStamp></AlarmEvent>'
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status>'
+        "<AItype>people</AItype><recording>1</recording><timeStamp>42</timeStamp></AlarmEvent>"
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status>'
+        "<AItype>vehicle</AItype><recording>1</recording><timeStamp>43</timeStamp></AlarmEvent>"
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status>'
+        "<AItype>none</AItype><recording>1</recording><timeStamp>44</timeStamp></AlarmEvent>"
+        '<AlarmEvent version="1.1"><channelId>0</channelId><status>none</status>'
+        "<AItype>none</AItype><recording>0</recording><timeStamp>0</timeStamp></AlarmEvent>"
         "</AlarmEventList>"
     )
     root = Message(Header(MSG.MOTION, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml).xml_root
@@ -978,7 +995,8 @@ def test_camera_events_status_returns_immediate_motion_event():
                     Header(MSG.MOTION, 0, 0, 0, 2, 200, MSG_CLASS.MODERN),
                     payload=xml_document(
                         '<AlarmEventList version="1.1">'
-                        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status><AItype>people</AItype></AlarmEvent>'
+                        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status>'
+                        "<AItype>people</AItype></AlarmEvent>"
                         "</AlarmEventList>"
                     ),
                 )
@@ -1104,7 +1122,6 @@ def test_talk_ability_parses_voice_config():
     assert config.samples_per_block == 513
 
 
-
 def test_voice_adpcm_bcmedia_packet_shape():
     block = ImaAdpcmEncoder().encode_block([0, 1000, -1000, 500, -500])
     packet = serialize_bcmedia_adpcm(block)
@@ -1114,9 +1131,14 @@ def test_voice_adpcm_bcmedia_packet_shape():
     assert packet[12:].startswith(block)
 
 
-def test_voice_adpcm_packs_high_nibble_first():
-    block = ImaAdpcmEncoder().encode_block([0, 1000, 2000])
-    assert block[4] == 0x77
+def test_voice_adpcm_packs_low_nibble_first():
+    block = ImaAdpcmEncoder().encode_block([0, 1000, 0])
+    assert block[4] == 0xA7
+
+
+def test_voice_adpcm_pads_odd_trailing_nibble_in_low_half():
+    block = ImaAdpcmEncoder().encode_block([0, 1000])
+    assert block[4] == 0x07
 
 
 def test_voice_adpcm_level_hint_reports_silence_as_zero():
@@ -1461,12 +1483,17 @@ def test_camera_snapshot_collects_binary_snap_packets(tmp_path):
         '<Snap version="1.1"><channelId>0</channelId><fileName>front.jpg</fileName><pictureSize>4</pictureSize></Snap>'
     )
     binary_ext = payloads.extension_binary.format(channel_id=0)
+
     def snap_replies(msg_num):
         return b"".join(
             [
                 encode_modern(MSG.SNAP, msg_num, info_xml, response_code=200, cipher=Cipher("none")),
-                encode_modern(MSG.SNAP, 77, b"\xff\xd8", extension=binary_ext, response_code=200, cipher=Cipher("none")),
-                encode_modern(MSG.SNAP, 77, b"\xff\xd9", extension=binary_ext, response_code=201, cipher=Cipher("none")),
+                encode_modern(
+                    MSG.SNAP, 77, b"\xff\xd8", extension=binary_ext, response_code=200, cipher=Cipher("none")
+                ),
+                encode_modern(
+                    MSG.SNAP, 77, b"\xff\xd9", extension=binary_ext, response_code=201, cipher=Cipher("none")
+                ),
             ]
         )
 
@@ -1905,7 +1932,9 @@ def test_sd_card_preview_debug_collects_bcmedia_continuation(monkeypatch):
     monkeypatch.setattr(
         "pyneolink.sd_card._preview_queries",
         lambda channel, file_id, raw: [
-            _FileInfoQuery("preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, b"", msg_class=MSG_CLASS.FILE_DOWNLOAD)
+            _FileInfoQuery(
+                "preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, b"", msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
         ],
     )
 
@@ -1934,11 +1963,7 @@ def test_sd_card_preview_debug_reports_embedded_mp4(monkeypatch):
             if getattr(self, "sent_mp4", False):
                 raise TimeoutError("done")
             self.sent_mp4 = True
-            mp4 = (
-                b"\x00\x00\x00\x18ftypisof\x00\x00\x00\x01isofhvc1"
-                b"\x00\x00\x00\x08moov"
-                b"\x00\x00\x00\x0cmdatdata"
-            )
+            mp4 = b"\x00\x00\x00\x18ftypisof\x00\x00\x00\x01isofhvc1\x00\x00\x00\x08moov\x00\x00\x00\x0cmdatdata"
             return Message(
                 Header(MSG.FILE_DOWNLOAD_VIDEO, 0, 0, 0, 5, 200, MSG_CLASS.FILE_DOWNLOAD),
                 payload=mp4,
@@ -1947,7 +1972,9 @@ def test_sd_card_preview_debug_reports_embedded_mp4(monkeypatch):
     monkeypatch.setattr(
         "pyneolink.sd_card._preview_queries",
         lambda channel, file_id, raw: [
-            _FileInfoQuery("preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, b"", msg_class=MSG_CLASS.FILE_DOWNLOAD)
+            _FileInfoQuery(
+                "preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, b"", msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
         ],
     )
 
@@ -1968,11 +1995,7 @@ def test_sd_card_preview_dump_writes_embedded_mp4(tmp_path):
             return 5
 
         def _recv_matching(self, msg_id, msg_num):
-            mp4 = (
-                b"\x00\x00\x00\x18ftypisof\x00\x00\x00\x01isofhvc1"
-                b"\x00\x00\x00\x08moov"
-                b"\x00\x00\x00\x0cmdatdata"
-            )
+            mp4 = b"\x00\x00\x00\x18ftypisof\x00\x00\x00\x01isofhvc1\x00\x00\x00\x08moov\x00\x00\x00\x0cmdatdata"
             return Message(
                 Header(msg_id, len(mp4) + 32, 0, 0, msg_num, 200, MSG_CLASS.FILE_DOWNLOAD),
                 extension=b"<Extension><binaryData>1</binaryData></Extension>",

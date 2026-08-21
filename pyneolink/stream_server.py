@@ -394,7 +394,11 @@ class MpegTsMuxer:
     def table_packets(self) -> list[bytes]:
         packets: list[bytes] = []
         packets.extend(self._packetize(self.PAT_PID, b"\x00" + _pat_section(self.PMT_PID), start=True))
-        packets.extend(self._packetize(self.PMT_PID, b"\x00" + _pmt_section(self.codec, self.VIDEO_PID, self.AUDIO_PID), start=True))
+        packets.extend(
+            self._packetize(
+                self.PMT_PID, b"\x00" + _pmt_section(self.codec, self.VIDEO_PID, self.AUDIO_PID), start=True
+            )
+        )
         self.tables_written = True
         return packets
 
@@ -537,12 +541,7 @@ class HlsSession:
             def add_packet(packet: MediaPacket) -> None:
                 nonlocal current, started_at, saw_video
                 now = time.monotonic()
-                if (
-                    packet.kind == "iframe"
-                    and saw_video
-                    and current
-                    and now - started_at >= self.segment_seconds
-                ):
+                if packet.kind == "iframe" and saw_video and current and now - started_at >= self.segment_seconds:
                     self._append_segment(bytes(current), now - started_at)
                     current = bytearray()
                     started_at = now

@@ -45,7 +45,9 @@ class Voice:
 
     def ability(self) -> TalkConfig:
         """Return camera talk capability/configuration."""
-        reply = self._voice_command(MSG.TALKABILITY, extension=payloads.extension.format(channel_id=self.camera.config.channel_id))
+        reply = self._voice_command(
+            MSG.TALKABILITY, extension=payloads.extension.format(channel_id=self.camera.config.channel_id)
+        )
         if reply.header.response_code != 200:
             raise ProtocolError(msg.Error.Response.format(response_code=reply.header.response_code))
         if reply.xml_text:
@@ -140,7 +142,9 @@ class Voice:
             if on_ready is not None:
                 on_ready(config)
             try:
-                self._send_blocks(_adpcm_blocks_from_microphone(config, volume=volume, seconds=seconds), config, wait_ack=wait_ack)
+                self._send_blocks(
+                    _adpcm_blocks_from_microphone(config, volume=volume, seconds=seconds), config, wait_ack=wait_ack
+                )
             finally:
                 self.stop()
 
@@ -159,7 +163,9 @@ class Voice:
             return
         try:
             self._drain_talk_replies()
-            msg_num = self.camera.send(MSG.TALKRESET, extension=payloads.extension.format(channel_id=self.camera.config.channel_id))
+            msg_num = self.camera.send(
+                MSG.TALKRESET, extension=payloads.extension.format(channel_id=self.camera.config.channel_id)
+            )
             if wait:
                 self._wait_for_stop_reply(msg_num)
         except Exception:
@@ -171,10 +177,18 @@ class Voice:
     def _start(self, config: TalkConfig) -> None:
         if config.audio_type != "adpcm":
             raise ProtocolError(msg.Error.VoiceNeedsAdpcm)
-        reply = self._voice_command(MSG.TALKCONFIG, talk_config_payload(config), extension=payloads.extension.format(channel_id=config.channel_id))
+        reply = self._voice_command(
+            MSG.TALKCONFIG,
+            talk_config_payload(config),
+            extension=payloads.extension.format(channel_id=config.channel_id),
+        )
         if reply.header.response_code == 422:
             self.stop(force=True)
-            reply = self._voice_command(MSG.TALKCONFIG, talk_config_payload(config), extension=payloads.extension.format(channel_id=config.channel_id))
+            reply = self._voice_command(
+                MSG.TALKCONFIG,
+                talk_config_payload(config),
+                extension=payloads.extension.format(channel_id=config.channel_id),
+            )
         if reply.header.response_code != 200:
             raise ProtocolError(msg.Error.Response.format(response_code=reply.header.response_code))
         self._debug(
@@ -256,7 +270,9 @@ class Voice:
             play_times=AUDIO_PLAY.DEFAULT_TIMES,
             on_off=AUDIO_PLAY.SIREN_TRIGGER,
         )
-        reply = self._voice_command(MSG.PLAY_AUDIO, payload, extension=payloads.extension.format(channel_id=self.camera.config.channel_id))
+        reply = self._voice_command(
+            MSG.PLAY_AUDIO, payload, extension=payloads.extension.format(channel_id=self.camera.config.channel_id)
+        )
         if reply.header.response_code not in (0, 200):
             raise ProtocolError(msg.Error.Response.format(response_code=reply.header.response_code))
         self._debug("siren command accepted")

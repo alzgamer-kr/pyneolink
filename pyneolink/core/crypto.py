@@ -94,6 +94,7 @@ class Cipher:
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher as AesCipher
             from cryptography.hazmat.primitives.ciphers import algorithms
+
             try:
                 from cryptography.hazmat.decrepit.ciphers import modes as cipher_modes
             except ImportError:

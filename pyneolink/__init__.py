@@ -7,7 +7,15 @@ from .core.const import EVENTS
 from .errors import CameraConnectionError
 from .motion import CameraEvent, CameraEvents, Motion, parse_motion_events
 from .recorder import StreamRecorder
-from .sd_card import DangerousSdCardOperation, DownloadSizeMismatch, SDFile, SDFilePreview, SDFilePreviewServer, SdCard, SdCardFile
+from .sd_card import (
+    DangerousSdCardOperation,
+    DownloadSizeMismatch,
+    SDFile,
+    SDFilePreview,
+    SDFilePreviewServer,
+    SdCard,
+    SdCardFile,
+)
 from .settings import Ir, Pir, Settings
 from .stream_server import StreamServer, serve_streams
 from .voice import TalkConfig, Voice
@@ -45,4 +53,4 @@ __all__ = [
     "serve_streams",
     "__version__",
 ]
-__version__ = "0.4.1"
+__version__ = "0.4.2"

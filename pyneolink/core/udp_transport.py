@@ -10,7 +10,6 @@ from .discovery import (
     DiscoveryHit,
     decode_discovery_packet,
     encode_discovery_xml,
-    remote_uid_lookup,
 )
 from .const import MAGIC, msg
 
@@ -189,7 +188,9 @@ class UdpBcConnection:
             self.data_packets_received += 1
             self.data_bytes_received += len(payload)
             self.last_data_packet_id = packet_id
-            self.max_data_packet_id = packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
+            self.max_data_packet_id = (
+                packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
+            )
             self.last_data_at = time.monotonic()
             self._feed_ack_latency()
             self._maybe_send_ack()
@@ -209,7 +210,9 @@ class UdpBcConnection:
 
     def _send_ack(self) -> None:
         packet_id, payload, group_id = self._ack_state()
-        self.sock.sendto(encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=self.ack_latency), self.addr)
+        self.sock.sendto(
+            encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=self.ack_latency), self.addr
+        )
         if packet_id != 0xFFFFFFFF:
             self.last_ack_packet_id = packet_id
         self.acks_sent += 1
@@ -298,7 +301,9 @@ class UdpBcConnection:
         max_id = self.max_data_packet_id
         pending_gaps = 0
         if max_id is not None and self.next_recv_id <= max_id:
-            pending_gaps = sum(1 for packet_id in range(self.next_recv_id, max_id + 1) if packet_id not in self.recv_chunks)
+            pending_gaps = sum(
+                1 for packet_id in range(self.next_recv_id, max_id + 1) if packet_id not in self.recv_chunks
+            )
         return {
             "udp_next_recv_id": self.next_recv_id,
             "udp_last_packet_id": self.last_data_packet_id,
@@ -319,7 +324,9 @@ class UdpBcConnection:
         }
 
 
-def connect_local_direct(uid: str, *, timeout: float = 8.0, listen_port: int = 0, debug: bool = False) -> UdpBcConnection:
+def connect_local_direct(
+    uid: str, *, timeout: float = 8.0, listen_port: int = 0, debug: bool = False
+) -> UdpBcConnection:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     try:
@@ -408,7 +415,12 @@ def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, 
     client_id = _client_id()
     local_ip = _local_ip_for(reg)
     local_port = sock.getsockname()[1]
-    _debug(debug, f"P2P lookup ok: reg={reg[0]}:{reg[1]} relay={relay_lookup[0]}:{relay_lookup[1]} local={local_ip}:{local_port} cid={client_id}")
+    lookup_detail = (
+        f"P2P lookup ok: reg={reg[0]}:{reg[1]} "
+        f"relay={relay_lookup[0]}:{relay_lookup[1]} "
+        f"local={local_ip}:{local_port} cid={client_id}"
+    )
+    _debug(debug, lookup_detail)
     reg_xml = (
         "<P2P><C2R_C>"
         f"<uid>{uid}</uid>"
@@ -418,7 +430,9 @@ def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, 
         "</C2R_C></P2P>"
     )
     _debug(debug, "Registering client address with Reolink register server")
-    reply_xml = _retry_discovery(sock, reg_xml, reg, lambda xml: "<R2C_C_R>" in xml, timeout=timeout, debug=debug, label="C2R_C")
+    reply_xml = _retry_discovery(
+        sock, reg_xml, reg, lambda xml: "<R2C_C_R>" in xml, timeout=timeout, debug=debug, label="C2R_C"
+    )
     sid = _find_int(reply_xml, "sid")
     relay = _find_in_xml(reply_xml, "relay") or _find_in_xml(reply_xml, "relayt") or relay_lookup
     candidates = [
@@ -431,8 +445,13 @@ def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, 
         sock.close()
         raise TimeoutError(msg.Error.RegisterNoConnectionDetails)
 
-    _debug(debug, f"Register ok: sid={sid} candidates={', '.join(f'{conn}={addr[0]}:{addr[1]}' for conn, addr in candidates)}")
-    conn_name, final_addr, confirm_xml, heartbeat_tid = _open_registered_channel(sock, sid, client_id, candidates, timeout=timeout, debug=debug)
+    _debug(
+        debug,
+        f"Register ok: sid={sid} candidates={', '.join(f'{conn}={addr[0]}:{addr[1]}' for conn, addr in candidates)}",
+    )
+    conn_name, final_addr, confirm_xml, heartbeat_tid = _open_registered_channel(
+        sock, sid, client_id, candidates, timeout=timeout, debug=debug
+    )
     camera_id = _find_int(confirm_xml, "did")
     if camera_id is None:
         sock.close()
@@ -455,8 +474,14 @@ def encode_udp_data(connection_id: int, packet_id: int, payload: bytes) -> bytes
     return struct.pack("<IiII", MAGIC.UDP_DATA, connection_id, 0, packet_id) + struct.pack("<I", len(payload)) + payload
 
 
-def encode_udp_ack(connection_id: int, packet_id: int, payload: bytes = b"", group_id: int = 0, maybe_latency: int = 0) -> bytes:
-    return struct.pack("<IiIIII", MAGIC.UDP_ACK, connection_id, 0, group_id, packet_id, maybe_latency) + struct.pack("<I", len(payload)) + payload
+def encode_udp_ack(
+    connection_id: int, packet_id: int, payload: bytes = b"", group_id: int = 0, maybe_latency: int = 0
+) -> bytes:
+    return (
+        struct.pack("<IiIIII", MAGIC.UDP_ACK, connection_id, 0, group_id, packet_id, maybe_latency)
+        + struct.pack("<I", len(payload))
+        + payload
+    )
 
 
 def decode_udp_packet(data: bytes):
@@ -490,7 +515,9 @@ def _lookup_with_socket(sock: socket.socket, uid: str, *, timeout: float, debug:
 
     for hostname in P2P_RELAY_HOSTNAMES:
         try:
-            destinations.extend(info[4] for info in socket.getaddrinfo(hostname, 9999, socket.AF_INET, socket.SOCK_DGRAM))
+            destinations.extend(
+                info[4] for info in socket.getaddrinfo(hostname, 9999, socket.AF_INET, socket.SOCK_DGRAM)
+            )
         except OSError:
             pass
     deadline = time.monotonic() + timeout
@@ -512,14 +539,29 @@ def _lookup_with_socket(sock: socket.socket, uid: str, *, timeout: float, debug:
             reg = _find_in_xml(decoded[1], "reg")
             relay = _find_in_xml(decoded[1], "relay")
             target = _find_in_xml(decoded[1], "t")
-            _debug(debug, f"Received M2C_Q_R from {_addr[0]}:{_addr[1]} reg={_fmt_addr(reg)} relay={_fmt_addr(relay)} t={_fmt_addr(target)}")
+            lookup_reply = (
+                f"Received M2C_Q_R from {_addr[0]}:{_addr[1]} "
+                f"reg={_fmt_addr(reg)} relay={_fmt_addr(relay)} t={_fmt_addr(target)}"
+            )
+            _debug(debug, lookup_reply)
             if reg and relay:
-                return DiscoveryHit(uid, target or _addr, xml=decoded[1], raw=data, source="remote:p2p", transport="udp")
+                return DiscoveryHit(
+                    uid, target or _addr, xml=decoded[1], raw=data, source="remote:p2p", transport="udp"
+                )
             _debug(debug, "Ignoring incomplete M2C_Q_R and waiting for another P2P server")
     raise TimeoutError(msg.Error.P2pLookupNoReply)
 
 
-def _retry_discovery(sock: socket.socket, xml: str, dest: tuple[str, int], accept, *, timeout: float, debug: bool = False, label: str = "discovery") -> str:
+def _retry_discovery(
+    sock: socket.socket,
+    xml: str,
+    dest: tuple[str, int],
+    accept,
+    *,
+    timeout: float,
+    debug: bool = False,
+    label: str = "discovery",
+) -> str:
     deadline = time.monotonic() + timeout
     sent_at = 0.0
     while time.monotonic() < deadline:
@@ -556,9 +598,7 @@ def _open_registered_channel(
             addr,
             encode_discovery_xml(
                 heartbeat_tid,
-                "<P2P><C2D_T>"
-                f"<sid>{sid}</sid><conn>{conn}</conn><cid>{client_id}</cid><mtu>{MTU}</mtu>"
-                "</C2D_T></P2P>",
+                f"<P2P><C2D_T><sid>{sid}</sid><conn>{conn}</conn><cid>{client_id}</cid><mtu>{MTU}</mtu></C2D_T></P2P>",
             ),
         )
         for conn, addr in candidates

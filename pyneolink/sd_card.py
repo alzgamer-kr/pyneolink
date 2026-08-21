@@ -356,9 +356,7 @@ class _PreviewHttpHandler(BaseHTTPRequestHandler):
             with self.server.lock:
                 self.server.active_clients = max(self.server.active_clients - 1, 0)
                 should_cleanup = (
-                    self.server.cleanup_on_disconnect
-                    and self.server.seen_client
-                    and self.server.active_clients == 0
+                    self.server.cleanup_on_disconnect and self.server.seen_client and self.server.active_clients == 0
                 )
             if should_cleanup:
                 self.server.preview.close()
@@ -505,7 +503,9 @@ class SdCard:
                 days.append(start.date().fromordinal(start.date().toordinal() + index))
         return [day for day in days if start.date() <= day <= end.date()]
 
-    def _list_day_files(self, channel: int, start: datetime, end: datetime, stream_type: str, attempts: list[str]) -> list[SdCardFile]:
+    def _list_day_files(
+        self, channel: int, start: datetime, end: datetime, stream_type: str, attempts: list[str]
+    ) -> list[SdCardFile]:
         files = []
         seen = set()
         for handle_query in _handle_queries(channel, start, end, stream_type):
@@ -582,7 +582,13 @@ class SdCard:
         end_dt = _coerce_datetime(end, end_of_day=True) if end is not None else None
         result = []
         for item in items:
-            data = item.info() if isinstance(item, SDFile) else item.to_dict() if isinstance(item, SdCardFile) else dict(item)
+            data = (
+                item.info()
+                if isinstance(item, SDFile)
+                else item.to_dict()
+                if isinstance(item, SdCardFile)
+                else dict(item)
+            )
             item_start = _coerce_datetime(data.get("start_time"), end_of_day=False) if data.get("start_time") else None
             item_end = _coerce_datetime(data.get("end_time"), end_of_day=True) if data.get("end_time") else None
             if name and name.lower() not in _searchable_file_text(data).lower():
@@ -697,10 +703,7 @@ class SdCard:
                 return
             except Exception as exc:
                 last_error = exc
-                message = (
-                    f"SD download reconnect failed for {file_name}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
+                message = f"SD download reconnect failed for {file_name}: {type(exc).__name__}: {exc}"
                 self.last_download_attempts.append(message)
                 _emit_progress_message(progress, f"  {message}")
         raise CameraConnectionError(
@@ -753,7 +756,9 @@ class SdCard:
                     self._stop_replay_download(raw)
                 if query.label.startswith("playback143/"):
                     self._stop_playback_download()
-                self.last_download_attempts.append(f"{query.label}: timeout{_transport_snapshot_text(self.camera.sock)}")
+                self.last_download_attempts.append(
+                    f"{query.label}: timeout{_transport_snapshot_text(self.camera.sock)}"
+                )
                 _remove_empty_file(part_path)
                 last_error = exc
                 continue
@@ -769,7 +774,9 @@ class SdCard:
             except Exception as exc:
                 if query.label.startswith("replay5/"):
                     self._stop_replay_download(raw)
-                    self.last_download_attempts.append(f"{query.label}: {type(exc).__name__}: {exc}{_transport_snapshot_text(self.camera.sock)}")
+                    self.last_download_attempts.append(
+                        f"{query.label}: {type(exc).__name__}: {exc}{_transport_snapshot_text(self.camera.sock)}"
+                    )
                     _remove_empty_file(part_path)
                     last_error = exc
                     continue
@@ -779,13 +786,23 @@ class SdCard:
             detail = f", {self._last_download_detail}" if self._last_download_detail else ""
             self.last_download_attempts.append(f"{query.label}: wrote {written} bytes{detail}")
             if written:
-                if expected_size is not None and written != expected_size and (forced_high or not query.label.startswith("playback143/")):
+                if (
+                    expected_size is not None
+                    and written != expected_size
+                    and (forced_high or not query.label.startswith("playback143/"))
+                ):
                     _remove_file(part_path)
                     if best_mismatch is None or written > best_mismatch[1]:
                         best_mismatch = (query.label, written)
                     self._reconnect_after_download()
                     continue
-                return _finalize_download(part_path, output_path, expected_size if forced_high else (None if query.label.startswith("playback143/") else expected_size))
+                return _finalize_download(
+                    part_path,
+                    output_path,
+                    expected_size
+                    if forced_high
+                    else (None if query.label.startswith("playback143/") else expected_size),
+                )
             _remove_empty_file(part_path)
         if best_mismatch and expected_size is not None:
             label, written = best_mismatch
@@ -797,7 +814,9 @@ class SdCard:
                     attempts=", ".join(self.last_download_attempts),
                 )
             ) from last_error
-        raise ProtocolError(const_msg.Error.SdDownloadFailed.format(attempts=", ".join(self.last_download_attempts))) from last_error
+        raise ProtocolError(
+            const_msg.Error.SdDownloadFailed.format(attempts=", ".join(self.last_download_attempts))
+        ) from last_error
 
     def _download_with_query(
         self,
@@ -812,8 +831,14 @@ class SdCard:
     ) -> int:
         replay_mode = query.label.startswith("replay5/")
         playback_mode = query.label.startswith("playback143/")
-        msg_class = query.msg_class if query.msg_class is not None else (MSG_CLASS.FILE_DOWNLOAD if not replay_mode else MSG_CLASS.MODERN)
-        msg_num = self.camera.send(query.msg_id, query.payload, msg_class=msg_class, channel_id=query.channel_id, msg_num=query.msg_num)
+        msg_class = (
+            query.msg_class
+            if query.msg_class is not None
+            else (MSG_CLASS.FILE_DOWNLOAD if not replay_mode else MSG_CLASS.MODERN)
+        )
+        msg_num = self.camera.send(
+            query.msg_id, query.payload, msg_class=msg_class, channel_id=query.channel_id, msg_num=query.msg_num
+        )
         accepted_msg_nums = {msg_num}
         chunks = 0
         written = 0
@@ -865,12 +890,17 @@ class SdCard:
                 except TimeoutError:
                     deadline_misses += 1
                     if written and effective_expected_size is not None and written >= effective_expected_size:
-                        self._last_download_detail = f"complete after timeout, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                        self._last_download_detail = (
+                            f"complete after timeout, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                        )
                         break
                     if written and monotonic_clock.monotonic() - last_progress < active_idle_seconds:
                         continue
                     if written:
-                        self._last_download_detail = f"idle timeout after {deadline_misses} recv timeouts, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                        self._last_download_detail = (
+                            f"idle timeout after {deadline_misses} recv timeouts, chunks={chunks}, "
+                            f"msg_nums={len(accepted_msg_nums)}"
+                        )
                         break
                     raise
                 if not _is_download_message(
@@ -903,10 +933,14 @@ class SdCard:
                         payload = _clip_payload(msg.payload, written, effective_expected_size)
                         fh.write(payload)
                         written += len(payload)
-                    self._last_download_detail = f"replay finished response=201, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                    self._last_download_detail = (
+                        f"replay finished response=201, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                    )
                     break
                 if playback_mode and msg.header.response_code == 300:
-                    self._last_download_detail = f"playback finished response=300, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                    self._last_download_detail = (
+                        f"playback finished response=300, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                    )
                     break
                 if msg.header.response_code not in (0, 200) and not replay_payload and not playback_continuation:
                     if written:
@@ -915,7 +949,9 @@ class SdCard:
                             f"msg_nums={len(accepted_msg_nums)}"
                         )
                         break
-                    raise ProtocolError(_response_detail(msg, const_msg.Error.Response.format(response_code=msg.header.response_code)))
+                    raise ProtocolError(
+                        _response_detail(msg, const_msg.Error.Response.format(response_code=msg.header.response_code))
+                    )
                 if b"<binaryData>1</binaryData>" in msg.extension:
                     self.camera.binary_msg_nums.add(msg_num)
                     self.camera.binary_msg_nums.add(msg.header.msg_num)
@@ -955,15 +991,27 @@ class SdCard:
                 if not msg.payload:
                     if playback_continuation:
                         continue
-                    if effective_expected_size is not None and written < effective_expected_size and monotonic_clock.monotonic() - last_progress < active_idle_seconds:
+                    if (
+                        effective_expected_size is not None
+                        and written < effective_expected_size
+                        and monotonic_clock.monotonic() - last_progress < active_idle_seconds
+                    ):
                         continue
                     if written:
-                        self._last_download_detail = f"empty payload response={msg.header.response_code}, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                        self._last_download_detail = (
+                            f"empty payload response={msg.header.response_code}, chunks={chunks}, "
+                            f"msg_nums={len(accepted_msg_nums)}"
+                        )
                         break
-                    self._last_download_detail = f"empty payload before data response={msg.header.response_code}, msg_nums={len(accepted_msg_nums)}"
+                    self._last_download_detail = (
+                        f"empty payload before data response={msg.header.response_code}, "
+                        f"msg_nums={len(accepted_msg_nums)}"
+                    )
                     break
                 if deadline_misses > 1:
-                    self._last_download_detail = f"deadline misses={deadline_misses}, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                    self._last_download_detail = (
+                        f"deadline misses={deadline_misses}, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
+                    )
                     break
         if written and not self._last_download_detail:
             self._last_download_detail = f"loop ended, chunks={chunks}, msg_nums={len(accepted_msg_nums)}"
@@ -976,9 +1024,7 @@ class SdCard:
                 if effective_expected_size is not None and effective_expected_size != expected_size:
                     payload_detail = f"{payload_detail}, effective_expected={effective_expected_size}"
                 self._last_download_detail = (
-                    f"{self._last_download_detail}, {payload_detail}"
-                    if self._last_download_detail
-                    else payload_detail
+                    f"{self._last_download_detail}, {payload_detail}" if self._last_download_detail else payload_detail
                 )
             snapshot = _transport_snapshot_text(self.camera.sock)
             if snapshot:
@@ -1033,7 +1079,9 @@ class SdCard:
             raise ProtocolError(const_msg.Error.SdReplayNeedsNameAndStart)
         channel = self.camera.config.channel_id
         seq = int(start_time.timestamp())
-        seek_payload = payloads.replay_seek.format(channel_id=channel, seq=seq, seek_time=_time_fragment("seekTime", start_time))
+        seek_payload = payloads.replay_seek.format(
+            channel_id=channel, seq=seq, seek_time=_time_fragment("seekTime", start_time)
+        )
         seek_reply = self.camera.command(MSG.REPLAY_SEEK, seek_payload)
         if seek_reply.header.response_code != 200:
             raise ProtocolError(const_msg.Error.ReplaySeekFailed.format(response_code=seek_reply.header.response_code))
@@ -1041,7 +1089,9 @@ class SdCard:
         detail_payload = payloads.replay_file_detail.format(channel_id=channel, name=name, stream_type=stream_type)
         detail_reply = self.camera.command(MSG.FILE_DOWNLOAD, detail_payload)
         if detail_reply.header.response_code != 200:
-            raise ProtocolError(const_msg.Error.ReplayFileDetailFailed.format(response_code=detail_reply.header.response_code))
+            raise ProtocolError(
+                const_msg.Error.ReplayFileDetailFailed.format(response_code=detail_reply.header.response_code)
+            )
         self._active_replay_name = name
 
     def _stop_replay_download(self, raw: dict) -> None:
@@ -1280,7 +1330,9 @@ class SdCard:
         )
         data = payload if raw else _extract_embedded_mp4_bytes(payload)
         if not data:
-            raise ProtocolError(const_msg.Error.SdPreviewFailed.format(attempts="preview8/thumbnail/class6482 returned no MP4 data"))
+            raise ProtocolError(
+                const_msg.Error.SdPreviewFailed.format(attempts="preview8/thumbnail/class6482 returned no MP4 data")
+            )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(data)
         _emit_progress_message(progress, f"  saved preview dump: {output_path} ({len(data)} bytes)")
@@ -1316,7 +1368,9 @@ class SdCard:
         )
         reply = self.camera._recv_matching(query.msg_id, msg_num)
         if reply.header.response_code not in (0, 200):
-            raise ProtocolError(_response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code)))
+            raise ProtocolError(
+                _response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code))
+            )
 
         raw_seen = 0
         mp4_offset: int | None = None
@@ -1348,7 +1402,9 @@ class SdCard:
                     if deadline_misses >= idle_timeouts:
                         break
                     continue
-                if msg.header.msg_num != msg_num and not _is_download_continuation(msg, query.msg_id, mp4_started or bool(head)):
+                if msg.header.msg_num != msg_num and not _is_download_continuation(
+                    msg, query.msg_id, mp4_started or bool(head)
+                ):
                     continue
                 if msg.header.response_code not in (0, 200):
                     break
@@ -1392,7 +1448,9 @@ class SdCard:
         )
         reply = self.camera._recv_matching(query.msg_id, msg_num)
         if reply.header.response_code not in (0, 200):
-            raise ProtocolError(_response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code)))
+            raise ProtocolError(
+                _response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code))
+            )
         data = bytearray(reply.payload or b"")
         expected_total = _embedded_mp4_total_size(data)
         deadline_misses = 0
@@ -1445,9 +1503,7 @@ def _parse_file_list(root: ET.Element | None) -> list[SdCardFile]:
         nodes = [
             node
             for node in root.iter()
-            if node is not root
-            and len(node) > 0
-            and any(child.tag in _TIME_OR_FILE_KEYS for child in node)
+            if node is not root and len(node) > 0 and any(child.tag in _TIME_OR_FILE_KEYS for child in node)
         ]
     return [_parse_file_node(node) for node in nodes]
 
@@ -1504,10 +1560,25 @@ _TIME_OR_FILE_KEYS = {
 }
 
 _STREAM_TYPE_CANDIDATES = ("mainStream", "subStream", "clear", "fluent")
-_FILE_TYPE_CANDIDATES = ("All", "all", "Rec", "rec", "record", "Record", "MD", "motion", "alarm", "human", "vehicle", "visitor")
+_FILE_TYPE_CANDIDATES = (
+    "All",
+    "all",
+    "Rec",
+    "rec",
+    "record",
+    "Record",
+    "MD",
+    "motion",
+    "alarm",
+    "human",
+    "vehicle",
+    "visitor",
+)
 
 
-def _file_info_queries(channel: int, start: datetime, end: datetime, stream_type: str, file_type: str) -> list[_FileInfoQuery]:
+def _file_info_queries(
+    channel: int, start: datetime, end: datetime, stream_type: str, file_type: str
+) -> list[_FileInfoQuery]:
     msg_ids = [
         ("replay", MSG.FILE_REPLAY),
         ("info14", MSG.FILE_INFO_LIST),
@@ -1525,14 +1596,18 @@ def _file_info_queries(channel: int, start: datetime, end: datetime, stream_type
         *[
             (
                 f"compact-{stream_value}",
-                payloads.file_info_compact_stream.format(channel_id=channel, start=start, end=end, stream_type=stream_value),
+                payloads.file_info_compact_stream.format(
+                    channel_id=channel, start=start, end=end, stream_type=stream_value
+                ),
             )
             for stream_value in _STREAM_TYPE_CANDIDATES
         ],
         *[
             (
                 f"compact-{stream_value}-{type_value}",
-                payloads.file_info_compact_stream_type.format(channel_id=channel, start=start, end=end, stream_type=stream_value, type_value=type_value),
+                payloads.file_info_compact_stream_type.format(
+                    channel_id=channel, start=start, end=end, stream_type=stream_value, type_value=type_value
+                ),
             )
             for stream_value in _STREAM_TYPE_CANDIDATES
             for type_value in _FILE_TYPE_CANDIDATES
@@ -1615,7 +1690,11 @@ def _handle_queries(channel: int, start: datetime, end: datetime, stream_type: s
             end_time=_time_fragment("endTime", end),
         )
         queries.append(_FileInfoQuery(f"handle/{stream}", MSG.FILE_INFO_LIST, payload))
-        queries.append(_FileInfoQuery(f"handle/{stream}+ext", MSG.FILE_INFO_LIST, payload, payloads.extension.format(channel_id=channel)))
+        queries.append(
+            _FileInfoQuery(
+                f"handle/{stream}+ext", MSG.FILE_INFO_LIST, payload, payloads.extension.format(channel_id=channel)
+            )
+        )
     return queries
 
 
@@ -1623,7 +1702,9 @@ def _handle_detail_queries(channel: int, handle: str) -> list[_FileInfoQuery]:
     payload = payloads.files_for_handle.format(channel_id=channel, handle=handle)
     return [
         _FileInfoQuery(f"files/handle-{handle}", MSG.FILE_INFO_LIST_ALT, payload),
-        _FileInfoQuery(f"files/handle-{handle}+ext", MSG.FILE_INFO_LIST_ALT, payload, payloads.extension.format(channel_id=channel)),
+        _FileInfoQuery(
+            f"files/handle-{handle}+ext", MSG.FILE_INFO_LIST_ALT, payload, payloads.extension.format(channel_id=channel)
+        ),
     ]
 
 
@@ -1905,23 +1986,71 @@ def _download_queries(channel: int, file_id: str, raw: dict) -> list[_FileInfoQu
     primary_label, primary_payload = download_payloads[0]
     full_payload = download_payloads[-1][1]
     if _is_forced_high_quality(raw):
-        queries.append(_FileInfoQuery("download13/full-high/class6482", MSG.FILE_DOWNLOAD, full_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
-        queries.append(_FileInfoQuery("download8/full-high/class6482", MSG.FILE_DOWNLOAD_VIDEO, full_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+        queries.append(
+            _FileInfoQuery(
+                "download13/full-high/class6482", MSG.FILE_DOWNLOAD, full_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
+        )
+        queries.append(
+            _FileInfoQuery(
+                "download8/full-high/class6482",
+                MSG.FILE_DOWNLOAD_VIDEO,
+                full_payload,
+                msg_class=MSG_CLASS.FILE_DOWNLOAD,
+            )
+        )
         return queries
-    queries.append(_FileInfoQuery(f"download13/{primary_label}/class6482", MSG.FILE_DOWNLOAD, primary_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+    queries.append(
+        _FileInfoQuery(
+            f"download13/{primary_label}/class6482",
+            MSG.FILE_DOWNLOAD,
+            primary_payload,
+            msg_class=MSG_CLASS.FILE_DOWNLOAD,
+        )
+    )
     for label, payload in playback_payloads:
-        queries.append(_FileInfoQuery(f"playback143/{label}/bcmedia", MSG.FILE_PLAYBACK, payload, msg_class=MSG_CLASS.MODERN, channel_id=playback_channel_id, msg_num=0))
-    queries.append(_FileInfoQuery(f"download8/{primary_label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, primary_payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+        queries.append(
+            _FileInfoQuery(
+                f"playback143/{label}/bcmedia",
+                MSG.FILE_PLAYBACK,
+                payload,
+                msg_class=MSG_CLASS.MODERN,
+                channel_id=playback_channel_id,
+                msg_num=0,
+            )
+        )
+    queries.append(
+        _FileInfoQuery(
+            f"download8/{primary_label}/class6482",
+            MSG.FILE_DOWNLOAD_VIDEO,
+            primary_payload,
+            msg_class=MSG_CLASS.FILE_DOWNLOAD,
+        )
+    )
     if replay_payload:
-        queries.append(_FileInfoQuery("replay5/start/bcmedia", MSG.FILE_REPLAY, replay_payload, msg_class=MSG_CLASS.MODERN))
+        queries.append(
+            _FileInfoQuery("replay5/start/bcmedia", MSG.FILE_REPLAY, replay_payload, msg_class=MSG_CLASS.MODERN)
+        )
     for label, payload in download_payloads:
         if label == primary_label:
             continue
-        queries.append(_FileInfoQuery(f"download13/{label}/class6482", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
-        queries.append(_FileInfoQuery(f"download8/{label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+        queries.append(
+            _FileInfoQuery(
+                f"download13/{label}/class6482", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
+        )
+        queries.append(
+            _FileInfoQuery(
+                f"download8/{label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
+        )
     for label, payload in download_payloads:
-        queries.append(_FileInfoQuery(f"download8/{label}/class6414", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.MODERN))
-        queries.append(_FileInfoQuery(f"download13/{label}/class6414", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.MODERN))
+        queries.append(
+            _FileInfoQuery(f"download8/{label}/class6414", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.MODERN)
+        )
+        queries.append(
+            _FileInfoQuery(f"download13/{label}/class6414", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.MODERN)
+        )
     return queries
 
 
@@ -1955,14 +2084,31 @@ def _preview_queries(channel: int, file_id: str, raw: dict) -> list[_FileInfoQue
             queries.append(_FileInfoQuery(f"preview143/{label}/range", MSG.FILE_PLAYBACK, text.encode("utf-8")))
     for label, extra in variants[:2]:
         payload = _preview_payload(channel, file_id, raw, stream_type=stream_type, extra=extra, mode="full")
-        queries.append(_FileInfoQuery(f"preview13/{label}/class6482", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
-        queries.append(_FileInfoQuery(f"preview8/{label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD))
+        queries.append(
+            _FileInfoQuery(
+                f"preview13/{label}/class6482", MSG.FILE_DOWNLOAD, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
+        )
+        queries.append(
+            _FileInfoQuery(
+                f"preview8/{label}/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD
+            )
+        )
     return queries
 
 
 def _preview_dump_query(channel: int, file_id: str, raw: dict) -> _FileInfoQuery:
-    payload = _preview_payload(channel, file_id, raw, stream_type=str(raw.get("streamType") or "mainStream"), extra="<thumbnail>1</thumbnail>", mode="full")
-    return _FileInfoQuery("preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD)
+    payload = _preview_payload(
+        channel,
+        file_id,
+        raw,
+        stream_type=str(raw.get("streamType") or "mainStream"),
+        extra="<thumbnail>1</thumbnail>",
+        mode="full",
+    )
+    return _FileInfoQuery(
+        "preview8/thumbnail/class6482", MSG.FILE_DOWNLOAD_VIDEO, payload, msg_class=MSG_CLASS.FILE_DOWNLOAD
+    )
 
 
 def _preview_handle_queries(channel: int, handle: str, source_label: str) -> list[_FileInfoQuery]:
@@ -1977,8 +2123,16 @@ def _preview_handle_queries(channel: int, handle: str, source_label: str) -> lis
         payload = _preview_handle_payload(channel, handle, extra=extra)
         queries.append(_FileInfoQuery(f"{source_label}/handle-{handle}/msg15/{label}", MSG.FILE_INFO_LIST_ALT, payload))
         queries.append(_FileInfoQuery(f"{source_label}/handle-{handle}/msg14/{label}", MSG.FILE_INFO_LIST, payload))
-        queries.append(_FileInfoQuery(f"{source_label}/handle-{handle}/msg16/{label}", MSG.FILE_INFO_LIST_ALT2, payload))
-    queries.append(_FileInfoQuery(f"{source_label}/handle-{handle}/plain15", MSG.FILE_INFO_LIST_ALT, payloads.files_for_handle.format(channel_id=channel, handle=handle)))
+        queries.append(
+            _FileInfoQuery(f"{source_label}/handle-{handle}/msg16/{label}", MSG.FILE_INFO_LIST_ALT2, payload)
+        )
+    queries.append(
+        _FileInfoQuery(
+            f"{source_label}/handle-{handle}/plain15",
+            MSG.FILE_INFO_LIST_ALT,
+            payloads.files_for_handle.format(channel_id=channel, handle=handle),
+        )
+    )
     return queries
 
 
@@ -2021,17 +2175,31 @@ def _playback_download_payloads(channel: int, raw: dict) -> list[tuple[str, byte
         return []
     if _is_forced_high_quality(raw):
         return [
-            ("range-mainStream-nosub", _playback_download_payload(channel, start_time, end_time, "mainStream", support_sub=0)),
-            ("range-mainStream-nosupport", _playback_download_payload(channel, start_time, end_time, "mainStream", support_sub=None)),
-            ("range-mainStream", _playback_download_payload(channel, start_time, end_time, "mainStream", support_sub=1)),
+            (
+                "range-mainStream-nosub",
+                _playback_download_payload(channel, start_time, end_time, "mainStream", support_sub=0),
+            ),
+            (
+                "range-mainStream-nosupport",
+                _playback_download_payload(channel, start_time, end_time, "mainStream", support_sub=None),
+            ),
+            (
+                "range-mainStream",
+                _playback_download_payload(channel, start_time, end_time, "mainStream", support_sub=1),
+            ),
         ]
     stream_types = [str(stream_type)]
     if not raw.get("_streamTypeForced") and "subStream" not in stream_types:
         stream_types.append("subStream")
-    return [(f"range-{stream}", _playback_download_payload(channel, start_time, end_time, stream)) for stream in stream_types]
+    return [
+        (f"range-{stream}", _playback_download_payload(channel, start_time, end_time, stream))
+        for stream in stream_types
+    ]
 
 
-def _playback_download_payload(channel: int, start_time: datetime, end_time: datetime, stream_type: str, *, support_sub: int | None = 1) -> bytes:
+def _playback_download_payload(
+    channel: int, start_time: datetime, end_time: datetime, stream_type: str, *, support_sub: int | None = 1
+) -> bytes:
     template = payloads.playback_download_no_support if support_sub is None else payloads.playback_download
     return template.format(
         channel_id=channel,
@@ -2157,12 +2325,16 @@ def _merge_preview_binary_probe(detail: dict, payload: bytes) -> None:
             }
             for packet in packets[:8]
         ]
-    detail["has_video_frame"] = any(packet.kind in ("iframe", "pframe") for packet in packets) or bool(mp4_info.get("has_mdat"))
+    detail["has_video_frame"] = any(packet.kind in ("iframe", "pframe") for packet in packets) or bool(
+        mp4_info.get("has_mdat")
+    )
 
 
 def _preview_binary_has_video_frame(payload: bytes | bytearray) -> bool:
     data = bytes(payload)
-    return any(packet.kind in ("iframe", "pframe") for packet in MediaParser().feed(data)) or bool(_embedded_mp4_info(data).get("has_mdat"))
+    return any(packet.kind in ("iframe", "pframe") for packet in MediaParser().feed(data)) or bool(
+        _embedded_mp4_info(data).get("has_mdat")
+    )
 
 
 def _preview_output_path(output: str | Path, file_name: str, *, raw: bool) -> Path:
@@ -2493,7 +2665,9 @@ def _remove_empty_file(path: Path) -> None:
 def _finalize_download(part_path: Path, output_path: Path, expected_size: int | None) -> Path:
     actual_size = part_path.stat().st_size
     if expected_size is not None and actual_size != expected_size:
-        raise DownloadSizeMismatch(const_msg.Error.DownloadSizeMismatch.format(actual_size=actual_size, expected_size=expected_size))
+        raise DownloadSizeMismatch(
+            const_msg.Error.DownloadSizeMismatch.format(actual_size=actual_size, expected_size=expected_size)
+        )
     if output_path.suffix.lower() == ".mp4" and looks_like_bcmedia(part_path):
         if output_path.exists():
             output_path.unlink()

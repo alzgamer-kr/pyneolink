@@ -123,7 +123,9 @@ class CLI:
         parser.add_argument("--state", default=".pyneolink_state.json")
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--camera")
-        parser.add_argument("--info", action="store_true", help="Connect to the camera and print camera information as JSON")
+        parser.add_argument(
+            "--info", action="store_true", help="Connect to the camera and print camera information as JSON"
+        )
         subparsers = parser.add_subparsers(dest="command")
 
         for name in ("status", "info", "uid", "reboot"):
@@ -169,7 +171,9 @@ class CLI:
         motion.add_argument("--watch", action="store_true", help="Keep listening for motion events")
         motion.add_argument("--count", type=int, help="With --watch, stop after N events")
         motion.add_argument("--duration", type=float, help="With --watch, stop after this many seconds")
-        motion.add_argument("--timeout", type=float, default=3.0, help="Seconds to wait for an immediate motion state event")
+        motion.add_argument(
+            "--timeout", type=float, default=3.0, help="Seconds to wait for an immediate motion state event"
+        )
 
         voice = subparsers.add_parser("voice")
         self.add_common_options(voice)
@@ -180,7 +184,9 @@ class CLI:
         voice.add_argument("--siren", action="store_true", help="Trigger the camera siren")
         voice.add_argument("--seconds", type=float, help="Seconds for microphone or tone modes")
         voice.add_argument("--volume", type=float, default=1.0)
-        voice.add_argument("--voice-codec", choices=["python", "ffmpeg"], default="python", help="ADPCM encoder for --file")
+        voice.add_argument(
+            "--voice-codec", choices=["python", "ffmpeg"], default="python", help="ADPCM encoder for --file"
+        )
         voice.add_argument("--voice-wait-ack", action="store_true", help="Wait for every talk packet acknowledgement")
 
         pir = subparsers.add_parser("pir")
@@ -204,7 +210,9 @@ class CLI:
         self.add_camera_option(raw_stream)
         raw_stream.add_argument("--stream", default="mainStream", choices=["mainStream", "subStream"])
         raw_stream.add_argument("--output", required=True)
-        raw_stream.add_argument("--packets", type=int, default=0, help="Stop after N video packets; 0 means keep running")
+        raw_stream.add_argument(
+            "--packets", type=int, default=0, help="Stop after N video packets; 0 means keep running"
+        )
 
         serve = subparsers.add_parser("serve")
         self.add_common_options(serve)
@@ -515,7 +523,9 @@ class CLI:
         :param cam_cfg: Selected camera configuration.
         """
 
-        enabled_sources = sum(1 for enabled in (args.file, args.microphone, args.tone is not None, args.siren) if enabled)
+        enabled_sources = sum(
+            1 for enabled in (args.file, args.microphone, args.tone is not None, args.siren) if enabled
+        )
         if enabled_sources > 1:
             self.parser.error("Use only one of --file, --microphone, --tone, or --siren")
         if enabled_sources == 0:
@@ -547,7 +557,9 @@ class CLI:
                     seconds=args.seconds or 3.0,
                     volume=args.volume,
                     wait_ack=args.voice_wait_ack,
-                    on_ready=lambda _config: print(msg.Log.VoicePlaying.format(input=f"{args.tone:g} Hz tone"), flush=True),
+                    on_ready=lambda _config: print(
+                        msg.Log.VoicePlaying.format(input=f"{args.tone:g} Hz tone"), flush=True
+                    ),
                 )
         print(msg.Log.VoiceSent)
         return 0
