@@ -9,6 +9,7 @@ class Error(StrEnum):
     LoginNonce = "Camera did not return a login nonce"
     UdpRelayRequiresUid = "UDP relay requires a camera UID"
     CameraAddressRequired = "Camera needs address, cached_address, or a UID reachable by discovery"
+    CameraConfigMissingName = "Camera config item #{index} is missing required field 'name'"
     CameraNotConnected = "Camera is not connected"
     BatteryRequestFailed = "Battery request failed"
     ShortBaichuanHeader = "Short Baichuan header"
@@ -85,6 +86,7 @@ class Error(StrEnum):
     DownloadSizeMismatch = "Downloaded {actual_size} bytes, expected {expected_size} bytes"
     Mp4ConversionFailed = "Downloaded BCMedia, but MP4 conversion failed; raw stream saved to {raw_path}: {exc}"
     UnknownCommand = "Unknown command: {command}"
+    ConfigParseFailed = "Could not parse config {path} as JSON ({json_error}) or TOML ({toml_error})"
 
 
 class Log(StrEnum):
@@ -101,6 +103,7 @@ class Log(StrEnum):
     StreamStopReturned = "[pyneolink] Stream stop returned {response_code}; ignoring"
     StreamStopCloseFailed = "[pyneolink] Stream stop failed during close: {exc_type}: {exc}"
     StreamKeepaliveReplyFailed = "[pyneolink] Failed to reply to stream keepalive: {exc_type}: {exc}"
+    InfoFlagIgnored = "--info ignored because command {command!r} was also provided"
     ConfigWritten = "wrote {path}"
     DiscoveryHit = "{host}:{port}{uid} source={source}"
     CameraConnected = "{name}: connected"

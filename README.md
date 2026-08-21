@@ -2,7 +2,7 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.4.0` alpha.
+Version: `0.4.1` alpha.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -24,7 +24,8 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 - SD-card recording download with high/low quality selection
 - SD-card preview playback cache with an HTTP stream helper for players such as VLC
 - Snapshot download to bytes or JPEG file
-- Local MPEG-TS recording from the live stream
+- Local MPEG-TS recording from the live stream with `Camera.record()` or the
+  `record` CLI command
 - Live HTTP MPEG-TS viewing with H264/H265 video and AAC audio
 - HLS timeshift viewing with an in-memory sliding buffer
 - Motion status and motion event watch mode
@@ -38,7 +39,9 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 - This is reverse engineered and tested against a small number of real cameras, so behavior may differ between models and firmware versions.
 - Voice file playback uses `ffmpeg`/`ffprobe` for format validation and conversion. Install FFmpeg and make sure both commands are available in `PATH`.
 - Microphone voice input needs the Python `sounddevice` package and a working local input device.
-- Local stream recording writes MPEG-TS (`.ts`) files, not MP4.
+- Local stream recording writes MPEG-TS (`.ts`) files, not MP4. It records the
+  live stream on the client machine; it does not start or stop the camera's own
+  SD-card recording schedule.
 - SD-card `remove()` and `format()` exist, but are intentionally guarded.
 - PTZ, image settings, alarm schedules, floodlight settings, and Web UI are not implemented yet.
 
@@ -47,13 +50,13 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 From PyPI:
 
 ```powershell
-python -m pip install pyneolink==0.4.0
+python -m pip install pyneolink==0.4.1
 ```
 
 With microphone voice input support:
 
 ```powershell
-python -m pip install "pyneolink[voice]==0.4.0"
+python -m pip install "pyneolink[voice]==0.4.1"
 ```
 
 For local development from a checkout:
@@ -120,10 +123,14 @@ python pyneolink/cli.py battery --camera "Home-Front" --watch --interval 60 --mo
 Snapshots and local recording:
 
 ```powershell
-python pyneolink/cli.py snapshot --camera "Home-Front" --out snapshots/
+python pyneolink/cli.py snapshot --camera "Home-Front" --out snapshots/ --stream-type main
 python pyneolink/cli.py record --camera "Home-Front" --out recordings/ --duration 30 --quality high
 python pyneolink/cli.py record --camera "Home-Front" --out recordings/live.ts --quality low
 ```
+
+`record` opens the selected live stream and saves it locally as MPEG-TS. Omit
+`--duration` to record until Ctrl+C. This is not a command to force the camera
+to start writing a new SD-card recording.
 
 Motion:
 
@@ -242,15 +249,37 @@ with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as c
                 print("human detected")
 ```
 
-Snapshot and local recording:
+Snapshot:
 
 ```python
 from pyneolink import Camera
 
 with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
-    camera.snapshot(out="snapshots")
-    camera.record(out="recordings", duration=30, stream="mainStream")
+    camera.snapshot(out="snapshots", stream_type="main")
+    image = camera.snapshot(stream_type="sub")
 ```
+
+Local recording from the SDK:
+
+```python
+import time
+
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    path = camera.record(out="recordings", duration=30, stream="mainStream")
+    print(f"saved to {path}")
+
+    with camera.record(out="recordings/live.ts", stream="subStream") as recorder:
+        time.sleep(10)
+    print(f"saved to {recorder.path}")
+```
+
+`Camera.record()` records the live stream on the client machine and writes
+MPEG-TS (`.ts`). With `duration`, it waits and returns the final `Path`. Without
+`duration`, it returns a running `StreamRecorder`; use it as a context manager
+or call `stop()` to finalize the file. This does not enable or disable the
+camera's own SD-card recording.
 
 Voice and siren:
 

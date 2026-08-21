@@ -72,10 +72,25 @@ def load_config(path: str | Path) -> Config:
     """
     path = Path(path)
     text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".json":
+    suffix = path.suffix.lower()
+    if suffix == ".json":
         data = json.loads(text)
-    else:
+    elif suffix in (".toml", ".tml"):
         data = tomllib.loads(text)
+    else:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as json_error:
+            try:
+                data = tomllib.loads(text)
+            except tomllib.TOMLDecodeError as toml_error:
+                raise ValueError(
+                    msg.Error.ConfigParseFailed.format(
+                        path=path,
+                        json_error=json_error,
+                        toml_error=toml_error,
+                    )
+                ) from toml_error
     return config_from_dict(data)
 
 
@@ -84,20 +99,23 @@ def config_from_dict(data: dict) -> Config:
 
     :param data: Parsed config dictionary.
     """
-    cameras = [
-        CameraConfig(
-            name=item["name"],
-            username=item.get("username", "admin"),
-            password=item.get("password", "123456"),
-            address=item.get("address"),
-            uid=item.get("uid"),
-            discovery=item.get("discovery", "relay"),
-            channel_id=int(item.get("channel_id", 0)),
-            stream=item.get("stream", "both"),
-            cached_address=item.get("cached_address"),
+    cameras = []
+    for index, item in enumerate(data.get("cameras", [])):
+        if "name" not in item:
+            raise ValueError(msg.Error.CameraConfigMissingName.format(index=index))
+        cameras.append(
+            CameraConfig(
+                name=item["name"],
+                username=item.get("username", "admin"),
+                password=item.get("password", "123456"),
+                address=item.get("address"),
+                uid=item.get("uid"),
+                discovery=item.get("discovery", "relay"),
+                channel_id=int(item.get("channel_id", 0)),
+                stream=item.get("stream", "both"),
+                cached_address=item.get("cached_address"),
+            )
         )
-        for item in data.get("cameras", [])
-    ]
     return Config(data.get("bind", "0.0.0.0"), int(data.get("bind_port", 8554)), cameras)
 
 

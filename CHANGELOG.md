@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.1
+
+Voice/talk reliability patch.
+
+### Changed
+
+- Kept `Camera.snapshot()` and the `snapshot` CLI on explicit `stream_type` selection instead of adding snapshot `quality` aliases.
+- Snapshot payloads now keep `<fullFrame>0</fullFrame>` for both main and sub snapshot streams.
+- Clarified that `Camera.record()` and the `record` CLI perform local
+  MPEG-TS live-stream recording, not camera-side SD-card recording control.
+
+### Fixed
+
+- Reconnect once and retry when short camera commands hit a stale UDP session timeout.
+- Reconnect once and retry the whole snapshot request when snapshot metadata or data waits time out.
+- Reused the shared command retry path for repeated voice/talk and siren commands.
+- Treat Tree360-style `MSG.FILE_PLAYBACK` response `331` as a scoped playback
+  continuation so SD-card playback downloads can continue to their normal
+  completion response.
+- Hardened config parsing, snapshot output paths, connection-state writes, UDP
+  packet decoding, and global CLI `--camera` parsing based on external fork
+  review.
+
+---
+
 ## 0.4.0
 
 SD-card file API and preview playback work.

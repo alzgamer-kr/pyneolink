@@ -267,17 +267,55 @@ class Camera(AbstractContextManager["Camera"]):
             return self.settings().ir.auto()
         raise ValueError(msg.Error.IrModeValue)
 
-    def snapshot(self, *, out: str | Path | None = None, stream_type: str = "main") -> bytes | Path:
+    def snapshot(
+        self,
+        *,
+        out: str | Path | None = None,
+        stream_type: str = "main",
+        retry_on_timeout: bool = True,
+        reconnect_retries: int = 1,
+    ) -> bytes | Path:
         """Capture a JPEG snapshot.
 
         :param out: Optional file path or directory. When omitted, bytes are
             returned. When a directory is provided, the camera file name is used.
-        :param stream_type: Snapshot stream type, usually `main` or `sub`.
+        :param stream_type: Explicit snapshot stream type, usually `main` or
+            `sub`.
+        :param retry_on_timeout: Reconnect and retry the whole snapshot request
+            when the current UDP session times out.
+        :param reconnect_retries: Number of reconnect attempts for stale snapshot
+            sessions. The default retries once.
         """
+        attempts = max(0, reconnect_retries if retry_on_timeout else 0) + 1
+        last_error: TimeoutError | None = None
+        for attempt in range(attempts):
+            try:
+                return self._snapshot_once(out=out, stream_type=stream_type)
+            except TimeoutError as exc:
+                last_error = exc
+                if attempt >= attempts - 1:
+                    break
+                if self.debug:
+                    print(msg.Log.Pyneolink.format(message="snapshot timed out; reconnecting camera session"))
+                self.reconnect()
+        if last_error is not None:
+            raise last_error
+        raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=MSG.SNAP, msg_num="?"))
+
+    def _snapshot_once(
+        self,
+        *,
+        out: str | Path | None,
+        stream_type: str | None,
+    ) -> bytes | Path:
         self.ensure_connected()
+        requested_stream = _snapshot_stream_type(stream_type)
         msg_num = self.send(
             MSG.SNAP,
-            payloads.snapshot.format(channel_id=self.config.channel_id, stream_type=stream_type),
+            payloads.snapshot.format(
+                channel_id=self.config.channel_id,
+                stream_type=requested_stream,
+            ),
             extension=payloads.extension.format(channel_id=self.config.channel_id),
         )
 
@@ -387,16 +425,42 @@ class Camera(AbstractContextManager["Camera"]):
         """
         yield from self.battery().watch(interval=interval, count=count, mode=mode)
 
-    def command(self, msg_id: int, payload: bytes = b"", *, extension: bytes = b""):
+    def command(
+        self,
+        msg_id: int,
+        payload: bytes = b"",
+        *,
+        extension: bytes = b"",
+        retry_on_timeout: bool = True,
+        reconnect_retries: int = 1,
+    ):
         """Send a command and wait for the matching reply.
 
         :param msg_id: Baichuan message id.
         :param payload: Optional command payload bytes.
         :param extension: Optional Baichuan extension bytes.
+        :param retry_on_timeout: Reconnect and retry when the current UDP
+            session times out before the matching reply arrives.
+        :param reconnect_retries: Number of reconnect attempts for stale command
+            sessions. The default retries once.
         """
-        self.ensure_connected()
-        msg_num = self.send(msg_id, payload, extension=extension)
-        return self._recv_matching(msg_id, msg_num)
+        attempts = max(0, reconnect_retries if retry_on_timeout else 0) + 1
+        last_error: TimeoutError | None = None
+        for attempt in range(attempts):
+            self.ensure_connected()
+            try:
+                msg_num = self.send(msg_id, payload, extension=extension)
+                return self._recv_matching(msg_id, msg_num)
+            except TimeoutError as exc:
+                last_error = exc
+                if attempt >= attempts - 1:
+                    break
+                if self.debug:
+                    print(msg.Log.Pyneolink.format(message=f"command {msg_id} timed out; reconnecting camera session"))
+                self.reconnect()
+        if last_error is not None:
+            raise last_error
+        raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=msg_id, msg_num="?"))
 
     def _recv_matching(self, msg_id: int, msg_num: int):
         deadline = time.monotonic() + self.timeout
@@ -593,10 +657,21 @@ class Camera(AbstractContextManager["Camera"]):
             raise RuntimeError(msg.Error.CameraNotConnected)
         self.sock.sendall(data)
 
-    def _recv(self, timeout: float | None = None):
+    def _recv(
+        self,
+        timeout: float | None = None,
+        *,
+        binary_playback_331: bool = False,
+    ):
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        msg = recv_message(self.sock, self.cipher, timeout=self.timeout if timeout is None else timeout, binary_msg_nums=self.binary_msg_nums)
+        msg = recv_message(
+            self.sock,
+            self.cipher,
+            timeout=self.timeout if timeout is None else timeout,
+            binary_msg_nums=self.binary_msg_nums,
+            binary_playback_331=binary_playback_331,
+        )
         if msg.header.msg_id == MSG.UDP_KEEPALIVE:
             self._reply_keepalive(msg)
         return msg
@@ -620,3 +695,16 @@ class Camera(AbstractContextManager["Camera"]):
         except Exception as exc:
             if self.debug:
                 print(msg.Log.StreamKeepaliveReplyFailed.format(exc_type=type(exc).__name__, exc=exc))
+
+
+def _snapshot_stream_type(stream_type: str | None) -> str:
+    normalized = "main" if stream_type is None else stream_type.strip().lower()
+    mapping = {
+        "main": "main",
+        "mainstream": "main",
+        "sub": "sub",
+        "substream": "sub",
+    }
+    if normalized not in mapping:
+        raise ValueError(msg.Error.StreamValue)
+    return mapping[normalized]

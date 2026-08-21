@@ -125,15 +125,32 @@ The playlist uses active in-memory segments and gives a timeshift behavior: the 
 
 `Camera.snapshot(out=None, stream_type="main")`:
 
-1. sends `MSG.SNAP` with a snapshot payload and channel extension;
-2. reads the XML response with file name and expected size;
-3. reads binary snapshot payloads until response code `201`;
-4. validates size when the camera reported it;
-5. returns bytes or writes a JPEG file when `out` is provided.
+1. sends the requested explicit snapshot `stream_type`;
+2. sends `MSG.SNAP` with a snapshot payload and channel extension;
+3. reads XML metadata with file name and expected picture size;
+4. reads binary snapshot payloads until response code `201`;
+5. validates size when the camera reported it;
+6. returns bytes or writes a JPEG file when `out` is provided.
 
 ## Local Recording
 
 `Camera.record(out=..., duration=..., stream="mainStream")` creates a `StreamRecorder`.
+
+This is client-side recording. PyNeolink starts the camera live stream, muxes the
+received media packets into MPEG-TS, and writes a local `.ts` file. It does not
+send a camera command that enables or disables the camera's own SD-card
+recording.
+
+SDK behavior:
+
+- `out` can be a directory or a complete file path. Directories get an automatic
+  `recording-YYYYMMDD-HHMMSS.ts` file name.
+- `stream` accepts the live stream name, usually `mainStream` or `subStream`.
+- With `duration`, `Camera.record()` waits for completion and returns the saved
+  `Path`.
+- Without `duration`, `Camera.record()` returns a running `StreamRecorder`.
+  Call `stop()` to request shutdown and finalize the file.
+- `StreamRecorder` can also be used as a context manager.
 
 The recorder:
 
@@ -145,7 +162,30 @@ The recorder:
 6. flushes periodically;
 7. stops the stream on exit.
 
-When `duration` is omitted, the caller controls `recorder.stop()`. The CLI catches Ctrl+C and stops the recorder so the file is finalized as cleanly as possible.
+SDK examples:
+
+```python
+import time
+
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    path = camera.record(out="recordings", duration=30, stream="mainStream")
+
+    with camera.record(out="recordings/live.ts", stream="subStream") as recorder:
+        time.sleep(10)
+```
+
+When `duration` is omitted, the caller controls `recorder.stop()`. The CLI
+catches Ctrl+C and stops the recorder so the file is finalized as cleanly as
+possible.
+
+CLI examples:
+
+```powershell
+python pyneolink/cli.py record --camera "Home-Front" --out recordings/ --duration 30 --quality high
+python pyneolink/cli.py record --camera "Home-Front" --out recordings/live.ts --quality low
+```
 
 ## SD-Card BCMedia Conversion
 

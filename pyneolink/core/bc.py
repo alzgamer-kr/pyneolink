@@ -186,7 +186,14 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def recv_message(sock: socket.socket, cipher: Cipher, *, timeout: float | None = None, binary_msg_nums: set[int] | None = None) -> Message:
+def recv_message(
+    sock: socket.socket,
+    cipher: Cipher,
+    *,
+    timeout: float | None = None,
+    binary_msg_nums: set[int] | None = None,
+    binary_playback_331: bool = False,
+) -> Message:
     if timeout is not None:
         sock.settimeout(timeout)
     first = recv_exact(sock, 20)
@@ -206,7 +213,12 @@ def recv_message(sock: socket.socket, cipher: Cipher, *, timeout: float | None =
     extension = reply_cipher.decrypt(header.channel_id, ext_raw) if ext_raw else b""
     in_binary = b"<binaryData>1</binaryData>" in extension
     encrypted_len = _extension_int(extension, "encryptLen") if in_binary else None
-    is_binary = in_binary or (binary_msg_nums is not None and header.msg_num in binary_msg_nums)
+    scoped_playback_binary = (
+        binary_playback_331
+        and header.msg_id == MSG.FILE_PLAYBACK
+        and header.response_code == 331
+    )
+    is_binary = in_binary or (binary_msg_nums is not None and header.msg_num in binary_msg_nums) or scoped_playback_binary
     if is_binary:
         if reply_cipher.name == "aes" and reply_cipher.full_media and encrypted_len is not None:
             encrypted_part = payload_raw[:encrypted_len]

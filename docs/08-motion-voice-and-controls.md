@@ -90,7 +90,7 @@ Implementation notes:
 
 ## Snapshot
 
-`camera.snapshot(out="snapshots")` asks the camera for a JPEG snapshot. It can also return bytes when `out` is omitted.
+`camera.snapshot(out="snapshots", stream_type="main")` asks the camera for a JPEG snapshot using an explicit stream type. It can also return bytes when `out` is omitted.
 
 ## LED And Reboot
 
