@@ -109,7 +109,10 @@ class CLI:
 
         args = self.parser.parse_args(argv)
         if args.info:
-            args.command = "info"
+            if args.command:
+                print(msg.Log.InfoFlagIgnored.format(command=args.command), file=sys.stderr)
+            else:
+                args.command = "info"
         return args
 
     def build_parser(self) -> argparse.ArgumentParser:
@@ -126,11 +129,11 @@ class CLI:
         for name in ("status", "info", "uid", "reboot"):
             command_parser = subparsers.add_parser(name)
             self.add_common_options(command_parser)
-            command_parser.add_argument("--camera")
+            self.add_camera_option(command_parser)
 
         battery = subparsers.add_parser("battery")
         self.add_common_options(battery)
-        battery.add_argument("--camera")
+        self.add_camera_option(battery)
         battery.add_argument("--raw", action="store_true", help="Print raw battery XML")
         battery.add_argument("--watch", action="store_true", help="Repeat the battery request")
         battery.add_argument("--interval", type=float, default=60.0, help="Seconds between repeated battery requests")
@@ -139,30 +142,30 @@ class CLI:
 
         led = subparsers.add_parser("led")
         self.add_common_options(led)
-        led.add_argument("--camera")
+        self.add_camera_option(led)
         led.add_argument("value", nargs="?", choices=["on", "off", "auto"])
 
         snapshot = subparsers.add_parser("snapshot")
         self.add_common_options(snapshot)
-        snapshot.add_argument("--camera")
+        self.add_camera_option(snapshot)
         snapshot.add_argument("-out", "--out", required=True, help="Path or directory for the JPEG snapshot")
-        snapshot.add_argument("--stream-type", default="main", choices=["main", "sub"])
+        snapshot.add_argument("--stream-type", default="main", choices=["main", "sub"], help="Snapshot stream type")
 
         record = subparsers.add_parser("record")
         self.add_common_options(record)
-        record.add_argument("--camera")
+        self.add_camera_option(record)
         record.add_argument("-out", "--out", required=True, help="Path or directory for the MPEG-TS recording")
         record.add_argument("--duration", type=float, help="Seconds to record; omit to record until Ctrl+C")
         record.add_argument("--quality", default="high", choices=["high", "low"])
 
         events = subparsers.add_parser("events")
         self.add_common_options(events)
-        events.add_argument("--camera")
+        self.add_camera_option(events)
         events.add_argument("--count", type=int, help="Stop after N events; omit to keep listening")
 
         motion = subparsers.add_parser("motion")
         self.add_common_options(motion)
-        motion.add_argument("--camera")
+        self.add_camera_option(motion)
         motion.add_argument("--watch", action="store_true", help="Keep listening for motion events")
         motion.add_argument("--count", type=int, help="With --watch, stop after N events")
         motion.add_argument("--duration", type=float, help="With --watch, stop after this many seconds")
@@ -170,7 +173,7 @@ class CLI:
 
         voice = subparsers.add_parser("voice")
         self.add_common_options(voice)
-        voice.add_argument("--camera")
+        self.add_camera_option(voice)
         voice.add_argument("--file", help="Audio file to play through the camera speaker")
         voice.add_argument("--microphone", action="store_true", help="Use the local microphone as the voice source")
         voice.add_argument("--tone", type=float, help="Play a generated test tone at this frequency, for example 1000")
@@ -182,12 +185,12 @@ class CLI:
 
         pir = subparsers.add_parser("pir")
         self.add_common_options(pir)
-        pir.add_argument("--camera")
+        self.add_camera_option(pir)
         pir.add_argument("action", choices=["status", "on", "off"])
 
         ir = subparsers.add_parser("ir")
         self.add_common_options(ir)
-        ir.add_argument("--camera")
+        self.add_camera_option(ir)
         ir.add_argument("action", choices=["status", "on", "off", "auto"])
 
         discover = subparsers.add_parser("discover")
@@ -198,7 +201,7 @@ class CLI:
 
         raw_stream = subparsers.add_parser("raw-stream")
         self.add_common_options(raw_stream)
-        raw_stream.add_argument("--camera")
+        self.add_camera_option(raw_stream)
         raw_stream.add_argument("--stream", default="mainStream", choices=["mainStream", "subStream"])
         raw_stream.add_argument("--output", required=True)
         raw_stream.add_argument("--packets", type=int, default=0, help="Stop after N video packets; 0 means keep running")
@@ -229,6 +232,16 @@ class CLI:
         parser.add_argument("--config", default=argparse.SUPPRESS)
         parser.add_argument("--state", default=argparse.SUPPRESS)
         parser.add_argument("--debug", action="store_true", default=argparse.SUPPRESS)
+
+    @staticmethod
+    def add_camera_option(parser: argparse.ArgumentParser) -> None:
+        """
+        Add camera selection without overwriting the global ``--camera`` default.
+
+        :param parser: Subcommand parser to update.
+        """
+
+        parser.add_argument("--camera", default=argparse.SUPPRESS)
 
     def run_convert_config(self, args: argparse.Namespace) -> int:
         """
@@ -269,7 +282,7 @@ class CLI:
         """
 
         hits = local_discover(args.uid, timeout=args.timeout)
-        if args.remote or not hits:
+        if args.uid is not None and (args.remote or not hits):
             hits.extend(remote_uid_lookup(args.uid, timeout=args.timeout))
         if not hits:
             print(msg.Log.NoUidAddresses)

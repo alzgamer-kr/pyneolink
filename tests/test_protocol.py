@@ -1,4 +1,5 @@
 from pyneolink import Camera, CameraConfig, Config, DangerousSdCardOperation, EVENTS, Settings, StreamServer, Voice, config_from_dict
+from pyneolink.config import load_config
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
 from pyneolink.sd_card import DownloadSizeMismatch, SDFilePreview, SdCard
 from pyneolink.core.bc import Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
@@ -40,8 +41,10 @@ from pyneolink.sd_card import (
     _replay_download_payload,
     _xml_file_size,
 )
-from pyneolink.core.udp_transport import UdpBcConnection, decode_udp_packet, encode_udp_ack
+from pyneolink.core.state import ConnectionState
+from pyneolink.core.udp_transport import UdpBcConnection, decode_udp_packet, encode_udp_ack, encode_udp_data
 from pyneolink.recorder import StreamRecorder
+from pyneolink.internal.snapshot import snapshot_output_path
 from pyneolink.internal.voice import (
     ImaAdpcmEncoder,
     adpcm_blocks_from_tone,
@@ -99,6 +102,33 @@ def test_full_aes_binary_keeps_raw_tail_after_encrypt_len():
     assert msg.encrypted_len == 4
 
 
+def test_scoped_playback_331_keeps_media_payload_raw():
+    class FakeSocket:
+        def __init__(self, data):
+            self.data = bytearray(data)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self, size):
+            chunk = bytes(self.data[:size])
+            del self.data[:size]
+            return chunk
+
+    cipher = Cipher("bc")
+    raw_media = b"\x00\x00\x01\x65raw-media-from-camera"
+    header = Header(MSG.FILE_PLAYBACK, len(raw_media), 29, 0, 22, 331, MSG_CLASS.MODERN, 0)
+    wire = header.pack() + raw_media
+
+    scoped = recv_message(FakeSocket(wire), cipher, binary_playback_331=True)
+    unscoped = recv_message(FakeSocket(wire), cipher)
+
+    assert scoped.header.response_code == 331
+    assert scoped.payload == raw_media
+    assert unscoped.payload == bc_xor(29, raw_media)
+    assert unscoped.payload != raw_media
+
+
 def test_outgoing_binary_payload_is_not_encrypted():
     extension = payloads.extension_binary_data.format(channel_id=0)
     payload = b"raw-talk-data"
@@ -139,6 +169,11 @@ def test_discovery_packet_roundtrip():
 def test_udp_ack_packet_roundtrip():
     packet = encode_udp_ack(7, 5, b"\0\1\1", maybe_latency=42)
     assert decode_udp_packet(packet) == ("ack", 7, 0, 5, 42, b"\0\1\1")
+
+
+def test_truncated_udp_packets_are_ignored():
+    assert decode_udp_packet(encode_udp_data(7, 5, b"abcdef")[:-2]) is None
+    assert decode_udp_packet(encode_udp_ack(7, 5, b"\0\1\1")[:-1]) is None
 
 
 def test_udp_ack_state_reports_missing_packets():
@@ -380,6 +415,49 @@ def test_config_from_dict_uses_config_defaults():
     assert camera.discovery == "relay"
 
 
+def test_config_from_dict_requires_camera_name():
+    try:
+        config_from_dict({"cameras": [{"uid": "abc"}]})
+    except ValueError as exc:
+        assert "missing required field 'name'" in str(exc)
+    else:
+        raise AssertionError("camera config without name must fail clearly")
+
+
+def test_load_config_unknown_suffix_tries_json_then_toml(tmp_path):
+    config_path = tmp_path / "pyneolink.config"
+    config_path.write_text('bind = "127.0.0.1"\n[[cameras]]\nname = "Front"\nuid = "abc"\n', encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.bind == "127.0.0.1"
+    assert config.camera("Front").uid == "abc"
+
+
+def test_snapshot_output_path_uses_camera_file_basename(tmp_path):
+    output_dir = tmp_path / "snapshots"
+    output_dir.mkdir()
+
+    path = snapshot_output_path(output_dir, "../escape.jpg")
+
+    assert path == output_dir / "escape.jpg"
+
+
+def test_connection_state_save_preserves_other_camera_entries(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        '{\n  "cameras": {\n    "Back": {"address": "10.0.0.2:9000", "transport": "tcp"}\n  }\n}\n',
+        encoding="utf-8",
+    )
+
+    state = ConnectionState(state_path)
+    state.update_address("Front", "10.0.0.1:9000", uid="abc", transport="udp-local")
+
+    reloaded = ConnectionState(state_path)
+    assert reloaded.get_address("Back") == "10.0.0.2:9000"
+    assert reloaded.get_address("Front", transport="udp-local") == "10.0.0.1:9000"
+
+
 def test_download_query_order_prefers_direct_download_before_replay():
     raw = {
         "name": "abc",
@@ -572,6 +650,36 @@ def test_camera_battery_info_requests_channel_extension():
     assert header.msg_id == MSG.BATTERY
     assert b"<channelId>2</channelId>" in extension
     assert camera.sock.discarded == 1
+
+def test_camera_command_reconnects_once_after_timeout():
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    calls = {"send": 0, "recv": 0, "reconnect": 0, "ensure": 0}
+
+    def ensure_connected():
+        calls["ensure"] += 1
+
+    def send(msg_id, payload=b"", *, extension=b""):
+        calls["send"] += 1
+        return calls["send"]
+
+    def recv_matching(msg_id, msg_num):
+        calls["recv"] += 1
+        if calls["recv"] == 1:
+            raise TimeoutError("Timed out waiting for UDP Baichuan data")
+        return Message(Header(msg_id, 0, 0, 0, msg_num, 200, MSG_CLASS.MODERN), payload=b"")
+
+    def reconnect():
+        calls["reconnect"] += 1
+
+    camera.ensure_connected = ensure_connected
+    camera.send = send
+    camera._recv_matching = recv_matching
+    camera.reconnect = reconnect
+
+    reply = camera.command(MSG.UID)
+
+    assert reply.header.response_code == 200
+    assert calls == {"send": 2, "recv": 2, "reconnect": 1, "ensure": 2}
 
 
 def test_battery_refresh_reconnects_after_timeout():
@@ -996,6 +1104,7 @@ def test_talk_ability_parses_voice_config():
     assert config.samples_per_block == 513
 
 
+
 def test_voice_adpcm_bcmedia_packet_shape():
     block = ImaAdpcmEncoder().encode_block([0, 1000, -1000, 500, -500])
     packet = serialize_bcmedia_adpcm(block)
@@ -1007,7 +1116,7 @@ def test_voice_adpcm_bcmedia_packet_shape():
 
 def test_voice_adpcm_packs_high_nibble_first():
     block = ImaAdpcmEncoder().encode_block([0, 1000, 2000])
-    assert block[4] >> 4 != 0
+    assert block[4] == 0x77
 
 
 def test_voice_adpcm_level_hint_reports_silence_as_zero():
@@ -1087,6 +1196,13 @@ def test_cli_pir_command_parses_action():
     assert args.config == "file.conf"
     assert args.camera == "Camera name"
     assert args.action == "status"
+
+
+def test_cli_global_camera_is_not_overwritten_by_subcommand_default():
+    args = CLI().parse_args(["--camera", "Camera name", "info"])
+
+    assert args.command == "info"
+    assert args.camera == "Camera name"
 
 
 def test_cli_ir_command_parses_action():
@@ -1368,11 +1484,46 @@ def test_camera_snapshot_collects_binary_snap_packets(tmp_path):
     assert header.msg_id == MSG.SNAP
     assert b"<Snap" in payload
     assert b"<streamType>main</streamType>" in payload
+    assert b"<fullFrame>0</fullFrame>" in payload
 
     camera.sock = FakeSocket(snap_replies(2))
     path = camera.snapshot(out=tmp_path)
     assert path == tmp_path / "front.jpg"
     assert path.read_bytes() == b"\xff\xd8\xff\xd9"
+
+    camera.sock = FakeSocket(snap_replies(3))
+    camera.snapshot(stream_type="sub")
+    sent = bytes(camera.sock.sent)
+    payload = sent[24:]
+    assert b"<streamType>sub</streamType>" in payload
+    assert b"<fullFrame>0</fullFrame>" in payload
+
+    camera.sock = FakeSocket(snap_replies(4))
+    camera.snapshot(stream_type="main")
+    sent = bytes(camera.sock.sent)
+    payload = sent[24:]
+    assert b"<streamType>main</streamType>" in payload
+    assert b"<fullFrame>0</fullFrame>" in payload
+
+
+def test_camera_snapshot_reconnects_once_after_timeout(tmp_path):
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    calls = {"snapshot": 0, "reconnect": 0}
+
+    def snapshot_once(*, out, stream_type):
+        calls["snapshot"] += 1
+        if calls["snapshot"] == 1:
+            raise TimeoutError("Timed out waiting for UDP Baichuan data")
+        return b"jpeg"
+
+    def reconnect():
+        calls["reconnect"] += 1
+
+    camera._snapshot_once = snapshot_once
+    camera.reconnect = reconnect
+
+    assert camera.snapshot() == b"jpeg"
+    assert calls == {"snapshot": 2, "reconnect": 1}
 
 
 def test_stream_recorder_writes_mpegts_and_stops_stream(tmp_path):
@@ -1604,6 +1755,91 @@ def test_sd_card_download_treats_400_after_partial_data_as_interrupted_download(
     else:
         raise AssertionError("partial 400 download must trigger reconnect handling")
     assert any("stopped after response 400" in attempt for attempt in sd_card.last_download_attempts)
+
+
+def test_playback_331_continues_to_normal_completion(tmp_path):
+    class FakeCamera:
+        sock = None
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.recv_scopes = []
+            self.replies = [
+                Message(Header(MSG.FILE_PLAYBACK, 5, 29, 0, 0, 200, MSG_CLASS.MODERN), payload=b"first"),
+                Message(Header(MSG.FILE_PLAYBACK, 0, 29, 0, 0, 331, MSG_CLASS.MODERN)),
+                Message(Header(MSG.FILE_PLAYBACK, 6, 29, 0, 0, 200, MSG_CLASS.MODERN), payload=b"second"),
+                Message(Header(MSG.FILE_PLAYBACK, 0, 29, 0, 0, 300, MSG_CLASS.MODERN)),
+            ]
+
+        def send(self, _msg_id, payload=b"", **kwargs):
+            return kwargs.get("msg_num", 1)
+
+        def _recv(self, timeout=None, *, binary_playback_331=False):
+            self.recv_scopes.append(binary_playback_331)
+            if not self.replies:
+                raise TimeoutError("no more replies")
+            return self.replies.pop(0)
+
+    output = tmp_path / "playback.bcmedia"
+    camera = FakeCamera()
+    sd_card = SdCard(camera)
+    written = sd_card._download_with_query(
+        _FileInfoQuery(
+            "playback143/range-subStream/bcmedia",
+            MSG.FILE_PLAYBACK,
+            b"request",
+            msg_class=MSG_CLASS.MODERN,
+            channel_id=29,
+            msg_num=0,
+        ),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert written == 11
+    assert output.read_bytes() == b"firstsecond"
+    assert camera.recv_scopes == [True, True, True, True]
+    assert "playback finished response=300" in sd_card._last_download_detail
+
+
+def test_response_331_remains_terminal_for_non_playback_downloads(tmp_path):
+    class FakeCamera:
+        sock = None
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.replies = [
+                Message(Header(MSG.FILE_DOWNLOAD, 5, 0, 0, 7, 200, MSG_CLASS.FILE_DOWNLOAD), payload=b"first"),
+                Message(Header(MSG.FILE_DOWNLOAD, 6, 0, 0, 7, 331, MSG_CLASS.FILE_DOWNLOAD), payload=b"second"),
+            ]
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            if msg_id == MSG.UDP_KEEPALIVE:
+                return 0
+            return 7
+
+        def _recv(self, timeout=None):
+            return self.replies.pop(0)
+
+    output = tmp_path / "download.part"
+    sd_card = SdCard(FakeCamera())
+    written = sd_card._download_with_query(
+        _FileInfoQuery("download13/id/class6482", MSG.FILE_DOWNLOAD, b"request", msg_class=MSG_CLASS.FILE_DOWNLOAD),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert written == 5
+    assert output.read_bytes() == b"first"
+    assert "stopped after response 331" in sd_card._last_download_detail
 
 
 def test_sd_card_preview_debug_returns_probe_responses():

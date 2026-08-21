@@ -22,10 +22,11 @@ def int_or_none(value: str | None) -> int | None:
 
 def snapshot_output_path(out: str | Path, file_name: str | None = None) -> Path:
     path = Path(out)
+    safe_name = Path(file_name).name if file_name else ""
     if path.exists() and path.is_dir():
-        path = path / (file_name or "snapshot.jpg")
+        path = path / (safe_name or "snapshot.jpg")
     elif str(out).endswith(("/", "\\")):
-        path = path / (file_name or "snapshot.jpg")
+        path = path / (safe_name or "snapshot.jpg")
     elif not path.suffix:
         path = path.with_suffix(".jpg")
     return path

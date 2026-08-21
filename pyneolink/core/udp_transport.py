@@ -82,7 +82,8 @@ class UdpBcConnection:
         :param timeout: Timeout in seconds, or ``None`` to keep the current value.
         """
 
-        self.timeout = timeout or self.timeout
+        if timeout is not None:
+            self.timeout = timeout
 
     def sendall(self, data: bytes) -> None:
         """
@@ -181,6 +182,9 @@ class UdpBcConnection:
                 return
             if packet_id in self.recv_chunks or packet_id < self.next_recv_id:
                 self.duplicate_packets_received += 1
+                self.last_data_at = time.monotonic()
+                self._maybe_send_ack()
+                return
             self.recv_chunks[packet_id] = payload
             self.data_packets_received += 1
             self.data_bytes_received += len(payload)
@@ -461,9 +465,13 @@ def decode_udp_packet(data: bytes):
     magic = struct.unpack("<I", data[:4])[0]
     if magic == MAGIC.UDP_DATA and len(data) >= 20:
         _magic, connection_id, _zero, packet_id, size = struct.unpack("<IiIII", data[:20])
+        if size > len(data) - 20:
+            return None
         return "data", connection_id, packet_id, data[20 : 20 + size]
     if magic == MAGIC.UDP_ACK and len(data) >= 28:
         _magic, connection_id, _zero, group_id, packet_id, latency, size = struct.unpack("<IiIIIII", data[:28])
+        if size > len(data) - 28:
+            return None
         return "ack", connection_id, group_id, packet_id, latency, data[28 : 28 + size]
     decoded = decode_discovery_packet(data)
     if decoded:
