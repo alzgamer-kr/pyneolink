@@ -107,7 +107,11 @@ def local_discover(uid: str | None = None, *, timeout: float = 5.0, listen_port:
                 found_uid = _find_xml_text(xml, "uid")
                 hits.append(DiscoveryHit(found_uid, addr, xml=xml, raw=data, source="local", transport="udp"))
             elif b"." in data or (uid and uid.encode() in data):
-                hits.append(DiscoveryHit(uid if uid and uid.encode() in data else None, addr, raw=data, source="local", transport="udp"))
+                hits.append(
+                    DiscoveryHit(
+                        uid if uid and uid.encode() in data else None, addr, raw=data, source="local", transport="udp"
+                    )
+                )
     sock.close()
     return hits
 

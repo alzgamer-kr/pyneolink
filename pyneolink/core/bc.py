@@ -54,7 +54,10 @@ class Header:
 
     @property
     def has_payload_offset(self) -> bool:
-        return self.msg_class in (MSG_CLASS.MODERN, MSG_CLASS.FILE_DOWNLOAD, MSG_CLASS.MODERN_ZERO) or self.msg_id == MSG.FILE_REPLAY
+        return (
+            self.msg_class in (MSG_CLASS.MODERN, MSG_CLASS.FILE_DOWNLOAD, MSG_CLASS.MODERN_ZERO)
+            or self.msg_id == MSG.FILE_REPLAY
+        )
 
     @property
     def is_modern(self) -> bool:
@@ -166,7 +169,10 @@ def encode_modern(
     enc_payload = payload if binary_payload else wire_cipher.encrypt(channel_id, payload) if payload else b""
     body = enc_ext + enc_payload
     payload_offset = len(enc_ext) if msg_class in (MSG_CLASS.MODERN, MSG_CLASS.MODERN_ZERO) else None
-    return Header(msg_id, len(body), channel_id, stream_type, msg_num, response_code, msg_class, payload_offset).pack() + body
+    return (
+        Header(msg_id, len(body), channel_id, stream_type, msg_num, response_code, msg_class, payload_offset).pack()
+        + body
+    )
 
 
 def encode_legacy_login(msg_num: int, *, max_encryption: str = "aes", channel_id: int = 0) -> bytes:
@@ -213,12 +219,10 @@ def recv_message(
     extension = reply_cipher.decrypt(header.channel_id, ext_raw) if ext_raw else b""
     in_binary = b"<binaryData>1</binaryData>" in extension
     encrypted_len = _extension_int(extension, "encryptLen") if in_binary else None
-    scoped_playback_binary = (
-        binary_playback_331
-        and header.msg_id == MSG.FILE_PLAYBACK
-        and header.response_code == 331
+    scoped_playback_binary = binary_playback_331 and header.msg_id == MSG.FILE_PLAYBACK and header.response_code == 331
+    is_binary = (
+        in_binary or (binary_msg_nums is not None and header.msg_num in binary_msg_nums) or scoped_playback_binary
     )
-    is_binary = in_binary or (binary_msg_nums is not None and header.msg_num in binary_msg_nums) or scoped_playback_binary
     if is_binary:
         if reply_cipher.name == "aes" and reply_cipher.full_media and encrypted_len is not None:
             encrypted_part = payload_raw[:encrypted_len]

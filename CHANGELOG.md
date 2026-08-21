@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.2
+
+ADPCM compatibility and code style patch.
+
+### Changed
+
+- Added `ruff` development configuration for PEP8 checks and formatting with a
+  project line length of 120 characters.
+- Reformatted Python sources with `ruff` while keeping dense protocol tables and
+  XML payload constants readable.
+
+### Fixed
+
+- Pack pure-Python voice ADPCM sample pairs low-nibble-first to match DVI/IMA
+  ADPCM as produced by ffmpeg/GStreamer and the Rust Neolink talk pipeline,
+  based on protocol-review work from [kklemon](https://github.com/kklemon/).
+- Avoid shadowing the imported protocol message constants inside
+  `Camera._recv()`.
+
+---
+
 ## 0.4.1
 
 Voice/talk reliability patch.
@@ -18,10 +39,11 @@ Voice/talk reliability patch.
 - Reused the shared command retry path for repeated voice/talk and siren commands.
 - Treat Tree360-style `MSG.FILE_PLAYBACK` response `331` as a scoped playback
   continuation so SD-card playback downloads can continue to their normal
-  completion response.
+  completion response, based on fork testing from
+  [megablocks](https://github.com/megablocks).
 - Hardened config parsing, snapshot output paths, connection-state writes, UDP
   packet decoding, and global CLI `--camera` parsing based on external fork
-  review.
+  review from [kklemon](https://github.com/kklemon/).
 
 ---
 

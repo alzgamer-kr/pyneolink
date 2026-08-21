@@ -107,12 +107,7 @@ login = XmlTemplate(
     "</LoginNet>"
 )
 
-led_state = XmlTemplate(
-    '<LedState version="1.1">'
-    "<channelId>{channel_id}</channelId>"
-    "<state>{state}</state>"
-    "</LedState>"
-)
+led_state = XmlTemplate('<LedState version="1.1"><channelId>{channel_id}</channelId><state>{state}</state></LedState>')
 
 preview_start = XmlTemplate(
     '<Preview version="1.1">'
@@ -123,10 +118,7 @@ preview_start = XmlTemplate(
 )
 
 preview_stop = XmlTemplate(
-    '<Preview version="1.1">'
-    "<channelId>{channel_id}</channelId>"
-    "<handle>{handle}</handle>"
-    "</Preview>"
+    '<Preview version="1.1"><channelId>{channel_id}</channelId><handle>{handle}</handle></Preview>'
 )
 
 snapshot = XmlTemplate(
@@ -185,11 +177,7 @@ flat_time = XmlTemplate(
 )
 
 replay_seek = XmlTemplate(
-    '<ReplaySeek version="1.1">'
-    "<channelId>{channel_id}</channelId>"
-    "<seq>{seq}</seq>"
-    "{seek_time}"
-    "</ReplaySeek>"
+    '<ReplaySeek version="1.1"><channelId>{channel_id}</channelId><seq>{seq}</seq>{seek_time}</ReplaySeek>'
 )
 
 replay_file_detail = XmlTemplate(
@@ -213,13 +201,7 @@ replay_stop = XmlTemplate(
     "</FileInfoList>"
 )
 
-hdd_init = XmlTemplate(
-    '<HddInitList version="1.1">'
-    "<HddInit>"
-    "<id>{disk_id}</id>"
-    "</HddInit>"
-    "</HddInitList>"
-)
+hdd_init = XmlTemplate('<HddInitList version="1.1"><HddInit><id>{disk_id}</id></HddInit></HddInitList>')
 
 file_info_compact_type = XmlTemplate(
     '<FileInfoList version="1.1">'
@@ -317,10 +299,7 @@ day_record_nested = XmlTemplate(
 )
 
 day_record_compact = XmlTemplate(
-    '<DayRecords version="1.1">'
-    "<channelId>{channel_id}</channelId>"
-    "<date>{target:%Y%m%d}</date>"
-    "</DayRecords>"
+    '<DayRecords version="1.1"><channelId>{channel_id}</channelId><date>{target:%Y%m%d}</date></DayRecords>'
 )
 
 replay_download = XmlTemplate(
@@ -361,12 +340,7 @@ playback_download_no_support = XmlTemplate(
 )
 
 download_file = XmlTemplate(
-    '<FileInfoList version="1.1">'
-    "<FileInfo>"
-    "<channelId>{channel_id}</channelId>"
-    "{fields}"
-    "</FileInfo>"
-    "</FileInfoList>"
+    '<FileInfoList version="1.1"><FileInfo><channelId>{channel_id}</channelId>{fields}</FileInfo></FileInfoList>'
 )
 
 download_id_field = XmlTemplate("<Id>{file_id}</Id>", document=False, binary=False)

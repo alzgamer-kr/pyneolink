@@ -174,5 +174,3 @@ class BatteryInfo(dict):
 
     def __exit__(self, *exc: object) -> None:
         pass
-
-

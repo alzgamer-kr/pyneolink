@@ -74,7 +74,9 @@ class Error(StrEnum):
     InvalidBaichuanMagic = "Invalid Baichuan magic 0x{magic:08x}"
     NoAcceptedDiscoveryReply = "No accepted discovery reply from {dest}"
     FfmpegNoOutput = "ffmpeg created no output from {frames} {codec} frames"
-    SdBestAttemptMismatch = "Best attempt {label} downloaded {written} bytes, expected {expected_size} bytes. Tried: {attempts}"
+    SdBestAttemptMismatch = (
+        "Best attempt {label} downloaded {written} bytes, expected {expected_size} bytes. Tried: {attempts}"
+    )
     SdDownloadFailed = "SD download failed. Tried: {attempts}"
     SdPreviewFailed = "SD preview failed. Tried: {attempts}"
     Response = "response {response_code}"

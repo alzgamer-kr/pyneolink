@@ -166,7 +166,9 @@ class CameraEvents(Iterator[CameraEvent]):
                 continue
             if reply.header.msg_id != MSG.MOTION:
                 continue
-            self._pending.extend(self._normalize_events(parse_motion_events(reply.xml_root, channel_id=self.channel_id)))
+            self._pending.extend(
+                self._normalize_events(parse_motion_events(reply.xml_root, channel_id=self.channel_id))
+            )
             if self._pending:
                 return self._pending.popleft()
         raise StopIteration

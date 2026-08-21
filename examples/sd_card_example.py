@@ -49,7 +49,9 @@ def files_iterator_example(target_date: str = TARGET_DATE) -> None:
             print(f"{info.get('start_time')} {info.get('file_name')} {info.get('path')}")
 
 
-def download_example(target_date: str = TARGET_DATE, quality: str = DOWNLOAD_QUALITY, output_dir: str = DOWNLOAD_DIR) -> None:
+def download_example(
+    target_date: str = TARGET_DATE, quality: str = DOWNLOAD_QUALITY, output_dir: str = DOWNLOAD_DIR
+) -> None:
     """Download the newest MP4 recording through the `SDFile` API."""
     with open_camera() as camera:
         sd_card = camera.sd_card()

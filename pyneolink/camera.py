@@ -142,7 +142,12 @@ class Camera(AbstractContextManager["Camera"]):
             self.sock = connect_relay(self.config.uid, timeout=max(self.timeout, 20.0), debug=self.debug)
             self.connected_address = self.sock.addr
             if self.state:
-                self.state.update_address(self.config.name, f"{self.sock.addr[0]}:{self.sock.addr[1]}", uid=self.config.uid, transport="udp-relay")
+                self.state.update_address(
+                    self.config.name,
+                    f"{self.sock.addr[0]}:{self.sock.addr[1]}",
+                    uid=self.config.uid,
+                    transport="udp-relay",
+                )
             return
         host, port = resolved[:2]
         self.sock = socket.create_connection((host, port), timeout=self.timeout)
@@ -231,7 +236,9 @@ class Camera(AbstractContextManager["Camera"]):
         return {
             "name": self.config.name,
             "uid": self.config.uid or self.get_uid(),
-            "connected_address": f"{self.connected_address[0]}:{self.connected_address[1]}" if self.connected_address else None,
+            "connected_address": f"{self.connected_address[0]}:{self.connected_address[1]}"
+            if self.connected_address
+            else None,
             "device": info,
         }
 
@@ -341,7 +348,9 @@ class Camera(AbstractContextManager["Camera"]):
             deadline = time.monotonic() + self.timeout
 
         if expected_size is not None and len(data) != expected_size:
-            raise ProtocolError(msg.Error.SnapshotSizeMismatch.format(actual_size=len(data), expected_size=expected_size))
+            raise ProtocolError(
+                msg.Error.SnapshotSizeMismatch.format(actual_size=len(data), expected_size=expected_size)
+            )
 
         image = bytes(data)
         if out is None:
@@ -531,7 +540,9 @@ class Camera(AbstractContextManager["Camera"]):
         self.ensure_connected()
         msg_num = self._next_msg()
         stream_name, stream_code, handle = stream_params(stream)
-        payload = payloads.preview_start.format(channel_id=self.config.channel_id, handle=handle, stream_type=stream_name)
+        payload = payloads.preview_start.format(
+            channel_id=self.config.channel_id, handle=handle, stream_type=stream_name
+        )
         self._send(
             encode_modern(
                 MSG.VIDEO,
@@ -547,7 +558,9 @@ class Camera(AbstractContextManager["Camera"]):
             reply_msg = self._recv()
             if reply_msg.header.msg_id == MSG.VIDEO and reply_msg.header.msg_num == msg_num:
                 if reply_msg.header.response_code != 200:
-                    raise ProtocolError(msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code))
+                    raise ProtocolError(
+                        msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code)
+                    )
                 self.binary_msg_nums.add(msg_num)
                 return msg_num
             if time.monotonic() > deadline:
@@ -665,16 +678,16 @@ class Camera(AbstractContextManager["Camera"]):
     ):
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        msg = recv_message(
+        message = recv_message(
             self.sock,
             self.cipher,
             timeout=self.timeout if timeout is None else timeout,
             binary_msg_nums=self.binary_msg_nums,
             binary_playback_331=binary_playback_331,
         )
-        if msg.header.msg_id == MSG.UDP_KEEPALIVE:
-            self._reply_keepalive(msg)
-        return msg
+        if message.header.msg_id == MSG.UDP_KEEPALIVE:
+            self._reply_keepalive(message)
+        return message
 
     def _reply_keepalive(self, keepalive_msg) -> None:
         if self.sock is None:
