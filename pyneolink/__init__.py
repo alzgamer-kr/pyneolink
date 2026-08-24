@@ -6,6 +6,7 @@ from .config import CameraConfig, Config, config_from_dict, load_config
 from .core.const import EVENTS
 from .errors import CameraConnectionError
 from .motion import CameraEvent, CameraEvents, Motion, parse_motion_events
+from .ptz import Ptz, PtzPreset
 from .recorder import StreamRecorder
 from .sd_card import (
     DangerousSdCardOperation,
@@ -27,6 +28,8 @@ __all__ = [
     "CameraEvent",
     "CameraEvents",
     "Motion",
+    "Ptz",
+    "PtzPreset",
     "Battery",
     "BatteryInfo",
     "BatteryInfoUpdates",

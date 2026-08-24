@@ -131,6 +131,16 @@ snapshot = XmlTemplate(
     "</Snap>"
 )
 
+ptz_preset = XmlTemplate(
+    '<PtzPreset version="1.1">'
+    "<channelId>{channel_id}</channelId>"
+    "<presetList><preset>"
+    "<id>{preset_id}</id>"
+    "<command>toPos</command>\n\n"
+    "</preset></presetList>"
+    "</PtzPreset>"
+)
+
 talk_config = XmlTemplate(
     '<TalkConfig version="1.1">'
     "<channelId>{channel_id}</channelId>"

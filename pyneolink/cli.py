@@ -58,6 +58,7 @@ class CLI:
             "voice": self.run_camera_command,
             "pir": self.run_camera_command,
             "ir": self.run_camera_command,
+            "ptz": self.run_camera_command,
             "raw-stream": self.run_camera_command,
         }
         self.camera_handlers: dict[str, CameraCommandHandler] = {
@@ -74,6 +75,7 @@ class CLI:
             "voice": self.camera_voice,
             "pir": self.camera_pir,
             "ir": self.camera_ir,
+            "ptz": self.camera_ptz,
             "raw-stream": self.camera_raw_stream,
         }
 
@@ -198,6 +200,12 @@ class CLI:
         self.add_common_options(ir)
         self.add_camera_option(ir)
         ir.add_argument("action", choices=["status", "on", "off", "auto"])
+
+        ptz = subparsers.add_parser("ptz")
+        self.add_common_options(ptz)
+        self.add_camera_option(ptz)
+        ptz.add_argument("action", choices=["presets", "preset"])
+        ptz.add_argument("preset_id", nargs="?", type=int)
 
         discover = subparsers.add_parser("discover")
         self.add_common_options(discover)
@@ -599,6 +607,30 @@ class CLI:
             "auto": ir.auto,
         }
         print(json.dumps(actions[args.action](), indent=2, ensure_ascii=False))
+        return 0
+
+    def camera_ptz(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
+        """List or recall stored PTZ presets."""
+        ptz = cam.ptz()
+        if args.action == "presets":
+            if args.preset_id is not None:
+                self.parser.error("PTZ preset ID is only valid with 'ptz preset'")
+            presets = ptz.presets()
+            print(
+                json.dumps(
+                    [
+                        {"id": preset.id, "name": preset.name, "enabled": preset.enabled}
+                        for preset in presets
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.preset_id is None:
+            self.parser.error("PTZ preset ID is required: pyneolink ptz preset <id>")
+        ptz.goto_preset(args.preset_id)
+        print(msg.Log.PtzPresetRecalled.format(preset_id=args.preset_id))
         return 0
 
     def camera_raw_stream(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:

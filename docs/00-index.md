@@ -13,5 +13,6 @@ Recommended reading order:
 7. [06-sd-card-downloads.md](06-sd-card-downloads.md): SD-card file listing, pagination, and download strategies.
 8. [07-media-and-streaming.md](07-media-and-streaming.md): BCMedia parsing, MPEG-TS, HLS timeshift, snapshots, and local recording.
 9. [08-motion-voice-and-controls.md](08-motion-voice-and-controls.md): motion status/watch, two-way voice, siren, PIR, IR, and basic camera controls.
+10. [09-ptz-presets.md](09-ptz-presets.md): stored PTZ preset listing and recall.
 
 This is not official Reolink documentation. It describes the current PyNeolink implementation and the reverse-engineered behavior it relies on.
