@@ -5,6 +5,77 @@ on:
     types: [published]
 
 jobs:
+  build-cli-assets:
+    name: Build CLI assets (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            asset-base-name: pyneolink-cli-windows
+            asset-extension: .exe
+          - name: Linux
+            os: ubuntu-latest
+            asset-base-name: pyneolink-cli-linux
+            asset-extension: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Linux audio library
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libportaudio2 portaudio19-dev
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller ".[voice]"
+
+      - name: Resolve asset name
+        shell: bash
+        run: |
+          VERSION="$(python -c 'from importlib.metadata import version; print(version("pyneolink"))')"
+          ASSET_STEM="${{ matrix.asset-base-name }}-${VERSION}"
+          ASSET_NAME="${ASSET_STEM}${{ matrix.asset-extension }}"
+          echo "ASSET_STEM=${ASSET_STEM}" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=${ASSET_NAME}" >> "$GITHUB_ENV"
+          echo "ASSET_PATH=dist-cli/${ASSET_NAME}" >> "$GITHUB_ENV"
+
+      - name: Build CLI asset
+        run: |
+          python -m PyInstaller --clean --onefile --name "${{ env.ASSET_STEM }}" --distpath dist-cli --workpath build-cli --specpath build-cli-spec pyneolink/cli.py
+
+      - name: Verify CLI asset on Windows
+        if: runner.os == 'Windows'
+        run: |
+          & "${env:ASSET_PATH}" --help
+          & "${env:ASSET_PATH}" voice --help
+
+      - name: Verify CLI asset on Linux
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x "${ASSET_PATH}"
+          "${ASSET_PATH}" --help
+          "${ASSET_PATH}" voice --help
+
+      - name: Upload CLI asset to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_PATH }}
+          overwrite_files: true
+
   publish:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
