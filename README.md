@@ -1,5 +1,10 @@
 # PyNeolink
 
+[![Downloads](https://img.shields.io/pypi/dm/pyneolink?style=for-the-badge&label=downloads&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://pypistats.org/packages/pyneolink)
+[![Release](https://img.shields.io/github/v/release/alzgamer-kr/pyneolink?style=for-the-badge&label=release&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://github.com/alzgamer-kr/pyneolink/releases)
+[![GitHub](https://img.shields.io/github/forks/alzgamer-kr/pyneolink?style=for-the-badge&label=forks&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://github.com/alzgamer-kr/pyneolink)
+[![GitHub](https://img.shields.io/github/stars/alzgamer-kr/pyneolink?style=for-the-badge&label=stars&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://github.com/alzgamer-kr/pyneolink)
+
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
 Version: `0.4.2` alpha.
@@ -64,6 +69,7 @@ For local development from a checkout:
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
+python -m pip install -r requirements.txt
 python -m pip install -e ".[dev,voice]"
 ```
 
