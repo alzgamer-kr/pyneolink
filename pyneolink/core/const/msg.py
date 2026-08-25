@@ -56,6 +56,8 @@ class Error(StrEnum):
     PirStateMissing = "Camera did not return PIR rfAlarmCfg"
     LedStateMissing = "Camera did not return LedState"
     IrModeValue = 'IR mode must be "on", "off", or "auto"'
+    PtzPresetId = "PTZ preset id must be an integer from 0 through 255"
+    PtzPresetListMalformed = "Camera returned malformed PTZ preset data"
 
     LoginFailed = "Login failed with response {response_code}"
     TimedOutResponse = "Timed out waiting for response to message {msg_id} #{msg_num}"
@@ -66,6 +68,8 @@ class Error(StrEnum):
     PirSetFailed = "PIR set failed with response {response_code}"
     IrInfoFailed = "IR light info failed with response {response_code}"
     IrSetFailed = "IR light set failed with response {response_code}"
+    PtzPresetListFailed = "PTZ preset list failed with response {response_code}"
+    PtzPresetRecallFailed = "PTZ preset recall failed with response {response_code}"
     SnapshotInfoFailed = "Snapshot info failed with response {response_code}"
     SnapshotDataFailed = "Snapshot data failed with response {response_code}"
     SnapshotSizeMismatch = "Snapshot received {actual_size} bytes, expected {expected_size} bytes"
@@ -119,6 +123,7 @@ class Log(StrEnum):
     VoicePlaying = "voice connected; playing {input}"
     VoiceSent = "voice sent"
     SirenSent = "siren command sent"
+    PtzPresetRecalled = "PTZ preset {preset_id} recalled"
     Error = "Error: {exc}"
     Serving = "Serving camera streams on http://{host}:{port}/"
     OpenLocal = "Open locally with http://{host}:{port}/"
