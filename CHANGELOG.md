@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Stored PTZ preset list and recall through `camera.ptz()`, with documentation
+  for the Argus PT Ultra same-session snapshot prerequisite.
+
 ## 0.4.2
 
 ADPCM compatibility and code style patch.

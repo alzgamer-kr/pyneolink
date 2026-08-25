@@ -4,6 +4,8 @@ from pyneolink import (
     Config,
     DangerousSdCardOperation,
     EVENTS,
+    Ptz,
+    PtzPreset,
     Settings,
     StreamServer,
     Voice,
@@ -12,7 +14,15 @@ from pyneolink import (
 from pyneolink.config import load_config
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
 from pyneolink.sd_card import DownloadSizeMismatch, SDFilePreview, SdCard
-from pyneolink.core.bc import Header, InvalidMagicError, Message, encode_modern, recv_message, xml_document
+from pyneolink.core.bc import (
+    Header,
+    InvalidMagicError,
+    Message,
+    ProtocolError,
+    encode_modern,
+    recv_message,
+    xml_document,
+)
 from pyneolink.core.crypto import Cipher, bc_xor, make_aes_key, md5_hex, udp_xor
 from pyneolink.core.discovery import decode_discovery_packet, encode_discovery_xml
 from pyneolink.core.const import MSG, MSG_CLASS, payloads
@@ -1211,6 +1221,94 @@ def test_camera_settings_api_is_available():
     assert hasattr(settings.pir, "off")
 
 
+def test_camera_ptz_api_is_available():
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    assert isinstance(camera.ptz(), Ptz)
+    assert hasattr(camera.ptz(), "presets")
+    assert hasattr(camera.ptz(), "goto_preset")
+
+
+def test_ptz_presets_reads_stored_preset_list():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 2})()
+
+        def __init__(self):
+            self.calls = []
+
+        def command(self, msg_id, payload=b"", *, extension=b"", **kwargs):
+            self.calls.append((msg_id, payload, extension, kwargs))
+            xml = xml_document(
+                '<PtzPreset version="1.1"><presetList>'
+                "<preset><id>0</id><name>Box</name><enable>1</enable></preset>"
+                "<preset><id>2</id><name>Tractor</name><enable>0</enable></preset>"
+                "</presetList></PtzPreset>"
+            )
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+    camera = FakeCamera()
+    presets = Ptz(camera).presets()
+
+    assert presets == (
+        PtzPreset(id=0, name="Box", enabled=True),
+        PtzPreset(id=2, name="Tractor", enabled=False),
+    )
+    msg_id, payload, extension, kwargs = camera.calls[0]
+    assert msg_id == MSG.PTZ_PRESET_LIST
+    assert payload == b""
+    assert b"<channelId>2</channelId>" in extension
+    assert kwargs == {"retry_on_timeout": False, "reconnect_retries": 0}
+
+
+def test_ptz_goto_preset_sends_topos_without_snapshot_side_effect():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.calls = []
+
+        def command(self, msg_id, payload=b"", *, extension=b"", **kwargs):
+            self.calls.append(("command", msg_id, payload, extension, kwargs))
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+    camera = FakeCamera()
+    Ptz(camera).goto_preset(3)
+
+    assert len(camera.calls) == 1
+    _, msg_id, payload, extension, kwargs = camera.calls[0]
+    assert msg_id == MSG.PTZ_PRESET
+    assert b"<id>3</id>" in payload
+    assert b"<command>toPos</command>\n\n</preset>" in payload
+    assert b"<channelId>0</channelId>" in extension
+    assert kwargs == {"retry_on_timeout": False, "reconnect_retries": 0}
+
+
+def test_ptz_goto_preset_rejects_invalid_id_before_command():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    try:
+        Ptz(FakeCamera()).goto_preset(256)
+    except ValueError as exc:
+        assert "0 through 255" in str(exc)
+    else:
+        raise AssertionError("invalid PTZ preset ID was accepted")
+
+
+def test_ptz_goto_preset_rejects_camera_error():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def command(self, msg_id, payload=b"", *, extension=b"", **kwargs):
+            return Message(Header(msg_id, 0, 0, 0, 1, 400, MSG_CLASS.MODERN), payload=b"")
+
+    try:
+        Ptz(FakeCamera()).goto_preset(1)
+    except ProtocolError as exc:
+        assert "response 400" in str(exc)
+    else:
+        raise AssertionError("rejected PTZ preset was accepted")
+
+
 def test_cli_pir_command_parses_action():
     args = CLI().parse_args(["pir", "--config", "file.conf", "--camera", "Camera name", "status"])
 
@@ -1234,6 +1332,16 @@ def test_cli_ir_command_parses_action():
     assert args.config == "file.conf"
     assert args.camera == "Camera name"
     assert args.action == "auto"
+
+
+def test_cli_ptz_command_parses_preset_action_and_id():
+    args = CLI().parse_args(["ptz", "--config", "file.conf", "--camera", "Camera name", "preset", "3"])
+
+    assert args.command == "ptz"
+    assert args.config == "file.conf"
+    assert args.camera == "Camera name"
+    assert args.action == "preset"
+    assert args.preset_id == 3
 
 
 def test_cli_led_command_accepts_auto_alias():
