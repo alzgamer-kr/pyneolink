@@ -33,6 +33,7 @@ PyNeolink is experimental alpha software. It works against a limited set of real
 - Camera siren trigger
 - PIR status and PIR on/off settings
 - IR light status and IR on/off/auto settings
+- Stored PTZ preset listing and recall
 
 ## Current Limits
 
@@ -43,7 +44,7 @@ PyNeolink is experimental alpha software. It works against a limited set of real
   live stream on the client machine; it does not start or stop the camera's own
   SD-card recording schedule.
 - SD-card `remove()` and `format()` exist, but are intentionally guarded.
-- PTZ, image settings, alarm schedules, floodlight settings, and Web UI are not implemented yet.
+- Arbitrary directional PTZ movement, image settings, alarm schedules, floodlight settings, and Web UI are not implemented yet.
 
 ## Install
 
@@ -156,6 +157,17 @@ python pyneolink/cli.py ir --config config.json --camera "Home-Front" off
 python pyneolink/cli.py ir --config config.json --camera "Home-Front" auto
 python pyneolink/cli.py led --config config.json --camera "Home-Front" auto
 ```
+
+PTZ presets:
+
+```powershell
+python pyneolink/cli.py ptz --config config.json --camera "Home-Front" presets
+python pyneolink/cli.py ptz --config config.json --camera "Home-Front" preset 3
+```
+
+The tested Argus PT Ultra requires a snapshot exchange after login before it
+accepts PTZ preset recall. The SDK caller must perform that snapshot and recall
+in the same `Camera` session; `goto_preset()` does not do it automatically.
 
 Voice and siren:
 
@@ -308,6 +320,23 @@ with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as c
     settings.ir.auto()
 ```
 
+PTZ presets:
+
+```python
+from pyneolink import Camera
+
+with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
+    print(camera.ptz().presets())
+    # Required by the tested Argus PT Ultra before preset recall.
+    camera.snapshot()
+    camera.ptz().goto_preset(3)
+```
+
+The tested Argus PT Ultra requires a snapshot exchange after login before it
+accepts PTZ preset recall. The caller must perform and discard that snapshot in
+the same session; `goto_preset()` intentionally has no model-specific side
+effects and does not start a continuous video stream.
+
 Live stream server from a dict:
 
 ```python
@@ -341,6 +370,7 @@ See the `examples/` directory:
 - `record_example.py`: duration and manual local stream recording
 - `voice_example.py`: file, microphone, tone, and siren helpers
 - `settings_example.py`: PIR and IR status plus guarded setting helpers
+- `ptz_example.py`: list and recall stored PTZ presets
 - `stream_example.py`: live MPEG-TS and HLS timeshift server from a dict config
 
 Each example keeps camera settings as a small local dict near the top of the file. Edit those values directly or replace the dict with your own configuration loader.
