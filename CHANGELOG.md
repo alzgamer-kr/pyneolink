@@ -6,6 +6,15 @@
 
 - Stored PTZ preset list and recall through `camera.ptz()`, with documentation
   for the Argus PT Ultra same-session snapshot prerequisite.
+- Documented Conda-based local development setup and the tested Python versions.
+
+### Notes
+
+- PTZ preset recall is currently documented as experimental: on the tested
+  Argus PT Ultra it must be called after a `Camera.snapshot()` exchange in the
+  same authenticated session.
+- The test suite was verified with Conda on CPython 3.11.15, 3.12.13, 3.13.15,
+  and 3.14.7.
 
 ## 0.4.2
 

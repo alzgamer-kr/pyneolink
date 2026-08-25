@@ -17,6 +17,8 @@ Neolink and Reolink protocol support are reverse engineered. This project is not
 
 PyNeolink is experimental alpha software. It works against a limited set of real cameras, but Reolink firmware and model behavior can differ. APIs may change before `1.0.0`.
 
+The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.13.15, and 3.14.7.
+
 ## What Works
 
 - JSON camera configuration with `address` or `uid`
@@ -72,6 +74,16 @@ python -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
 python -m pip install -e ".[dev,voice]"
+```
+
+With Conda from a checkout:
+
+```powershell
+conda create -n pyneolink-dev python=3.14 pip
+conda activate pyneolink-dev
+python -m pip install -r requirements.txt
+python -m pip install -e ".[dev,voice]"
+python -m pytest
 ```
 
 The `cryptography` package is required for AES-encrypted cameras. It is installed automatically when installing the package.
@@ -174,6 +186,8 @@ python pyneolink/cli.py ptz --config config.json --camera "Home-Front" preset 3
 The tested Argus PT Ultra requires a snapshot exchange after login before it
 accepts PTZ preset recall. The SDK caller must perform that snapshot and recall
 in the same `Camera` session; `goto_preset()` does not do it automatically.
+On that model, the standalone `ptz preset` CLI command may still return `400`
+because it does not currently perform that snapshot warm-up automatically.
 
 Voice and siren:
 
