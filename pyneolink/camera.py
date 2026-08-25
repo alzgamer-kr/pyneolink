@@ -20,6 +20,7 @@ from .core.discovery import local_discover, remote_uid_lookup
 from .core.state import ConnectionState
 from .core.udp_transport import UdpBcConnection, connect_local_direct, connect_relay
 from .motion import Motion
+from .ptz import Ptz
 from .core.xmlutil import xml_to_dict
 from .internal.camera import CameraOnlineLease, redact_sensitive, split_address, stream_params
 from .internal.snapshot import parse_snapshot_info, snapshot_output_path
@@ -404,6 +405,14 @@ class Camera(AbstractContextManager["Camera"]):
     def voice(self) -> Voice:
         """Return the voice/talk helper."""
         return Voice(self)
+
+    def ptz(self, *, channel_id: int | None = None) -> Ptz:
+        """Return the stored PTZ-preset helper.
+
+        :param channel_id: Optional PTZ channel override. Defaults to the
+            camera config channel.
+        """
+        return Ptz(self, channel_id=channel_id)
 
     def settings(self) -> Settings:
         """Return the settings helper."""

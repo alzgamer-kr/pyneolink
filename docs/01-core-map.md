@@ -1,6 +1,6 @@
 # Core Map
 
-`pyneolink/core` contains the low-level protocol pieces. Public modules such as `camera.py`, `sd_card.py`, `battery.py`, `motion.py`, `voice.py`, `recorder.py`, and `stream_server.py` use these primitives instead of building UDP packets, Baichuan headers, or encryption directly.
+`pyneolink/core` contains the low-level protocol pieces. Public modules such as `camera.py`, `sd_card.py`, `battery.py`, `motion.py`, `ptz.py`, `voice.py`, `recorder.py`, and `stream_server.py` use these primitives instead of building UDP packets, Baichuan headers, or encryption directly.
 
 ## `pyneolink/core/const/flags.py`
 
@@ -111,6 +111,7 @@ This module does not know about camera login or transport. It only handles media
 - `pyneolink/sd_card.py`: SD-card listing, pagination, filtering, download, guarded remove/format.
 - `pyneolink/battery.py`: battery XML request, normalization, reconnect/online polling.
 - `pyneolink/motion.py`: motion status and event watch iterator.
+- `pyneolink/ptz.py`: stored PTZ preset listing and recall.
 - `pyneolink/voice.py`: talk ability, microphone/file/tone ADPCM voice, siren trigger.
 - `pyneolink/recorder.py`: local stream recording to MPEG-TS.
 - `pyneolink/stream_server.py`: live MPEG-TS and HLS timeshift HTTP server.

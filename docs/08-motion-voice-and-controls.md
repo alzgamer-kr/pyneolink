@@ -101,3 +101,9 @@ Basic controls live on `Camera`:
 - `camera.reboot()` sends a reboot command.
 
 Examples keep reboot guarded because it intentionally interrupts the camera.
+
+## PTZ Presets
+
+Stored preset support lives in `camera.ptz()`; see
+[09-ptz-presets.md](09-ptz-presets.md) for its Baichuan command IDs, payload,
+and the Argus PT Ultra snapshot prerequisite.
