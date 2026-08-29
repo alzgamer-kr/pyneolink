@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import queue
 import socket
+import threading
 import time
+from collections import deque
 from contextlib import AbstractContextManager
 from pathlib import Path
 
@@ -102,10 +105,18 @@ class Camera(AbstractContextManager["Camera"]):
         self.login_xml = ""
         self.debug = debug
         self._online_required = 0
+        self._send_lock = threading.RLock()
+        self._dispatch_lock = threading.RLock()
+        self._dispatch_stop = threading.Event()
+        self._dispatch_thread: threading.Thread | None = None
+        self._dispatch_waiters: dict[tuple[int, int | None], list[_MessageSubscription]] = {}
+        self._dispatch_unmatched: deque = deque()
+        self._dispatch_error: BaseException | None = None
 
     def __enter__(self) -> "Camera":
         self.connect()
         self.login()
+        self.start_dispatcher()
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -158,6 +169,7 @@ class Camera(AbstractContextManager["Camera"]):
 
     def close(self) -> None:
         """Close the current transport connection and clear login state."""
+        self.stop_dispatcher()
         if self.sock:
             self.sock.close()
             self.sock = None
@@ -165,9 +177,48 @@ class Camera(AbstractContextManager["Camera"]):
 
     def reconnect(self) -> None:
         """Close, reconnect, and log in again."""
+        restart_dispatcher = self.dispatcher_active
         self.close()
         self.connect()
         self.login()
+        if restart_dispatcher:
+            self.start_dispatcher()
+
+    @property
+    def dispatcher_active(self) -> bool:
+        """Whether the background message dispatcher is active."""
+        return self._dispatch_thread is not None and self._dispatch_thread.is_alive()
+
+    def start_dispatcher(self) -> "Camera":
+        """Start the background message dispatcher for concurrent API use."""
+        if self.dispatcher_active:
+            return self
+        self._dispatch_stop.clear()
+        self._dispatch_error = None
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop,
+            name=f"pyneolink-dispatch-{self.config.name}",
+            daemon=True,
+        )
+        self._dispatch_thread.start()
+        return self
+
+    def stop_dispatcher(self) -> None:
+        """Stop the background message dispatcher if it is running."""
+        thread = self._dispatch_thread
+        if thread is None:
+            return
+        self._dispatch_stop.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._dispatch_thread = None
+        with self._dispatch_lock:
+            subscriptions = [waiter for waiters in self._dispatch_waiters.values() for waiter in waiters]
+            self._dispatch_waiters.clear()
+            self._dispatch_unmatched.clear()
+            self._dispatch_error = None
+        for subscription in subscriptions:
+            subscription.close()
 
     @property
     def online_required(self) -> bool:
@@ -190,6 +241,30 @@ class Camera(AbstractContextManager["Camera"]):
         except TimeoutError:
             return "timeout"
         return f"msg_id={msg.header.msg_id} msg_num={msg.header.msg_num} response={msg.header.response_code}"
+
+    def subscribe_messages(
+        self,
+        msg_id: int,
+        msg_num: int | None = None,
+        *,
+        maxsize: int = 100,
+    ) -> "_MessageSubscription":
+        """Subscribe to dispatched messages by id and optional message number."""
+        if not self.dispatcher_active:
+            raise RuntimeError("Camera dispatcher is not active")
+        subscription = _MessageSubscription(self, msg_id, msg_num, maxsize=maxsize)
+        key = (msg_id, msg_num)
+        with self._dispatch_lock:
+            self._dispatch_waiters.setdefault(key, []).append(subscription)
+            remaining = deque()
+            while self._dispatch_unmatched:
+                message = self._dispatch_unmatched.popleft()
+                if _message_matches(message, msg_id, msg_num):
+                    subscription.put(message)
+                else:
+                    remaining.append(message)
+            self._dispatch_unmatched = remaining
+        return subscription
 
     def login(self, max_encryption: str = "aes") -> str:
         """Log in and return the raw login XML.
@@ -467,6 +542,11 @@ class Camera(AbstractContextManager["Camera"]):
         for attempt in range(attempts):
             self.ensure_connected()
             try:
+                if self.dispatcher_active:
+                    msg_num = self._next_msg()
+                    with self.subscribe_messages(msg_id, msg_num, maxsize=10) as replies:
+                        self._send_modern(msg_id, msg_num, payload, extension=extension)
+                        return replies.recv(timeout=self.timeout)
                 msg_num = self.send(msg_id, payload, extension=extension)
                 return self._recv_matching(msg_id, msg_num)
             except TimeoutError as exc:
@@ -481,6 +561,9 @@ class Camera(AbstractContextManager["Camera"]):
         raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=msg_id, msg_num="?"))
 
     def _recv_matching(self, msg_id: int, msg_num: int):
+        if self.dispatcher_active:
+            with self.subscribe_messages(msg_id, msg_num, maxsize=10) as replies:
+                return replies.recv(timeout=self.timeout)
         deadline = time.monotonic() + self.timeout
         while True:
             reply_msg = self._recv()
@@ -526,17 +609,14 @@ class Camera(AbstractContextManager["Camera"]):
         sent_msg_num = self._next_msg() if msg_num is None else msg_num
         if binary_reply:
             self.binary_msg_nums.add(sent_msg_num)
-        self._send(
-            encode_modern(
-                msg_id,
-                sent_msg_num,
-                payload,
-                extension=extension,
-                channel_id=self.config.channel_id if channel_id is None else channel_id,
-                msg_class=msg_class,
-                stream_type=stream_type,
-                cipher=self.cipher,
-            )
+        self._send_modern(
+            msg_id,
+            sent_msg_num,
+            payload,
+            extension=extension,
+            msg_class=msg_class,
+            channel_id=channel_id,
+            stream_type=stream_type,
         )
         return sent_msg_num
 
@@ -552,16 +632,17 @@ class Camera(AbstractContextManager["Camera"]):
         payload = payloads.preview_start.format(
             channel_id=self.config.channel_id, handle=handle, stream_type=stream_name
         )
-        self._send(
-            encode_modern(
-                MSG.VIDEO,
-                msg_num,
-                payload,
-                channel_id=self.config.channel_id,
-                stream_type=stream_code,
-                cipher=self.cipher,
-            )
-        )
+        if self.dispatcher_active:
+            with self.subscribe_messages(MSG.VIDEO, msg_num, maxsize=10) as replies:
+                self._send_modern(MSG.VIDEO, msg_num, payload, stream_type=stream_code)
+                reply_msg = replies.recv(timeout=self.timeout)
+                if reply_msg.header.response_code != 200:
+                    raise ProtocolError(
+                        msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code)
+                    )
+                self.binary_msg_nums.add(msg_num)
+                return msg_num
+        self._send_modern(MSG.VIDEO, msg_num, payload, stream_type=stream_code)
         deadline = time.monotonic() + self.timeout
         while True:
             reply_msg = self._recv()
@@ -587,16 +668,17 @@ class Camera(AbstractContextManager["Camera"]):
         sent_msg_num = self._next_msg() if msg_num is None else msg_num
         payload = payloads.preview_stop.format(channel_id=self.config.channel_id, handle=handle)
         self.binary_msg_nums.discard(sent_msg_num)
-        self._send(
-            encode_modern(
-                MSG.VIDEO_STOP,
-                sent_msg_num,
-                payload,
-                channel_id=self.config.channel_id,
-                stream_type=stream_code,
-                cipher=self.cipher,
-            )
-        )
+        if self.dispatcher_active:
+            with self.subscribe_messages(MSG.VIDEO_STOP, sent_msg_num, maxsize=10) as replies:
+                self._send_modern(MSG.VIDEO_STOP, sent_msg_num, payload, stream_type=stream_code)
+                try:
+                    reply_msg = replies.recv(timeout=min(self.timeout, 2.0))
+                except TimeoutError:
+                    return
+                if reply_msg.header.response_code not in (0, 200) and self.debug:
+                    print(msg.Log.StreamStopReturned.format(response_code=reply_msg.header.response_code))
+                return
+        self._send_modern(MSG.VIDEO_STOP, sent_msg_num, payload, stream_type=stream_code)
         deadline = time.monotonic() + min(self.timeout, 2.0)
         while time.monotonic() <= deadline:
             try:
@@ -617,6 +699,9 @@ class Camera(AbstractContextManager["Camera"]):
             or `subStream`.
         """
         with self.require_online():
+            if self.dispatcher_active:
+                yield from self._read_stream_payloads_dispatched(stream)
+                return
             msg_num = self.start_stream(stream)
             next_keepalive_at = time.monotonic() + 0.75
             try:
@@ -631,6 +716,38 @@ class Camera(AbstractContextManager["Camera"]):
                         continue
                     if msg.header.msg_id == MSG.VIDEO and msg.header.msg_num == msg_num and msg.payload:
                         yield msg.payload
+            finally:
+                try:
+                    self.stop_stream(stream, msg_num)
+                except Exception as exc:
+                    if self.debug:
+                        print(msg.Log.StreamStopCloseFailed.format(exc_type=type(exc).__name__, exc=exc))
+
+    def _read_stream_payloads_dispatched(self, stream: str = "mainStream"):
+        msg_num = self._next_msg()
+        stream_name, stream_code, handle = stream_params(stream)
+        payload = payloads.preview_start.format(
+            channel_id=self.config.channel_id, handle=handle, stream_type=stream_name
+        )
+        with self.subscribe_messages(MSG.VIDEO, msg_num, maxsize=200) as replies:
+            self._send_modern(MSG.VIDEO, msg_num, payload, stream_type=stream_code)
+            start_reply = replies.recv(timeout=self.timeout)
+            if start_reply.header.response_code != 200:
+                raise ProtocolError(msg.Error.StreamStartFailed.format(response_code=start_reply.header.response_code))
+            self.binary_msg_nums.add(msg_num)
+            next_keepalive_at = time.monotonic() + 0.75
+            try:
+                while True:
+                    now = time.monotonic()
+                    if now >= next_keepalive_at:
+                        self.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
+                        next_keepalive_at = now + 0.75
+                    try:
+                        message = replies.recv(timeout=1.0)
+                    except TimeoutError:
+                        continue
+                    if message.payload:
+                        yield message.payload
             finally:
                 try:
                     self.stop_stream(stream, msg_num)
@@ -671,15 +788,56 @@ class Camera(AbstractContextManager["Camera"]):
             self.login()
 
     def _next_msg(self) -> int:
-        self.msg_num = (self.msg_num + 1) & 0xFFFF
-        return self.msg_num or self._next_msg()
+        with self._send_lock:
+            self.msg_num = (self.msg_num + 1) & 0xFFFF
+            if self.msg_num == 0:
+                self.msg_num = 1
+            return self.msg_num
 
     def _send(self, data: bytes) -> None:
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        self.sock.sendall(data)
+        with self._send_lock:
+            self.sock.sendall(data)
+
+    def _send_modern(
+        self,
+        msg_id: int,
+        msg_num: int,
+        payload: bytes = b"",
+        *,
+        extension: bytes = b"",
+        binary_reply: bool = False,
+        msg_class: int = MSG_CLASS.MODERN,
+        channel_id: int | None = None,
+        stream_type: int = 0,
+    ) -> None:
+        if binary_reply:
+            self.binary_msg_nums.add(msg_num)
+        self._send(
+            encode_modern(
+                msg_id,
+                msg_num,
+                payload,
+                extension=extension,
+                channel_id=self.config.channel_id if channel_id is None else channel_id,
+                msg_class=msg_class,
+                stream_type=stream_type,
+                cipher=self.cipher,
+            )
+        )
 
     def _recv(
+        self,
+        timeout: float | None = None,
+        *,
+        binary_playback_331: bool = False,
+    ):
+        if self.dispatcher_active and threading.current_thread() is not self._dispatch_thread:
+            return self._recv_dispatched(timeout=timeout)
+        return self._recv_direct(timeout=timeout, binary_playback_331=binary_playback_331)
+
+    def _recv_direct(
         self,
         timeout: float | None = None,
         *,
@@ -697,6 +855,65 @@ class Camera(AbstractContextManager["Camera"]):
         if message.header.msg_id == MSG.UDP_KEEPALIVE:
             self._reply_keepalive(message)
         return message
+
+    def _recv_dispatched(self, timeout: float | None = None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._dispatch_lock:
+                if self._dispatch_error is not None:
+                    raise self._dispatch_error
+                if self._dispatch_unmatched:
+                    return self._dispatch_unmatched.popleft()
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(msg.Error.UdpBaichuanTimeout)
+                time.sleep(min(0.01, remaining))
+            else:
+                time.sleep(0.01)
+
+    def _dispatch_loop(self) -> None:
+        while not self._dispatch_stop.is_set():
+            try:
+                message = self._recv_direct(timeout=0.5)
+            except TimeoutError:
+                continue
+            except BaseException as exc:
+                with self._dispatch_lock:
+                    self._dispatch_error = exc
+                    subscriptions = [waiter for waiters in self._dispatch_waiters.values() for waiter in waiters]
+                    self._dispatch_waiters.clear()
+                for subscription in subscriptions:
+                    subscription.close()
+                return
+            self._dispatch_message(message)
+
+    def _dispatch_message(self, message) -> None:
+        if message.header.msg_id == MSG.UDP_KEEPALIVE:
+            return
+        with self._dispatch_lock:
+            delivered = False
+            for key in ((message.header.msg_id, message.header.msg_num), (message.header.msg_id, None)):
+                for waiter in list(self._dispatch_waiters.get(key, [])):
+                    if waiter.active:
+                        waiter.put(message)
+                        delivered = True
+            if delivered:
+                return
+            self._dispatch_unmatched.append(message)
+            while len(self._dispatch_unmatched) > 200:
+                self._dispatch_unmatched.popleft()
+
+    def _unsubscribe(self, subscription: "_MessageSubscription") -> None:
+        key = (subscription.msg_id, subscription.msg_num)
+        with self._dispatch_lock:
+            waiters = self._dispatch_waiters.get(key)
+            if not waiters:
+                return
+            if subscription in waiters:
+                waiters.remove(subscription)
+            if not waiters:
+                self._dispatch_waiters.pop(key, None)
 
     def _reply_keepalive(self, keepalive_msg) -> None:
         if self.sock is None:
@@ -717,6 +934,51 @@ class Camera(AbstractContextManager["Camera"]):
         except Exception as exc:
             if self.debug:
                 print(msg.Log.StreamKeepaliveReplyFailed.format(exc_type=type(exc).__name__, exc=exc))
+
+
+class _MessageSubscription:
+    def __init__(self, camera: Camera, msg_id: int, msg_num: int | None, *, maxsize: int = 100) -> None:
+        self.camera = camera
+        self.msg_id = msg_id
+        self.msg_num = msg_num
+        self.active = True
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, maxsize))
+
+    def __enter__(self) -> "_MessageSubscription":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def put(self, message) -> None:
+        if not self.active:
+            return
+        while True:
+            try:
+                self._queue.put_nowait(message)
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    return
+
+    def recv(self, *, timeout: float | None = None):
+        if not self.active:
+            raise TimeoutError(msg.Error.EventListenerClosed)
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(msg.Error.UdpBaichuanTimeout) from None
+
+    def close(self) -> None:
+        if self.active:
+            self.active = False
+            self.camera._unsubscribe(self)
+
+
+def _message_matches(message, msg_id: int, msg_num: int | None) -> bool:
+    return message.header.msg_id == msg_id and (msg_num is None or message.header.msg_num == msg_num)
 
 
 def _snapshot_stream_type(stream_type: str | None) -> str:

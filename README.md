@@ -1,13 +1,13 @@
 # PyNeolink
 
-[![Downloads](https://img.shields.io/pypi/dm/pyneolink?style=for-the-badge&label=downloads&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://pypistats.org/packages/pyneolink)
+[![Downloads](https://img.shields.io/pypi/dm/pyneolink?style=for-the-badge&label=downloads&labelColor=006dad&color=005d94&cacheSeconds=86400)](https://pypistats.org/packages/pyneolink)
 [![Release](https://img.shields.io/github/v/release/alzgamer-kr/pyneolink?style=for-the-badge&label=release&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://github.com/alzgamer-kr/pyneolink/releases)
 [![GitHub](https://img.shields.io/github/forks/alzgamer-kr/pyneolink?style=for-the-badge&label=forks&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://github.com/alzgamer-kr/pyneolink)
 [![GitHub](https://img.shields.io/github/stars/alzgamer-kr/pyneolink?style=for-the-badge&label=stars&labelColor=006dad&color=005d94&cacheSeconds=7200)](https://github.com/alzgamer-kr/pyneolink)
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.4.2` alpha.
+Version: `0.4.3` alpha.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -35,6 +35,8 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
   `record` CLI command
 - Live HTTP MPEG-TS viewing with H264/H265 video and AAC audio
 - HLS timeshift viewing with an in-memory sliding buffer
+- Concurrent SDK stream, motion, battery, and command handling inside one
+  `with Camera(...)` session
 - Motion status and motion event watch mode
 - Two-way voice/talk from microphone, audio file, or generated test tone
 - Camera siren trigger
@@ -58,13 +60,13 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 From PyPI:
 
 ```powershell
-python -m pip install pyneolink==0.4.2
+python -m pip install pyneolink==0.4.3
 ```
 
 With microphone voice input support:
 
 ```powershell
-python -m pip install "pyneolink[voice]==0.4.2"
+python -m pip install "pyneolink[voice]==0.4.3"
 ```
 
 For local development from a checkout:
@@ -227,6 +229,11 @@ python pyneolink/cli.py serve --config config.json --hls-buffer-mb 100 --hls-seg
 When binding to `0.0.0.0`, do not open `0.0.0.0` in VLC. Use `127.0.0.1` on the same PC or the PC's LAN IP from another device.
 
 ## Library Use
+
+`with Camera(...) as camera:` opens the camera session and starts the internal
+message dispatcher automatically. This lets one `Camera` object handle live
+stream reads, motion events, and ordinary status/config commands without the
+caller managing the socket reader manually.
 
 Camera information:
 

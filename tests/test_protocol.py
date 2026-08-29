@@ -31,9 +31,11 @@ from pyneolink.core.media import MediaParser, extract_embedded_mp4
 from pyneolink.motion import CameraEvent, CameraEvents, parse_motion_events
 from pyneolink.settings import Ir, Pir
 from pyneolink.cli import CLI
+import csv
 import queue
 import struct
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -225,6 +227,32 @@ def test_udp_heartbeat_reuses_connection_tid():
     assert "<C2D_HB>" in xml
 
 
+def test_udp_maintenance_runs_while_data_arrives():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+            self.received = [encode_udp_data(99, 0, b"ignored")]
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendto(self, data, addr):
+            self.sent.append((data, addr))
+
+        def recvfrom(self, _size):
+            return self.received.pop(0), ("127.0.0.1", 1234)
+
+    sock = FakeSocket()
+    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, heartbeat_tid=77)
+    connection.last_ack_at = time.monotonic()
+    connection.last_heartbeat_at = time.monotonic() - 2.0
+
+    connection._recv_one()
+
+    discovery_packets = [decode_discovery_packet(data) for data, _addr in sock.sent]
+    assert any(packet and packet[0] == 77 and "<C2D_HB>" in packet[1] for packet in discovery_packets)
+
+
 def test_media_info_packet():
     raw = b"1002" + (32).to_bytes(4, "little") + (1920).to_bytes(4, "little") + (1080).to_bytes(4, "little")
     raw += bytes([0, 15, 126, 1, 1, 0, 0, 0, 126, 1, 1, 0, 0, 0]) + b"\0\0"
@@ -408,6 +436,18 @@ def test_public_stream_server_builds_encoded_urls():
         "http://127.0.0.1:8554/Home-Front/high/hls.m3u8",
         "http://127.0.0.1:8554/Home-Front/low/hls.m3u8",
     ]
+
+
+def test_stream_server_context_manager_starts_and_stops():
+    config = Config(bind="127.0.0.1", bind_port=0, cameras=[CameraConfig(name="Home-Front")])
+    server = StreamServer(config)
+
+    with server as running:
+        assert running is server
+        assert server.port > 0
+        assert server._server is not None
+
+    assert server._server is None
 
 
 def test_stream_server_accepts_dict_config():
@@ -830,6 +870,20 @@ def test_camera_start_stream_uses_neolink_substream_preview():
     assert msg_num in camera.binary_msg_nums
 
 
+def test_camera_context_manager_starts_dispatcher(monkeypatch):
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    calls = []
+
+    monkeypatch.setattr(camera, "connect", lambda: calls.append("connect"))
+    monkeypatch.setattr(camera, "login", lambda: calls.append("login"))
+    monkeypatch.setattr(camera, "start_dispatcher", lambda: calls.append("dispatch") or camera)
+
+    with camera as opened:
+        assert opened is camera
+
+    assert calls == ["connect", "login", "dispatch"]
+
+
 def test_camera_stop_stream_ignores_camera_400_reply():
     class FakeSocket:
         def __init__(self, reply):
@@ -861,6 +915,34 @@ def test_camera_stop_stream_ignores_camera_400_reply():
     assert header.stream_type == 1
     assert b"<handle>256</handle>" in payload
     assert 7 not in camera.binary_msg_nums
+
+
+def test_camera_dispatcher_routes_messages_by_id_and_number():
+    class FakeThread:
+        def is_alive(self):
+            return True
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._dispatch_thread = FakeThread()
+    video_7 = Message(Header(MSG.VIDEO, 5, 0, 0, 7, 200, MSG_CLASS.MODERN), payload=b"video7")
+    video_8 = Message(Header(MSG.VIDEO, 5, 0, 0, 8, 200, MSG_CLASS.MODERN), payload=b"video8")
+    battery_8 = Message(Header(MSG.BATTERY, 7, 0, 0, 8, 200, MSG_CLASS.MODERN), payload=b"battery")
+    motion = Message(Header(MSG.MOTION, 6, 0, 0, 2, 200, MSG_CLASS.MODERN), payload=b"motion")
+
+    with (
+        camera.subscribe_messages(MSG.VIDEO, 7) as stream,
+        camera.subscribe_messages(MSG.BATTERY, 8) as battery,
+        camera.subscribe_messages(MSG.MOTION) as events,
+    ):
+        camera._dispatch_message(video_8)
+        camera._dispatch_message(video_7)
+        camera._dispatch_message(battery_8)
+        camera._dispatch_message(motion)
+
+        assert stream.recv(timeout=0.01) is video_7
+        assert battery.recv(timeout=0.01) is battery_8
+        assert events.recv(timeout=0.01) is motion
+        assert camera._recv_dispatched(timeout=0.01) is video_8
 
 
 def test_camera_replies_to_incoming_keepalive():
@@ -2303,3 +2385,238 @@ def test_sd_card_list_reads_all_handle_pages():
         "files/handle-1/page-2",
         "files/handle-1/page-3",
     ]
+
+
+def test_battery_runtime_test_helpers(tmp_path):
+    from examples.battery_runtime_test import (
+        format_hms,
+        result_filename,
+        result_status_label,
+        sanitize_filename,
+        write_csv_rows,
+        write_html_report,
+    )
+
+    assert sanitize_filename("Camera / UID: 123") == "Camera-UID-123"
+    assert format_hms(3661.9) == "01:01:01"
+    assert result_status_label("completed") == "Successful"
+
+    camera_config = CameraConfig(name="Front Yard", uid="ABCDEF0123456789")
+    when = datetime(2026, 8, 28, 12, 30, 0)
+    assert result_filename(camera_config, "motion", when, ".csv") == (
+        "ABCDEF0123456789-motion-battery-test-20260828-123000.csv"
+    )
+
+    rows = [
+        {
+            "timestamp": "2026-08-28T12:30:00+03:00",
+            "elapsed_seconds": 0.0,
+            "elapsed_hms": "00:00:00",
+            "level_percent": 80,
+            "is_charging": 1,
+            "charge_status": "Charging",
+            "adapter_status": "Solar",
+            "charge_type": "solar_panel",
+            "mode": "motion",
+            "mode_status": "motion-watch",
+            "payloads_seen": 0,
+            "mode_last_error": "",
+            "note": "",
+        },
+        {
+            "timestamp": "2026-08-28T12:35:00+03:00",
+            "elapsed_seconds": 300.0,
+            "elapsed_hms": "00:05:00",
+            "level_percent": 79,
+            "is_charging": 0,
+            "charge_status": "",
+            "adapter_status": "Battery",
+            "charge_type": "none",
+            "mode": "motion",
+            "mode_status": "motion-watch",
+            "payloads_seen": 0,
+            "mode_last_error": "",
+            "note": "",
+        },
+    ]
+    csv_path = tmp_path / "battery.csv"
+    html_path = tmp_path / "battery.html"
+
+    write_csv_rows(csv_path, rows)
+    write_html_report(
+        html_path,
+        camera_config=camera_config,
+        mode="motion",
+        result="completed",
+        rows=rows,
+        start_percent=80,
+        stop_percent=20,
+        sample_interval=300.0,
+        battery_keepalive_interval=20.0,
+        note="",
+    )
+
+    assert "level_percent" in csv_path.read_text(encoding="utf-8")
+    report = html_path.read_text(encoding="utf-8")
+    assert "PyNeolink Battery Runtime Test" in report
+    assert "Successful" in report
+    assert "charging" in report
+
+
+def test_stream_session_probe_helpers(tmp_path):
+    from examples.stream_session_probe import (
+        ProbeStats,
+        format_hms,
+        read_csv_rows,
+        result_filename,
+        sample_row,
+        sanitize_filename,
+        stream_stalled,
+        write_html_report,
+    )
+
+    assert sanitize_filename("Camera / UID: 123") == "Camera-UID-123"
+    assert format_hms(3661.9) == "01:01:01"
+
+    camera_config = CameraConfig(name="Back Yard", uid="ABCDEF0123456789")
+    when = datetime(2026, 8, 28, 12, 30, 0)
+    assert result_filename(camera_config, "high", when, ".csv") == (
+        "ABCDEF0123456789-stream-session-probe-high-20260828-123000.csv"
+    )
+
+    stats = ProbeStats()
+    stats.payloads_seen = 10
+    stats.payload_bytes = 4096
+    stats.keepalives_sent = 3
+    started_at = time.monotonic()
+    row = sample_row(
+        started_at=started_at,
+        stream="high",
+        state="streaming",
+        stats=stats,
+        payloads_delta=10,
+        payload_bytes_delta=4096,
+        socket_stats=None,
+        note="",
+    )
+    assert row["stream"] == "high"
+    assert row["state"] == "streaming"
+    assert row["payloads_seen"] == 10
+    assert not stream_stalled(started_at, stats, 60.0)
+
+    csv_path = tmp_path / "probe.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+
+    html_path = tmp_path / "probe.html"
+    write_html_report(
+        html_path,
+        camera_config=camera_config,
+        stream="high",
+        result="completed",
+        rows=read_csv_rows(csv_path),
+        duration=60.0,
+        sample_interval=10.0,
+        keepalive_interval=0.75,
+        stall_window=60.0,
+        max_reconnects=0,
+        note="done",
+    )
+
+    report = html_path.read_text(encoding="utf-8")
+    assert "PyNeolink Stream Session Probe" in report
+    assert "Back Yard" in report
+    assert "done" in report
+
+
+def test_dual_camera_session_probe_helpers(tmp_path):
+    from examples.dual_camera_session_probe import (
+        ProbeEvent,
+        ProbeStats,
+        analyze_events,
+        event_row,
+        first_event_per_camera,
+        format_hms,
+        read_csv_rows,
+        result_filename,
+        sanitize_filename,
+        stream_stalled,
+        write_html_report,
+    )
+
+    assert sanitize_filename("Camera / UID: 123") == "Camera-UID-123"
+    assert format_hms(3661.9) == "01:01:01"
+
+    camera_a = CameraConfig(name="Front Yard", uid="FRONT123")
+    camera_b = CameraConfig(name="Back Yard", uid="BACK456")
+    when = datetime(2026, 8, 29, 12, 30, 0)
+    assert result_filename([camera_a, camera_b], "high", when, ".csv") == (
+        "FRONT123-BACK456-dual-session-probe-high-20260829-123000.csv"
+    )
+
+    stats = ProbeStats()
+    stats.payloads_seen = 5
+    stats.payload_bytes = 2048
+    row = event_row(
+        camera_config=camera_a,
+        event="sample",
+        stream="high",
+        wall_started_at=time.monotonic(),
+        session_started_at=time.monotonic(),
+        stats=stats,
+        payloads_delta=5,
+        payload_bytes_delta=2048,
+        note="",
+    )
+    assert row["camera"] == "Front Yard"
+    assert row["event"] == "sample"
+    assert row["payloads_seen"] == 5
+    assert not stream_stalled(time.monotonic(), stats, 60.0)
+
+    first_failures = first_event_per_camera(
+        [
+            ProbeEvent("Front Yard", "failure", 100.0, 100.0, "first"),
+            ProbeEvent("Front Yard", "failure", 200.0, 200.0, "second"),
+            ProbeEvent("Back Yard", "failure", 106.0, 10.0, "third"),
+        ]
+    )
+    assert [event.last_error for event in first_failures] == ["first", "third"]
+    assert "same wall-clock" in analyze_events(
+        first_failures,
+        same_wall_window=10.0,
+        same_session_window=1.0,
+    )
+    assert "same session-age" in analyze_events(
+        [
+            ProbeEvent("Front Yard", "failure", 100.0, 300.0, "first"),
+            ProbeEvent("Back Yard", "failure", 700.0, 305.0, "second"),
+        ],
+        same_wall_window=10.0,
+        same_session_window=10.0,
+    )
+
+    csv_path = tmp_path / "dual.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+
+    html_path = tmp_path / "dual.html"
+    write_html_report(
+        html_path,
+        camera_configs=[camera_a, camera_b],
+        stream="high",
+        result="incomplete",
+        conclusion="same wall-clock failure window",
+        rows=read_csv_rows(csv_path),
+        duration=3600.0,
+        stagger_seconds=600.0,
+        sample_interval=30.0,
+        keepalive_interval=0.75,
+        stall_window=60.0,
+    )
+    report = html_path.read_text(encoding="utf-8")
+    assert "PyNeolink Dual Camera Session Probe" in report
+    assert "same wall-clock failure window" in report

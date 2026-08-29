@@ -39,6 +39,13 @@ For `mainStream` the preview handle is `0`. For `subStream` the preview handle i
 
 The generator yields raw BCMedia payloads. It does not parse H264/H265 itself.
 
+When a `Camera` is opened with `with Camera(...) as camera:`, the internal
+dispatcher is started automatically. In that mode stream payloads are read from
+a subscription for the stream's `MSG.VIDEO` message number, while ordinary SDK
+commands keep waiting for their own replies. This allows one camera session to
+serve stream data and poll status APIs such as battery info without both paths
+reading from the socket directly.
+
 ## MediaParser
 
 `MediaParser.feed(data)` accepts bytes and yields `MediaPacket` objects.
@@ -72,12 +79,11 @@ The handler:
 
 1. finds the camera config;
 2. converts `quality` to `mainStream` or `subStream`;
-3. opens a `Camera`;
-4. logs in;
-5. reads stream payloads;
-6. waits for the first keyframe;
-7. buffers startup frames;
-8. writes MPEG-TS to the HTTP client.
+3. opens a `Camera` context, which also starts the dispatcher;
+4. reads stream payloads;
+5. waits for the first keyframe;
+6. buffers startup frames;
+7. writes MPEG-TS to the HTTP client.
 
 ## MPEG-TS Muxing
 

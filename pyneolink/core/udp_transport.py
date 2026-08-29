@@ -165,10 +165,10 @@ class UdpBcConnection:
         self.max_pending_chunks = limit
 
     def _recv_one(self) -> None:
+        self._maintenance()
         try:
             data, addr = self.sock.recvfrom(65535)
         except TimeoutError:
-            self._maintenance()
             return
         parsed = decode_udp_packet(data)
         if not parsed:
