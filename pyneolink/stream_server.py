@@ -54,6 +54,15 @@ class StreamServer:
         self.buffer_seconds = max(buffer_seconds, 0.0)
         self.hls_buffer_bytes = max(int(hls_buffer_mb), 1) * 1024 * 1024
         self.hls_segment_seconds = max(hls_segment_seconds, 0.5)
+        self._server: _StreamServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "StreamServer":
+        """Start the HTTP server in a background thread."""
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
 
     def urls(self, *, host: str | None = None) -> list[str]:
         """Return stream URLs for configured cameras.
@@ -72,6 +81,36 @@ class StreamServer:
 
     def serve_forever(self) -> None:
         """Start serving streams and block forever."""
+        server = self._create_server()
+        self._print_startup()
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+
+    def start(self) -> "StreamServer":
+        """Start serving streams in a background thread."""
+        if self._server is not None:
+            return self
+        self._server = self._create_server()
+        self._print_startup()
+        self._thread = threading.Thread(target=self._server.serve_forever, name="pyneolink-stream-http", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Stop a background server started by `start()` or `with`."""
+        if self._server is None:
+            return
+        server = self._server
+        self._server = None
+        server.shutdown()
+        server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _create_server(self) -> "_StreamServer":
         server = _StreamServer((self.host, self.port), _StreamHandler)
         server.config = self.config
         server.state_path = self.state_path
@@ -81,13 +120,16 @@ class StreamServer:
         server.hls_segment_seconds = self.hls_segment_seconds
         server.hls_sessions = {}
         server.hls_sessions_lock = threading.Lock()
+        self.host, self.port = server.server_address
+        return server
+
+    def _print_startup(self) -> None:
         print(msg.Log.Serving.format(host=self.host, port=self.port))
         display_host = _display_host(self.host)
         if display_host != self.host:
             print(msg.Log.OpenLocal.format(host=display_host, port=self.port))
         for url in self.urls(host=display_host):
             print(msg.Log.Url.format(url=url))
-        server.serve_forever()
 
 
 def serve_streams(

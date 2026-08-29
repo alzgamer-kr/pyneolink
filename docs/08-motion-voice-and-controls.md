@@ -26,6 +26,8 @@ Implementation notes:
 - `CameraEvents.start()` acquires `camera.require_online()`.
 - It sends `MSG.MOTION_REQUEST` once.
 - It keeps the channel alive with `MSG.UDP_KEEPALIVE`.
+- When the camera dispatcher is active, incoming `MSG.MOTION` packets are read
+  from a motion subscription instead of the general socket reader.
 - Incoming `MSG.MOTION` XML is parsed by `parse_motion_events()`.
 - `EVENTS.human`, `EVENTS.vehicle`, `EVENTS.motion`, `EVENTS.unknown`, and `EVENTS.none` normalize camera-specific values.
 - A camera may send `none stop`; PyNeolink normalizes that stop event to the last active event type when possible.

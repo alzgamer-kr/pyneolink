@@ -66,4 +66,10 @@ neolink/
 .upstream-tree.json
 .upstream-neolink.zip
 captures/
+.research/
+ReolinkApp/
+BCSDK_functions.txt
+json_api_endpoints.txt
+vdt_clean_functions.txt
+SUPPORT.md
 release.ps1

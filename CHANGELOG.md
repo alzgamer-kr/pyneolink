@@ -2,19 +2,53 @@
 
 ## Unreleased
 
+No changes yet.
+
+---
+
+## 0.4.3
+
+Session dispatcher and release workflow preparation.
+
 ### Added
 
 - Stored PTZ preset list and recall through `camera.ptz()`, with documentation
   for the Argus PT Ultra same-session snapshot prerequisite.
 - Documented Conda-based local development setup and the tested Python versions.
+- Added long-running battery/runtime, stream-session, and dual-camera
+  stream-session probe examples for real camera diagnostics.
+- Added GitHub Actions test coverage across CPython 3.11, 3.12, 3.13, and 3.14
+  on Windows and Linux.
+- Stream-session probe examples now detect stalled media payloads separately
+  from active UDP keepalive traffic.
+
+### Changed
+
+- `with Camera(...) as camera:` now starts an internal message dispatcher
+  automatically, so SDK users can use one camera session for stream reads,
+  motion events, and regular commands without managing the socket reader.
+- The stream server can be used as a context manager for tests and embedded SDK
+  use.
+
+### Fixed
+
+- Keep UDP relay maintenance running even while media data is continuously
+  arriving, which prevents long live streams from losing their P2P session.
+- Route live stream, motion, and command replies by Baichuan message id and
+  message number when the dispatcher is active, avoiding packet mix-ups between
+  stream payloads and status requests such as battery polling.
 
 ### Notes
 
 - PTZ preset recall is currently documented as experimental: on the tested
   Argus PT Ultra it must be called after a `Camera.snapshot()` exchange in the
   same authenticated session.
+- The new runtime examples are intended for real-camera diagnostics and may be
+  updated as more camera models are tested.
 - The test suite was verified with Conda on CPython 3.11.15, 3.12.13, 3.13.15,
   and 3.14.7.
+
+---
 
 ## 0.4.2
 

@@ -618,10 +618,7 @@ class CLI:
             presets = ptz.presets()
             print(
                 json.dumps(
-                    [
-                        {"id": preset.id, "name": preset.name, "enabled": preset.enabled}
-                        for preset in presets
-                    ],
+                    [{"id": preset.id, "name": preset.name, "enabled": preset.enabled} for preset in presets],
                     indent=2,
                     ensure_ascii=False,
                 )

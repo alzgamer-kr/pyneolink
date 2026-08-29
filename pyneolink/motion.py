@@ -132,6 +132,7 @@ class CameraEvents(Iterator[CameraEvent]):
         self._next_keepalive_at = 0.0
         self._deadline: float | None = None
         self._last_active_type: EVENTS | None = None
+        self._subscription = None
 
     def __enter__(self) -> "CameraEvents":
         self.start()
@@ -161,7 +162,7 @@ class CameraEvents(Iterator[CameraEvent]):
                 recv_timeout = 1.0
                 if self._deadline is not None:
                     recv_timeout = min(recv_timeout, max(0.0, self._deadline - time.monotonic()))
-                reply = self.camera._recv(timeout=recv_timeout)
+                reply = self._recv_motion(timeout=recv_timeout)
             except TimeoutError:
                 continue
             if reply.header.msg_id != MSG.MOTION:
@@ -179,6 +180,8 @@ class CameraEvents(Iterator[CameraEvent]):
             return self
         self._lease = self.camera.require_online()
         self._lease.__enter__()
+        if getattr(self.camera, "dispatcher_active", False):
+            self._subscription = self.camera.subscribe_messages(MSG.MOTION, maxsize=100)
         reply = self.camera.command(MSG.MOTION_REQUEST)
         if reply.header.response_code != 200:
             self.close()
@@ -194,6 +197,9 @@ class CameraEvents(Iterator[CameraEvent]):
         self._pending.clear()
         self._deadline = None
         self._last_active_type = None
+        if self._subscription is not None:
+            self._subscription.close()
+            self._subscription = None
         if self._lease is not None:
             self._lease.__exit__(None, None, None)
             self._lease = None
@@ -212,7 +218,7 @@ class CameraEvents(Iterator[CameraEvent]):
                     self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
                     self._next_keepalive_at = now + self.keepalive_interval
                 try:
-                    reply = self.camera._recv(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
+                    reply = self._recv_motion(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
                 except TimeoutError:
                     continue
                 if reply.header.msg_id != MSG.MOTION:
@@ -223,6 +229,11 @@ class CameraEvents(Iterator[CameraEvent]):
             return CameraEvent(EVENTS.none, active=False, channel_id=self.channel_id), False
         finally:
             self.close()
+
+    def _recv_motion(self, *, timeout: float):
+        if self._subscription is not None:
+            return self._subscription.recv(timeout=timeout)
+        return self.camera._recv(timeout=timeout)
 
     def _normalize_events(self, events: list[CameraEvent]) -> list[CameraEvent]:
         normalized: list[CameraEvent] = []
