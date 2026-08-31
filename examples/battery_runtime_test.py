@@ -16,11 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyneolink import Camera, StreamServer
-from pyneolink.config import CameraConfig, Config, load_config
+from pyneolink import Camera
+from pyneolink.config import CameraConfig, load_config
+from pyneolink.core.bc import InvalidMagicError, ProtocolError
 from pyneolink.core.const import MSG
 
 
+RECOVERABLE_CONNECTION_ERRORS = (TimeoutError, EOFError, OSError, InvalidMagicError, ProtocolError)
 DEFAULT_CONFIG = "config.json"
 DEFAULT_MODE = "motion"
 DEFAULT_START_PERCENT = 80
@@ -29,6 +31,10 @@ DEFAULT_WAIT_INTERVAL_SECONDS = 60.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 300.0
 DEFAULT_BATTERY_KEEPALIVE_INTERVAL_SECONDS = 20.0
 DEFAULT_RECONNECT_WINDOW_SECONDS = 300.0
+DEFAULT_MAX_DURATION_SECONDS = 0.0
+DEFAULT_MOTION_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_STREAM_STALL_SECONDS = 15.0
+DEFAULT_CONTINUE_PREVIEW_INTERVAL_SECONDS = 0.0
 DEFAULT_STREAM = "mainStream"
 DEFAULT_OUTPUT_DIR = ".tmp"
 CSV_FIELDS = [
@@ -43,6 +49,29 @@ CSV_FIELDS = [
     "mode",
     "mode_status",
     "payloads_seen",
+    "mode_last_event",
+    "motion_none",
+    "motion_motion",
+    "motion_human",
+    "motion_vehicle",
+    "motion_unknown",
+    "motion_unknown_status",
+    "udp_next_recv_id",
+    "udp_last_packet_id",
+    "udp_max_packet_id",
+    "udp_pending_chunks",
+    "udp_pending_gaps",
+    "udp_buffered_bytes",
+    "udp_data_packets",
+    "udp_data_bytes",
+    "udp_duplicates",
+    "udp_ignored",
+    "udp_unknown",
+    "udp_acks_sent",
+    "udp_acks_received",
+    "udp_heartbeats_sent",
+    "udp_resend_packets",
+    "udp_seconds_since_data",
     "mode_last_error",
     "note",
 ]
@@ -54,6 +83,8 @@ class ModeStatus:
     last_error: str | None = None
     last_event: str | None = None
     payloads_seen: int = 0
+    event_counts: dict[str, int] = field(default_factory=dict)
+    socket_stats: dict[str, Any] = field(default_factory=dict)
     first_failure_at: float | None = None
     failed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -76,6 +107,19 @@ class ModeStatus:
             self.failed = True
             self.state = "failed"
 
+    def update_socket_stats(self, camera: Camera) -> None:
+        with self.lock:
+            self.socket_stats = socket_debug_snapshot(camera)
+
+    def record_motion_status(self, event: dict[str, Any]) -> dict[str, int]:
+        event_type = str(event.get("type") or "unknown")
+        key = event_type if event.get("known") else "unknown_status"
+        with self.lock:
+            self.payloads_seen += 1
+            self.event_counts[key] = self.event_counts.get(key, 0) + 1
+            self.last_event = _motion_event_label(event)
+            return dict(self.event_counts)
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
@@ -83,9 +127,31 @@ class ModeStatus:
                 "last_error": self.last_error,
                 "last_event": self.last_event,
                 "payloads_seen": self.payloads_seen,
+                "event_counts": dict(self.event_counts),
+                "socket_stats": self.socket_stats,
                 "first_failure_at": self.first_failure_at,
                 "failed": self.failed,
             }
+
+
+@dataclass
+class ContinuePreviewTimer:
+    interval: float
+    next_at: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.interval = max(0.0, float(self.interval))
+        self.next_at = time.monotonic() + self.interval if self.enabled else float("inf")
+
+    @property
+    def enabled(self) -> bool:
+        return self.interval > 0
+
+    def due(self) -> bool:
+        return self.enabled and time.monotonic() >= self.next_at
+
+    def schedule_next(self) -> None:
+        self.next_at = time.monotonic() + self.interval if self.enabled else float("inf")
 
 
 class CsvSampleWriter:
@@ -134,11 +200,10 @@ def main(argv: list[str] | None = None) -> int:
         sample_interval=args.sample_interval,
         battery_keepalive_interval=args.battery_keepalive_interval,
         reconnect_window=args.reconnect_window,
+        max_duration=args.max_duration,
+        motion_poll_interval=args.motion_poll_interval,
         stream=args.stream,
-        serve_host=args.serve_host if args.serve_host is not None else config.bind,
-        serve_port=args.serve_port if args.serve_port is not None else config.bind_port,
-        serve_internal_client=not args.no_serve_internal_client,
-        single_connection_serve=args.single_connection_serve,
+        continue_preview_interval=args.continue_preview_interval,
         write_html=args.html,
     )
     print(f"CSV: {result['csv_path']}")
@@ -164,18 +229,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-interval", type=float, default=DEFAULT_SAMPLE_INTERVAL_SECONDS)
     parser.add_argument("--battery-keepalive-interval", type=float, default=DEFAULT_BATTERY_KEEPALIVE_INTERVAL_SECONDS)
     parser.add_argument("--reconnect-window", type=float, default=DEFAULT_RECONNECT_WINDOW_SECONDS)
-    parser.add_argument("--stream", default=DEFAULT_STREAM, help="Stream used by --mode serve")
-    parser.add_argument("--serve-host", help="Bind host used by --mode serve. Defaults to config bind")
-    parser.add_argument("--serve-port", type=int, help="Bind port used by --mode serve. Defaults to config bind_port")
     parser.add_argument(
-        "--no-serve-internal-client",
-        action="store_true",
-        help="Run only the HTTP server during --mode serve. Open a stream URL externally to create camera load",
+        "--max-duration",
+        type=float,
+        default=DEFAULT_MAX_DURATION_SECONDS,
+        help="Stop after this many seconds once recording starts. 0 means run until --stop-percent or interruption",
     )
     parser.add_argument(
-        "--single-connection-serve",
-        action="store_true",
-        help="Diagnostic mode: read stream and battery through one Camera connection",
+        "--motion-poll-interval",
+        type=float,
+        default=DEFAULT_MOTION_POLL_INTERVAL_SECONDS,
+        help="Seconds between motion status polls in --mode motion",
+    )
+    parser.add_argument("--stream", default=DEFAULT_STREAM, help="Stream used by --mode serve")
+    parser.add_argument(
+        "--continue-preview-interval",
+        type=float,
+        default=DEFAULT_CONTINUE_PREVIEW_INTERVAL_SECONDS,
+        help="Experimental: send LongTimePreview/continuePreview every N seconds during serve mode",
     )
     parser.add_argument("--no-html", dest="html", action="store_false", help="Only write CSV")
     parser.set_defaults(html=True)
@@ -195,17 +266,16 @@ def run_battery_runtime_test(
     sample_interval: float,
     battery_keepalive_interval: float,
     reconnect_window: float,
+    max_duration: float,
+    motion_poll_interval: float,
     stream: str,
-    serve_host: str,
-    serve_port: int,
-    serve_internal_client: bool,
-    single_connection_serve: bool,
+    continue_preview_interval: float,
     write_html: bool,
 ) -> dict[str, str | Path]:
     if stop_percent >= start_percent:
         raise ValueError("--stop-percent must be lower than --start-percent")
-    if mode == "serve" and single_connection_serve:
-        return run_single_connection_stream_test(
+    if mode == "motion":
+        return run_motion_test(
             camera_config,
             output_dir=output_dir,
             state_path=state_path,
@@ -216,132 +286,30 @@ def run_battery_runtime_test(
             sample_interval=sample_interval,
             battery_keepalive_interval=battery_keepalive_interval,
             reconnect_window=reconnect_window,
+            max_duration=max_duration,
+            motion_poll_interval=motion_poll_interval,
+            write_html=write_html,
+        )
+    if mode == "serve":
+        return run_stream_test(
+            camera_config,
+            output_dir=output_dir,
+            state_path=state_path,
+            debug=debug,
+            start_percent=start_percent,
+            stop_percent=stop_percent,
+            wait_interval=wait_interval,
+            sample_interval=sample_interval,
+            battery_keepalive_interval=battery_keepalive_interval,
+            reconnect_window=reconnect_window,
+            max_duration=max_duration,
             stream=stream,
+            continue_preview_interval=continue_preview_interval,
             write_html=write_html,
         )
 
-    stop_event = threading.Event()
-    mode_status = ModeStatus()
-    worker = threading.Thread(
-        target=_run_mode_worker,
-        args=(
-            camera_config,
-            mode,
-            stream,
-            serve_host,
-            serve_port,
-            serve_internal_client,
-            state_path,
-            debug,
-            stop_event,
-            mode_status,
-            reconnect_window,
-        ),
-        name=f"pyneolink-{mode}-battery-runtime",
-        daemon=True,
-    )
-    worker.start()
 
-    battery_camera = Camera(camera_config, state_path=state_path, debug=debug)
-    started_at: float | None = None
-    start_wall: datetime | None = None
-    csv_path: Path | None = None
-    csv_writer: CsvSampleWriter | None = None
-    result = "incomplete"
-    note = ""
-
-    try:
-        battery_camera.__enter__()
-        print(f"Waiting until battery level is <= {start_percent}%...")
-        while True:
-            _raise_if_mode_failed(mode_status)
-            info = _read_battery_with_recovery(battery_camera, reconnect_window=reconnect_window)
-            level = _battery_level(info)
-            print_battery("waiting", info)
-            if level is not None and level <= start_percent:
-                started_at = time.monotonic()
-                start_wall = datetime.now().astimezone()
-                csv_path = output_dir / result_filename(camera_config, mode, start_wall, ".csv")
-                csv_writer = CsvSampleWriter(csv_path)
-                break
-            _sleep_with_battery_keepalive(
-                wait_interval,
-                battery_camera,
-                stop_event,
-                mode_status,
-                keepalive_interval=battery_keepalive_interval,
-            )
-
-        print(f"Recording samples every {sample_interval:g}s until battery level is <= {stop_percent}%...")
-        while True:
-            _raise_if_mode_failed(mode_status)
-            info = _read_battery_with_recovery(battery_camera, reconnect_window=reconnect_window)
-            level = _battery_level(info)
-            row = sample_row(
-                info,
-                mode=mode,
-                mode_status=mode_status.snapshot(),
-                started_at=started_at,
-                note=note,
-            )
-            if csv_writer is None:
-                raise RuntimeError("CSV writer was not initialized")
-            csv_writer.write(row)
-            print_battery("sample", info, elapsed=row["elapsed_hms"])
-            if level is not None and level <= stop_percent:
-                result = "completed"
-                break
-            _sleep_with_battery_keepalive(
-                sample_interval,
-                battery_camera,
-                stop_event,
-                mode_status,
-                keepalive_interval=battery_keepalive_interval,
-            )
-    except KeyboardInterrupt:
-        note = "Interrupted by user"
-        result = "interrupted"
-        print("Interrupted; saving collected samples.")
-    except Exception as exc:
-        note = f"{type(exc).__name__}: {exc}"
-        result = "incomplete"
-        print(f"Test stopped incomplete: {note}")
-    finally:
-        stop_event.set()
-        try:
-            battery_camera.close()
-        finally:
-            worker.join(timeout=5.0)
-        if csv_writer is not None:
-            csv_writer.close()
-
-    if csv_path is None:
-        start_wall = datetime.now().astimezone()
-        csv_path = output_dir / result_filename(camera_config, mode, start_wall, ".csv")
-        write_csv_header(csv_path)
-    if note:
-        append_note_row(csv_path, mode=mode, note=note)
-
-    html_path: Path | None = None
-    if write_html:
-        html_path = csv_path.with_suffix(".html")
-        write_html_report_from_csv(
-            html_path,
-            camera_config=camera_config,
-            mode=mode,
-            result=result,
-            csv_path=csv_path,
-            start_percent=start_percent,
-            stop_percent=stop_percent,
-            sample_interval=sample_interval,
-            battery_keepalive_interval=battery_keepalive_interval,
-            note=note,
-        )
-
-    return {"result": result, "csv_path": csv_path, "html_path": html_path or ""}
-
-
-def run_single_connection_stream_test(
+def run_motion_test(
     camera_config: CameraConfig,
     *,
     output_dir: Path,
@@ -353,7 +321,131 @@ def run_single_connection_stream_test(
     sample_interval: float,
     battery_keepalive_interval: float,
     reconnect_window: float,
+    max_duration: float,
+    motion_poll_interval: float,
+    write_html: bool,
+) -> dict[str, str | Path]:
+    status = ModeStatus()
+    result = "incomplete"
+    note = ""
+    csv_path: Path | None = None
+    csv_writer: CsvSampleWriter | None = None
+    started_at: float | None = None
+    poll_interval = max(0.1, motion_poll_interval)
+    camera = Camera(camera_config, state_path=state_path, debug=debug)
+
+    try:
+        print(f"{now_text()} motion: using one Camera connection for motion and battery")
+        with camera:
+            with camera.motion().watch(keepalive_interval=min(0.75, poll_interval)) as motion:
+                status.running("motion-status-poll")
+                status.update_socket_stats(camera)
+                print(f"{now_text()} motion: polling status every {poll_interval:g}s")
+                print(f"Waiting until battery level is <= {start_percent}%...")
+                while True:
+                    info = _read_battery_with_recovery(camera, reconnect_window=reconnect_window)
+                    level = _battery_level(info)
+                    status.update_socket_stats(camera)
+                    print_battery("waiting", info)
+                    if level is not None and level <= start_percent:
+                        started_at = time.monotonic()
+                        csv_path = output_dir / result_filename(
+                            camera_config,
+                            "motion",
+                            datetime.now().astimezone(),
+                            ".csv",
+                        )
+                        csv_writer = CsvSampleWriter(csv_path)
+                        break
+                    _poll_motion_for(
+                        motion,
+                        seconds=wait_interval,
+                        poll_interval=poll_interval,
+                        status=status,
+                        camera=camera,
+                        battery_keepalive_interval=battery_keepalive_interval,
+                    )
+
+                print(f"Recording samples every {sample_interval:g}s until battery level is <= {stop_percent}%...")
+                while True:
+                    info = _read_battery_with_recovery(camera, reconnect_window=reconnect_window)
+                    level = _battery_level(info)
+                    status.update_socket_stats(camera)
+                    if started_at is not None and max_duration > 0 and time.monotonic() - started_at >= max_duration:
+                        result = "completed"
+                        note = f"Completed requested max duration {max_duration:g}s"
+                        break
+                    if started_at is None or csv_writer is None:
+                        raise RuntimeError("CSV writer was not initialized")
+                    row = sample_row(info, mode="motion", mode_status=status.snapshot(), started_at=started_at)
+                    csv_writer.write(row)
+                    print_battery("sample", info, elapsed=row["elapsed_hms"])
+                    if level is not None and level <= stop_percent:
+                        result = "completed"
+                        break
+                    _poll_motion_for(
+                        motion,
+                        seconds=sample_interval,
+                        poll_interval=poll_interval,
+                        status=status,
+                        camera=camera,
+                        battery_keepalive_interval=battery_keepalive_interval,
+                    )
+    except KeyboardInterrupt:
+        note = "Interrupted by user"
+        result = "interrupted"
+        print("Interrupted; saving collected samples.")
+    except Exception as exc:
+        note = f"{type(exc).__name__}: {exc}"
+        result = "incomplete"
+        print(f"Test stopped incomplete: {note}")
+    finally:
+        if csv_writer is not None:
+            csv_writer.close()
+        try:
+            camera.close()
+        except Exception:
+            pass
+
+    if csv_path is None:
+        csv_path = output_dir / result_filename(camera_config, "motion", datetime.now().astimezone(), ".csv")
+        write_csv_header(csv_path)
+    if note:
+        append_note_row(csv_path, mode="motion", note=note)
+
+    html_path: Path | None = None
+    if write_html:
+        html_path = csv_path.with_suffix(".html")
+        write_html_report_from_csv(
+            html_path,
+            camera_config=camera_config,
+            mode="motion",
+            result=result,
+            csv_path=csv_path,
+            start_percent=start_percent,
+            stop_percent=stop_percent,
+            sample_interval=sample_interval,
+            battery_keepalive_interval=battery_keepalive_interval,
+            note=note,
+        )
+    return {"result": result, "csv_path": csv_path, "html_path": html_path or ""}
+
+
+def run_stream_test(
+    camera_config: CameraConfig,
+    *,
+    output_dir: Path,
+    state_path: str | Path | None,
+    debug: bool,
+    start_percent: int,
+    stop_percent: int,
+    wait_interval: float,
+    sample_interval: float,
+    battery_keepalive_interval: float,
+    reconnect_window: float,
+    max_duration: float,
     stream: str,
+    continue_preview_interval: float,
     write_html: bool,
 ) -> dict[str, str | Path]:
     status = ModeStatus()
@@ -363,23 +455,33 @@ def run_single_connection_stream_test(
     csv_writer: CsvSampleWriter | None = None
     started_at: float | None = None
     camera = Camera(camera_config, state_path=state_path, debug=debug)
+    continue_preview = ContinuePreviewTimer(continue_preview_interval)
 
     try:
         print(f"{now_text()} serve: using one Camera connection for stream and battery")
-        stream_msg_num = _open_single_stream_with_recovery(
+        stream_msg_num = _open_stream_with_recovery(
             camera,
             stream=stream,
             status=status,
             reconnect_window=reconnect_window,
         )
-        status.running(f"stream-single-{stream}")
+        status.running(f"stream-{stream}")
 
         print(f"Waiting until battery level is <= {start_percent}%...")
         while True:
             try:
+                connection_id = _connection_identity(camera)
                 info = camera.battery().info(mode="online")
-            except (TimeoutError, EOFError, OSError) as exc:
-                stream_msg_num = _recover_single_stream(
+                stream_msg_num = _restart_stream_after_implicit_reconnect(
+                    camera,
+                    previous_connection_id=connection_id,
+                    stream=stream,
+                    status=status,
+                    fallback_msg_num=stream_msg_num,
+                )
+                _send_continue_preview_if_due(camera, stream, continue_preview)
+            except RECOVERABLE_CONNECTION_ERRORS as exc:
+                stream_msg_num = _recover_stream(
                     camera,
                     stream=stream,
                     status=status,
@@ -401,14 +503,24 @@ def run_single_connection_stream_test(
                 status=status,
                 stream=stream,
                 reconnect_window=reconnect_window,
+                continue_preview=continue_preview,
             )
 
         print(f"Recording samples every {sample_interval:g}s until battery level is <= {stop_percent}%...")
         while True:
             try:
+                connection_id = _connection_identity(camera)
                 info = camera.battery().info(mode="online")
-            except (TimeoutError, EOFError, OSError) as exc:
-                stream_msg_num = _recover_single_stream(
+                stream_msg_num = _restart_stream_after_implicit_reconnect(
+                    camera,
+                    previous_connection_id=connection_id,
+                    stream=stream,
+                    status=status,
+                    fallback_msg_num=stream_msg_num,
+                )
+                _send_continue_preview_if_due(camera, stream, continue_preview)
+            except RECOVERABLE_CONNECTION_ERRORS as exc:
+                stream_msg_num = _recover_stream(
                     camera,
                     stream=stream,
                     status=status,
@@ -417,8 +529,13 @@ def run_single_connection_stream_test(
                 )
                 continue
             level = _battery_level(info)
+            if started_at is not None and max_duration > 0 and time.monotonic() - started_at >= max_duration:
+                result = "completed"
+                note = f"Completed requested max duration {max_duration:g}s"
+                break
             if started_at is None or csv_writer is None:
                 raise RuntimeError("CSV writer was not initialized")
+            status.update_socket_stats(camera)
             row = sample_row(info, mode="serve", mode_status=status.snapshot(), started_at=started_at, note=note)
             csv_writer.write(row)
             print_battery("sample", info, elapsed=row["elapsed_hms"])
@@ -432,6 +549,7 @@ def run_single_connection_stream_test(
                 status=status,
                 stream=stream,
                 reconnect_window=reconnect_window,
+                continue_preview=continue_preview,
             )
     except KeyboardInterrupt:
         note = "Interrupted by user"
@@ -473,7 +591,7 @@ def run_single_connection_stream_test(
     return {"result": result, "csv_path": csv_path, "html_path": html_path or ""}
 
 
-def _open_single_stream_with_recovery(
+def _open_stream_with_recovery(
     camera: Camera,
     *,
     stream: str,
@@ -490,7 +608,7 @@ def _open_single_stream_with_recovery(
             msg_num = camera.start_stream(stream)
             print(f"{now_text()} stream: started {stream}")
             return msg_num
-        except (TimeoutError, EOFError, OSError) as exc:
+        except RECOVERABLE_CONNECTION_ERRORS as exc:
             status.recovering(exc)
             camera.close()
             if time.monotonic() - started >= reconnect_window:
@@ -508,27 +626,41 @@ def _pump_stream_for(
     status: ModeStatus,
     stream: str,
     reconnect_window: float,
+    continue_preview: ContinuePreviewTimer | None = None,
 ) -> int:
     deadline = time.monotonic() + max(0.0, seconds)
     next_keepalive_at = time.monotonic() + 0.75
     current_msg_num = msg_num
+    last_payload_at = time.monotonic()
+    camera.ensure_connected()
     while time.monotonic() < deadline:
         try:
-            now = time.monotonic()
-            if now >= next_keepalive_at:
-                camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
-                next_keepalive_at = now + 0.75
-            timeout = min(1.0, max(0.0, deadline - time.monotonic()))
-            if timeout <= 0:
-                return current_msg_num
-            reply = camera._recv(timeout=timeout)
-            if reply.header.msg_id == MSG.VIDEO and reply.header.msg_num == current_msg_num and reply.payload:
-                with status.lock:
-                    status.payloads_seen += 1
-        except TimeoutError:
-            continue
-        except (EOFError, OSError) as exc:
-            current_msg_num = _recover_single_stream(
+            with camera.subscribe_messages(MSG.VIDEO, current_msg_num, maxsize=200) as replies:
+                while time.monotonic() < deadline:
+                    if not camera.dispatcher_active:
+                        raise TimeoutError("stream dispatcher stopped")
+                    now = time.monotonic()
+                    _send_continue_preview_if_due(camera, stream, continue_preview)
+                    if now >= next_keepalive_at:
+                        camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
+                        next_keepalive_at = now + 0.75
+                    timeout = min(1.0, max(0.0, deadline - time.monotonic()))
+                    if timeout <= 0:
+                        return current_msg_num
+                    try:
+                        message = replies.recv(timeout=timeout)
+                    except TimeoutError:
+                        _raise_if_stream_stalled(last_payload_at)
+                        continue
+                    if message.payload:
+                        with status.lock:
+                            status.payloads_seen += 1
+                        last_payload_at = time.monotonic()
+                        status.update_socket_stats(camera)
+                    else:
+                        _raise_if_stream_stalled(last_payload_at)
+        except RECOVERABLE_CONNECTION_ERRORS as exc:
+            current_msg_num = _recover_stream(
                 camera,
                 stream=stream,
                 status=status,
@@ -536,10 +668,38 @@ def _pump_stream_for(
                 exc=exc,
             )
             next_keepalive_at = time.monotonic() + 0.75
+            last_payload_at = time.monotonic()
     return current_msg_num
 
 
-def _recover_single_stream(
+def _send_continue_preview_if_due(
+    camera: Camera,
+    stream: str,
+    timer: ContinuePreviewTimer | None,
+) -> None:
+    if timer is None or not timer.due():
+        return
+    try:
+        reply = camera.continue_preview(
+            stream,
+            retry_on_timeout=False,
+        )
+    except TimeoutError as exc:
+        print(f"{now_text()} preview: continue timed out with {exc!r}")
+    except ProtocolError as exc:
+        print(f"{now_text()} preview: continue failed with {exc!r}")
+    else:
+        print(f"{now_text()} preview: continue sent response={reply.header.response_code}")
+    finally:
+        timer.schedule_next()
+
+
+def _raise_if_stream_stalled(last_payload_at: float) -> None:
+    if time.monotonic() - last_payload_at >= DEFAULT_STREAM_STALL_SECONDS:
+        raise TimeoutError("stream payload stalled")
+
+
+def _recover_stream(
     camera: Camera,
     *,
     stream: str,
@@ -557,105 +717,75 @@ def _recover_single_stream(
         try:
             camera.reconnect()
             msg_num = camera.start_stream(stream)
-            status.running(f"stream-single-{stream}")
+            status.running(f"stream-{stream}")
             print(f"{now_text()} stream: reconnected")
             return msg_num
-        except (TimeoutError, EOFError, OSError) as reconnect_exc:
+        except RECOVERABLE_CONNECTION_ERRORS as reconnect_exc:
             status.recovering(reconnect_exc)
             print(f"{now_text()} stream: reconnect failed with {reconnect_exc!r}")
             time.sleep(10.0)
 
 
-def _run_mode_worker(
-    camera_config: CameraConfig,
-    mode: str,
+def _restart_stream_after_implicit_reconnect(
+    camera: Camera,
+    *,
+    previous_connection_id: int | None,
     stream: str,
-    serve_host: str,
-    serve_port: int,
-    serve_internal_client: bool,
-    state_path: str | Path | None,
-    debug: bool,
-    stop_event: threading.Event,
     status: ModeStatus,
-    reconnect_window: float,
-) -> None:
-    while not stop_event.is_set():
-        try:
-            if mode == "motion":
-                _run_motion_mode(camera_config, state_path, debug, stop_event, status)
-            elif serve_internal_client:
-                _run_stream_client_mode(camera_config, stream, state_path, debug, stop_event, status)
-            else:
-                _run_http_serve_mode(
-                    camera_config,
-                    serve_host,
-                    serve_port,
-                    state_path,
-                    debug,
-                    stop_event,
-                    status,
-                )
-        except Exception as exc:
-            status.recovering(exc)
-            failure_started = status.snapshot().get("first_failure_at")
-            if failure_started is not None and time.monotonic() - float(failure_started) >= reconnect_window:
-                status.mark_failed()
-                stop_event.set()
-                return
-            time.sleep(min(10.0, max(1.0, reconnect_window)))
+    fallback_msg_num: int,
+) -> int:
+    current_connection_id = _connection_identity(camera)
+    if current_connection_id == previous_connection_id:
+        return fallback_msg_num
+    status.recovering(RuntimeError("camera session changed during battery request; restarting stream"))
+    msg_num = camera.start_stream(stream)
+    status.running(f"stream-{stream}")
+    status.update_socket_stats(camera)
+    print(f"{now_text()} stream: restarted {stream} after battery reconnect")
+    return msg_num
 
 
-def _run_motion_mode(
-    camera_config: CameraConfig,
-    state_path: str | Path | None,
-    debug: bool,
-    stop_event: threading.Event,
+def _connection_identity(camera: Camera) -> int | None:
+    return None if camera.sock is None else id(camera.sock)
+
+
+def _poll_motion_for(
+    motion: Any,
+    *,
+    seconds: float,
+    poll_interval: float,
     status: ModeStatus,
+    camera: Camera,
+    battery_keepalive_interval: float | None = None,
 ) -> None:
-    with Camera(camera_config, state_path=state_path, debug=debug) as camera:
-        with camera.motion().watch() as events:
-            status.running("motion-watch")
-            for event in events:
-                with status.lock:
-                    status.last_event = f"{event.received_at.isoformat()} {event}"
-                if stop_event.is_set():
-                    return
-
-
-def _run_http_serve_mode(
-    camera_config: CameraConfig,
-    serve_host: str,
-    serve_port: int,
-    state_path: str | Path | None,
-    debug: bool,
-    stop_event: threading.Event,
-    status: ModeStatus,
-) -> None:
-    server_config = Config(bind=serve_host, bind_port=serve_port, cameras=[camera_config])
-    with StreamServer(server_config, state_path=None if state_path is None else str(state_path), debug=debug):
-        status.running("serve-listening")
-        print(f"{now_text()} serve: waiting for an external stream client")
-        while not stop_event.is_set():
-            time.sleep(1.0)
-
-
-def _run_stream_client_mode(
-    camera_config: CameraConfig,
-    stream: str,
-    state_path: str | Path | None,
-    debug: bool,
-    stop_event: threading.Event,
-    status: ModeStatus,
-) -> None:
-    with Camera(camera_config, state_path=state_path, debug=debug) as camera:
-        status.running(f"stream-client-{stream}")
-        print(f"{now_text()} serve: reading {stream} through an isolated Camera connection")
-        for payload in camera.read_stream_payloads(stream):
-            if payload:
-                with status.lock:
-                    status.payloads_seen += 1
-            if stop_event.is_set():
-                return
+    deadline = time.monotonic() + max(0.0, seconds)
+    next_poll_at = time.monotonic()
+    next_battery_keepalive_at = (
+        time.monotonic() + max(1.0, battery_keepalive_interval) if battery_keepalive_interval else float("inf")
+    )
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if battery_keepalive_interval and now >= next_battery_keepalive_at:
+            try:
+                keepalive_result = camera.keepalive(timeout=0.5)
+                print(f"{now_text()} battery: keepalive {keepalive_result}")
+            except RECOVERABLE_CONNECTION_ERRORS as exc:
+                print(f"{now_text()} battery: keepalive failed with {exc!r}")
+            next_battery_keepalive_at = time.monotonic() + max(1.0, battery_keepalive_interval)
+        if now < next_poll_at:
+            sleep_until = min(next_poll_at, next_battery_keepalive_at)
+            time.sleep(min(max(0.0, sleep_until - now), max(0.0, deadline - now)))
+            continue
+        timeout = min(0.5, max(0.0, deadline - time.monotonic()))
+        event, known = motion.status(timeout=timeout, close=False)
+        event_dict = event.to_dict(known=known)
+        counts = status.record_motion_status(event_dict)
+        print(
+            f"{now_text()} motion: status #{status.snapshot()['payloads_seen']} "
+            f"{_motion_event_label(event_dict)} counts={_motion_counts_label(counts)}"
+        )
+        status.update_socket_stats(camera)
+        next_poll_at += poll_interval
 
 
 def _read_battery_with_recovery(camera: Camera, *, reconnect_window: float) -> dict[str, Any]:
@@ -663,59 +793,16 @@ def _read_battery_with_recovery(camera: Camera, *, reconnect_window: float) -> d
     while True:
         try:
             return camera.battery().info(mode="online")
-        except (TimeoutError, EOFError, OSError) as exc:
+        except RECOVERABLE_CONNECTION_ERRORS as exc:
             print(f"{now_text()} battery: reconnecting after {exc!r}")
             if time.monotonic() - started >= reconnect_window:
                 raise
-            try:
-                camera.reconnect()
-            except (TimeoutError, EOFError, OSError) as reconnect_exc:
-                print(f"{now_text()} battery: reconnect failed with {reconnect_exc!r}")
-                pass
+            if camera.sock is not None:
+                try:
+                    camera.reconnect()
+                except RECOVERABLE_CONNECTION_ERRORS as reconnect_exc:
+                    print(f"{now_text()} battery: reconnect failed with {reconnect_exc!r}")
             time.sleep(10.0)
-
-
-def _sleep_with_status(seconds: float, stop_event: threading.Event, status: ModeStatus) -> None:
-    deadline = time.monotonic() + max(0.0, seconds)
-    while not stop_event.is_set():
-        _raise_if_mode_failed(status)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(1.0, remaining))
-
-
-def _sleep_with_battery_keepalive(
-    seconds: float,
-    camera: Camera,
-    stop_event: threading.Event,
-    status: ModeStatus,
-    *,
-    keepalive_interval: float,
-) -> None:
-    deadline = time.monotonic() + max(0.0, seconds)
-    next_keepalive_at = time.monotonic() + max(1.0, keepalive_interval)
-    while not stop_event.is_set():
-        _raise_if_mode_failed(status)
-        now = time.monotonic()
-        remaining = deadline - now
-        if remaining <= 0:
-            return
-        if now >= next_keepalive_at:
-            try:
-                keepalive_result = camera.keepalive(timeout=0.5)
-                print(f"{now_text()} battery: keepalive {keepalive_result}")
-            except (TimeoutError, EOFError, OSError) as exc:
-                print(f"{now_text()} battery: keepalive failed with {exc!r}")
-            next_keepalive_at = time.monotonic() + max(1.0, keepalive_interval)
-        time.sleep(min(1.0, remaining))
-
-
-def _raise_if_mode_failed(status: ModeStatus) -> None:
-    snapshot = status.snapshot()
-    if snapshot["failed"]:
-        detail = snapshot["last_error"] or "mode connection did not recover"
-        raise RuntimeError(detail)
 
 
 def sample_row(
@@ -729,6 +816,7 @@ def sample_row(
     elapsed = max(0.0, time.monotonic() - started_at)
     level = _battery_level(info)
     is_charging = info.get("is_charging")
+    event_counts = mode_status.get("event_counts") or {}
     return {
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "elapsed_seconds": round(elapsed, 3),
@@ -741,6 +829,14 @@ def sample_row(
         "mode": mode,
         "mode_status": mode_status["state"],
         "payloads_seen": mode_status["payloads_seen"],
+        "mode_last_event": mode_status["last_event"] or "",
+        "motion_none": event_counts.get("none", 0),
+        "motion_motion": event_counts.get("motion", 0),
+        "motion_human": event_counts.get("human", 0),
+        "motion_vehicle": event_counts.get("vehicle", 0),
+        "motion_unknown": event_counts.get("unknown", 0),
+        "motion_unknown_status": event_counts.get("unknown_status", 0),
+        **(mode_status.get("socket_stats") or empty_socket_debug_snapshot()),
         "mode_last_error": mode_status["last_error"] or "",
         "note": note,
     }
@@ -766,6 +862,14 @@ def append_note_row(path: Path, *, mode: str, note: str) -> None:
         "mode": mode,
         "mode_status": "stopped",
         "payloads_seen": "",
+        "mode_last_event": "",
+        "motion_none": "",
+        "motion_motion": "",
+        "motion_human": "",
+        "motion_vehicle": "",
+        "motion_unknown": "",
+        "motion_unknown_status": "",
+        **empty_socket_debug_snapshot(),
         "mode_last_error": "",
         "note": note,
     }
@@ -918,6 +1022,26 @@ def _html_table_row(row: dict[str, Any]) -> str:
     return f"<tr>{cells}</tr>"
 
 
+def _motion_event_label(event: dict[str, Any]) -> str:
+    known = "known" if event.get("known") else "unknown"
+    return (
+        f"{event.get('received_at', '')} "
+        f"type={event.get('type')} active={event.get('active')} "
+        f"status={event.get('status')} ai={event.get('ai_type')} {known}"
+    ).strip()
+
+
+def _motion_counts_label(counts: dict[str, int]) -> str:
+    return (
+        f"none={counts.get('none', 0)} "
+        f"motion={counts.get('motion', 0)} "
+        f"human={counts.get('human', 0)} "
+        f"vehicle={counts.get('vehicle', 0)} "
+        f"unknown={counts.get('unknown', 0)} "
+        f"unknown_status={counts.get('unknown_status', 0)}"
+    )
+
+
 def result_filename(camera_config: CameraConfig, mode: str, when: datetime, suffix: str) -> str:
     identity = camera_config.uid or camera_config.name
     timestamp = when.strftime("%Y%m%d-%H%M%S")
@@ -958,6 +1082,34 @@ def print_battery(prefix: str, info: dict[str, Any], *, elapsed: str | None = No
 def _battery_level(info: dict[str, Any]) -> int | None:
     level = info.get("level_percent")
     return level if isinstance(level, int) else None
+
+
+def socket_debug_snapshot(camera: Camera) -> dict[str, Any]:
+    sock = getattr(camera, "sock", None)
+    if hasattr(sock, "debug_snapshot"):
+        return sock.debug_snapshot()
+    return empty_socket_debug_snapshot()
+
+
+def empty_socket_debug_snapshot() -> dict[str, Any]:
+    return {
+        "udp_next_recv_id": "",
+        "udp_last_packet_id": "",
+        "udp_max_packet_id": "",
+        "udp_pending_chunks": "",
+        "udp_pending_gaps": "",
+        "udp_buffered_bytes": "",
+        "udp_data_packets": "",
+        "udp_data_bytes": "",
+        "udp_duplicates": "",
+        "udp_ignored": "",
+        "udp_unknown": "",
+        "udp_acks_sent": "",
+        "udp_acks_received": "",
+        "udp_heartbeats_sent": "",
+        "udp_resend_packets": "",
+        "udp_seconds_since_data": "",
+    }
 
 
 def now_text() -> str:

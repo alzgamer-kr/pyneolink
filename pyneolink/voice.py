@@ -20,7 +20,7 @@ from .internal.voice import (
 
 
 class Voice:
-    """Two-way talk, audio playback, microphone, tone, and siren helper."""
+    """Two-way audio helper using the camera's shared dispatcher session."""
 
     def __init__(self, camera) -> None:
         """Create a voice/talk helper.
@@ -31,6 +31,7 @@ class Voice:
         self._lease = None
         self._started = False
         self._last_talk_msg_num: int | None = None
+        self._talk_replies = None
 
     def __enter__(self) -> "Voice":
         self._lease = self.camera.require_online()
@@ -163,14 +164,22 @@ class Voice:
             return
         try:
             self._drain_talk_replies()
-            msg_num = self.camera.send(
-                MSG.TALKRESET, extension=payloads.extension.format(channel_id=self.camera.config.channel_id)
-            )
-            if wait:
-                self._wait_for_stop_reply(msg_num)
+            self.camera.ensure_connected()
+            msg_num = self.camera._next_msg()
+            with self.camera.subscribe_messages(MSG.TALKRESET, msg_num, maxsize=4) as replies:
+                self.camera.send(
+                    MSG.TALKRESET,
+                    extension=payloads.extension.format(channel_id=self.camera.config.channel_id),
+                    msg_num=msg_num,
+                )
+                if wait:
+                    replies.recv(timeout=1.0)
         except Exception:
             pass
         finally:
+            if self._talk_replies is not None:
+                self._talk_replies.close()
+                self._talk_replies = None
             self._started = False
             self._last_talk_msg_num = None
 
@@ -204,6 +213,9 @@ class Voice:
     def _send_blocks(self, blocks: Iterable[bytes], config: TalkConfig, *, wait_ack: bool = False) -> None:
         msg_num = self.camera._next_msg()
         self._last_talk_msg_num = msg_num
+        if self._talk_replies is not None:
+            self._talk_replies.close()
+        self._talk_replies = self.camera.subscribe_messages(MSG.TALK, msg_num, maxsize=256)
         next_play_end = time.monotonic()
         sent = 0
         first_sent_at: float | None = None
@@ -219,7 +231,7 @@ class Voice:
             )
             response = "skipped"
             if wait_ack:
-                reply = self.camera._recv_matching(MSG.TALK, msg_num)
+                reply = self._talk_replies.recv(timeout=self.camera.timeout)
                 response = str(reply.header.response_code)
                 if reply.header.response_code not in (0, 200):
                     raise ProtocolError(msg.Error.Response.format(response_code=reply.header.response_code))
@@ -244,23 +256,12 @@ class Voice:
         drained = 0
         while time.monotonic() < deadline:
             try:
-                reply = self.camera._recv(timeout=0.02)
+                self._talk_replies.recv(timeout=0.02)
             except TimeoutError:
                 break
-            if reply.header.msg_id == MSG.TALK and reply.header.msg_num == self._last_talk_msg_num:
-                drained += 1
+            drained += 1
         if drained:
             self._debug(f"drained {drained} old talk replies before stop")
-
-    def _wait_for_stop_reply(self, msg_num: int) -> None:
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            try:
-                reply = self.camera._recv(timeout=0.1)
-            except TimeoutError:
-                return
-            if reply.header.msg_id == MSG.TALKRESET and reply.header.msg_num == msg_num:
-                return
 
     def _siren_command(self) -> None:
         payload = payloads.audio_play_info.format(

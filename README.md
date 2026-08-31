@@ -7,7 +7,7 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.4.3` alpha.
+Version: `0.4.4` alpha.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -37,6 +37,7 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 - HLS timeshift viewing with an in-memory sliding buffer
 - Concurrent SDK stream, motion, battery, and command handling inside one
   `with Camera(...)` session
+- Automatic dispatcher and live-stream recovery when a camera session closes
 - Motion status and motion event watch mode
 - Two-way voice/talk from microphone, audio file, or generated test tone
 - Camera siren trigger
@@ -53,6 +54,8 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
   live stream on the client machine; it does not start or stop the camera's own
   SD-card recording schedule.
 - SD-card `remove()` and `format()` exist, but are intentionally guarded.
+- Some tested battery cameras end a continuous stream near 30 minutes. The SDK
+  reconnects and restarts the stream, which can cause a short playback gap.
 - Arbitrary directional PTZ movement, image settings, alarm schedules, floodlight settings, and Web UI are not implemented yet.
 
 ## Install
@@ -60,13 +63,13 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 From PyPI:
 
 ```powershell
-python -m pip install pyneolink==0.4.3
+python -m pip install pyneolink==0.4.4
 ```
 
 With microphone voice input support:
 
 ```powershell
-python -m pip install "pyneolink[voice]==0.4.3"
+python -m pip install "pyneolink[voice]==0.4.4"
 ```
 
 For local development from a checkout:
@@ -144,7 +147,7 @@ python pyneolink/cli.py battery --camera "Home-Front" --watch --interval 60 --mo
 Snapshots and local recording:
 
 ```powershell
-python pyneolink/cli.py snapshot --camera "Home-Front" --out snapshots/ --stream-type main
+python pyneolink/cli.py snapshot --camera "Home-Front" --out snapshots/
 python pyneolink/cli.py record --camera "Home-Front" --out recordings/ --duration 30 --quality high
 python pyneolink/cli.py record --camera "Home-Front" --out recordings/live.ts --quality low
 ```
@@ -294,8 +297,8 @@ Snapshot:
 from pyneolink import Camera
 
 with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
-    camera.snapshot(out="snapshots", stream_type="main")
-    image = camera.snapshot(stream_type="sub")
+    camera.snapshot(out="snapshots")
+    image = camera.snapshot()
 ```
 
 Local recording from the SDK:

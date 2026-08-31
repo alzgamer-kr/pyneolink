@@ -19,7 +19,7 @@ class PtzPreset:
 
 
 class Ptz:
-    """Read and recall stored PTZ presets."""
+    """Read and recall PTZ presets through the camera's shared dispatcher."""
 
     def __init__(self, camera, *, channel_id: int | None = None) -> None:
         """Create a stored-preset helper for one camera channel."""

@@ -1,8 +1,54 @@
 # Changelog
 
-## Unreleased
+## 0.4.4
 
-No changes yet.
+Single-session streaming and recovery patch.
+
+### Added
+
+- Added dispatcher-managed request contexts for regular commands, multipart
+  replies, live streams, motion events, snapshots, voice, and SD-card access.
+- Added experimental `Camera.continue_preview()` support for the Reolink
+  `LongTimePreview` command and runtime diagnostics for session continuation.
+- Expanded the battery/runtime examples with per-second motion polling, stream
+  payload and UDP statistics, maximum-duration runs, and reconnect reporting.
+
+### Changed
+
+- Use one managed transport session per `Camera`; concurrent helpers now share
+  its dispatcher instead of opening isolated camera connections.
+- Move stream recording and HTTP serving onto dispatcher-managed payload
+  readers so status commands can run while video is active.
+- Simplified snapshot capture to one standard image request because the tested
+  snapshot stream types return the same image quality.
+- Removed the undocumented `raw-stream` CLI command. Use `record` for a local
+  MPEG-TS file or `serve` for live playback; low-level stream payload access
+  remains available through the SDK.
+- Updated public class and method annotations and the physical-test examples
+  for the managed-session API.
+
+### Fixed
+
+- Route replies by message ID, message number, and scoped multipart matchers so
+  concurrent stream, motion, battery, and command operations cannot consume
+  each other's packets.
+- Restart the dispatcher and active stream after a stale or closed camera
+  session reconnects, including the observed battery-camera stream cutoff near
+  30 minutes.
+- Keep UDP acknowledgements and heartbeats running in the background while
+  media packets arrive continuously, without clearing unrelated pending data.
+- Detect stalled media separately from ordinary receive timeouts and recover
+  the stream through a fresh P2P registration when needed.
+- Give the MPEG-TS recorder test enough time to start on slower Python 3.11
+  Windows runners, removing a timing-dependent empty-file failure.
+
+### Notes
+
+- A real-camera high-stream test completed 35 minutes with battery polling,
+  detected the session cutoff at 30 minutes, reconnected in about six seconds,
+  and completed normally.
+- `LongTimePreview` does not bypass the observed camera-side 30-minute stream
+  limit; automatic reconnect remains the recovery mechanism.
 
 ---
 

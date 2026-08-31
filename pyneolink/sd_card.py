@@ -387,7 +387,7 @@ class _PreviewHttpHandler(BaseHTTPRequestHandler):
 
 
 class SdCard:
-    """SD-card helper for listing, filtering, and downloading recordings."""
+    """SD-card operations routed through the owning camera's dispatcher."""
 
     def __init__(self, camera: Camera) -> None:
         """Create an SD-card helper.
@@ -836,10 +836,7 @@ class SdCard:
             if query.msg_class is not None
             else (MSG_CLASS.FILE_DOWNLOAD if not replay_mode else MSG_CLASS.MODERN)
         )
-        msg_num = self.camera.send(
-            query.msg_id, query.payload, msg_class=msg_class, channel_id=query.channel_id, msg_num=query.msg_num
-        )
-        accepted_msg_nums = {msg_num}
+        accepted_msg_nums = {query.msg_num} if query.msg_num is not None else set()
         chunks = 0
         written = 0
         effective_expected_size = expected_size
@@ -854,12 +851,34 @@ class SdCard:
         next_progress_at = 0
         progress_step = 512 * 1024
         next_keepalive_at = monotonic_clock.monotonic()
-        recv_options = {"binary_playback_331": True} if playback_mode else {}
-        with output_path.open("wb") as fh:
+
+        def matches_download(message, sent_msg_num: int) -> bool:
+            accepted_msg_nums.add(sent_msg_num)
+            return _is_download_message(
+                message,
+                query.msg_id,
+                accepted_msg_nums,
+                written > 0,
+                allow_playback_331=playback_mode,
+            )
+
+        with (
+            self.camera.request_messages(
+                query.msg_id,
+                query.payload,
+                msg_class=msg_class,
+                channel_id=query.channel_id,
+                msg_num=query.msg_num,
+                matcher=matches_download,
+                maxsize=1024,
+            ) as replies,
+            output_path.open("wb") as fh,
+        ):
+            accepted_msg_nums.add(replies.msg_num)
             while True:
                 next_keepalive_at = self._send_download_keepalive(next_keepalive_at)
                 try:
-                    msg = self.camera._recv(timeout=recv_timeout, **recv_options)
+                    msg = replies.recv(timeout=recv_timeout)
                 except InvalidMagicError as exc:
                     if exc.data:
                         payload = _clip_payload(exc.data, written, effective_expected_size)
@@ -953,7 +972,7 @@ class SdCard:
                         _response_detail(msg, const_msg.Error.Response.format(response_code=msg.header.response_code))
                     )
                 if b"<binaryData>1</binaryData>" in msg.extension:
-                    self.camera.binary_msg_nums.add(msg_num)
+                    self.camera.binary_msg_nums.add(replies.msg_num)
                     self.camera.binary_msg_nums.add(msg.header.msg_num)
                 xml_text = msg.xml_text
                 if xml_text and _looks_like_xml(xml_text):
@@ -962,7 +981,7 @@ class SdCard:
                         playback_size = _xml_file_size(xml_text)
                         if playback_size:
                             effective_expected_size = playback_size
-                            self.camera.binary_msg_nums.add(msg_num)
+                            self.camera.binary_msg_nums.add(replies.msg_num)
                             self.camera.binary_msg_nums.add(msg.header.msg_num)
                             continue
                     if _download_xml_done_text(xml_text):
@@ -971,7 +990,7 @@ class SdCard:
                             f"msg_nums={len(accepted_msg_nums)}, xml={_one_line_preview(xml_text)}"
                         )
                         break
-                    self.camera.binary_msg_nums.add(msg_num)
+                    self.camera.binary_msg_nums.add(replies.msg_num)
                     self.camera.binary_msg_nums.add(msg.header.msg_num)
                     continue
                 if msg.payload:
@@ -1216,36 +1235,46 @@ class SdCard:
             query = queries[index]
             index += 1
             try:
-                msg_num = self.camera.send(
+
+                def matches_preview(message, sent_msg_num: int) -> bool:
+                    return message.header.msg_num == sent_msg_num or _is_download_continuation(
+                        message,
+                        query.msg_id,
+                        False,
+                    )
+
+                with self.camera.request_messages(
                     query.msg_id,
                     query.payload,
                     extension=query.extension,
                     msg_class=query.msg_class if query.msg_class is not None else MSG_CLASS.MODERN,
                     channel_id=query.channel_id,
                     msg_num=query.msg_num,
-                )
-                reply = self.camera._recv_matching(query.msg_id, msg_num)
-                detail = _preview_response(query.label, reply)
-                if debug and _preview_should_collect_binary(detail):
-                    _merge_preview_binary_probe(
-                        detail,
-                        self._collect_preview_binary(
-                            msg_num,
-                            query.msg_id,
-                            first_payload=reply.payload,
-                            max_bytes=binary_probe_bytes,
-                            idle_timeout=binary_probe_idle,
-                        ),
-                    )
-                attempts.append(detail)
-                for handle in _preview_handles(reply.xml_text) if "/handle-" not in query.label else []:
-                    key = (query.label, handle)
-                    if key in seen_handle_queries:
-                        continue
-                    seen_handle_queries.add(key)
-                    queries.extend(_preview_handle_queries(channel, handle, query.label))
-                if detail["jpeg"] and not debug:
-                    return reply.payload
+                    matcher=matches_preview,
+                    maxsize=512,
+                ) as replies:
+                    reply = replies.recv(timeout=self.camera.timeout)
+                    detail = _preview_response(query.label, reply)
+                    if debug and _preview_should_collect_binary(detail):
+                        _merge_preview_binary_probe(
+                            detail,
+                            self._collect_preview_binary(
+                                replies,
+                                query.msg_id,
+                                first_payload=reply.payload,
+                                max_bytes=binary_probe_bytes,
+                                idle_timeout=binary_probe_idle,
+                            ),
+                        )
+                    attempts.append(detail)
+                    for handle in _preview_handles(reply.xml_text) if "/handle-" not in query.label else []:
+                        key = (query.label, handle)
+                        if key in seen_handle_queries:
+                            continue
+                        seen_handle_queries.add(key)
+                        queries.extend(_preview_handle_queries(channel, handle, query.label))
+                    if detail["jpeg"] and not debug:
+                        return reply.payload
             except Exception as exc:
                 attempts.append({"label": query.label, "error": f"{type(exc).__name__}: {exc}"})
         self.last_attempts = [_preview_attempt_text(item) for item in attempts]
@@ -1255,7 +1284,7 @@ class SdCard:
 
     def _collect_preview_binary(
         self,
-        msg_num: int,
+        replies,
         query_msg_id: int,
         *,
         first_payload: bytes,
@@ -1266,10 +1295,14 @@ class SdCard:
         deadline = monotonic_clock.monotonic() + idle_timeout
         while len(data) < max_bytes:
             try:
-                msg = self.camera._recv(timeout=min(idle_timeout, 0.5))
+                msg = replies.recv(timeout=min(idle_timeout, 0.5))
             except TimeoutError:
                 break
-            if msg.header.msg_num != msg_num and not _is_download_continuation(msg, query_msg_id, bool(data)):
+            if msg.header.msg_num != replies.msg_num and not _is_download_continuation(
+                msg,
+                query_msg_id,
+                bool(data),
+            ):
                 if monotonic_clock.monotonic() >= deadline:
                     break
                 continue
@@ -1358,20 +1391,6 @@ class SdCard:
         channel = self.camera.config.channel_id if channel_id is None else channel_id
         file_id = raw_item.get("Id") or item.get("path") or item.get("file_name") or str(file)
         query = _preview_dump_query(channel, str(file_id), raw_item)
-        msg_num = self.camera.send(
-            query.msg_id,
-            query.payload,
-            extension=query.extension,
-            msg_class=query.msg_class if query.msg_class is not None else MSG_CLASS.MODERN,
-            channel_id=query.channel_id,
-            msg_num=query.msg_num,
-        )
-        reply = self.camera._recv_matching(query.msg_id, msg_num)
-        if reply.header.response_code not in (0, 200):
-            raise ProtocolError(
-                _response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code))
-            )
-
         raw_seen = 0
         mp4_offset: int | None = None
         mp4_started = False
@@ -1379,7 +1398,32 @@ class SdCard:
         expected_total = 0
         deadline_misses = 0
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("wb") as fh:
+
+        def matches_preview(message, sent_msg_num: int) -> bool:
+            return message.header.msg_num == sent_msg_num or _is_download_continuation(
+                message,
+                query.msg_id,
+                mp4_started or bool(head),
+            )
+
+        with (
+            self.camera.request_messages(
+                query.msg_id,
+                query.payload,
+                extension=query.extension,
+                msg_class=query.msg_class if query.msg_class is not None else MSG_CLASS.MODERN,
+                channel_id=query.channel_id,
+                msg_num=query.msg_num,
+                matcher=matches_preview,
+                maxsize=1024,
+            ) as replies,
+            output_path.open("wb") as fh,
+        ):
+            reply = replies.recv(timeout=self.camera.timeout)
+            if reply.header.response_code not in (0, 200):
+                raise ProtocolError(
+                    _response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code))
+                )
             raw_seen, mp4_offset, mp4_started, expected_total = _write_preview_cache_payload(
                 fh,
                 reply.payload or b"",
@@ -1396,15 +1440,11 @@ class SdCard:
                 if max_bytes is not None and raw_seen >= max_bytes:
                     break
                 try:
-                    msg = self.camera._recv(timeout=recv_timeout)
+                    msg = replies.recv(timeout=recv_timeout)
                 except TimeoutError:
                     deadline_misses += 1
                     if deadline_misses >= idle_timeouts:
                         break
-                    continue
-                if msg.header.msg_num != msg_num and not _is_download_continuation(
-                    msg, query.msg_id, mp4_started or bool(head)
-                ):
                     continue
                 if msg.header.response_code not in (0, 200):
                     break
@@ -1438,48 +1478,58 @@ class SdCard:
         idle_timeouts: int,
         max_bytes: int | None,
     ) -> bytes:
-        msg_num = self.camera.send(
+        data = bytearray()
+        expected_total = 0
+        deadline_misses = 0
+
+        def matches_preview(message, sent_msg_num: int) -> bool:
+            return message.header.msg_num == sent_msg_num or _is_download_continuation(
+                message,
+                query.msg_id,
+                bool(data),
+            )
+
+        with self.camera.request_messages(
             query.msg_id,
             query.payload,
             extension=query.extension,
             msg_class=query.msg_class if query.msg_class is not None else MSG_CLASS.MODERN,
             channel_id=query.channel_id,
             msg_num=query.msg_num,
-        )
-        reply = self.camera._recv_matching(query.msg_id, msg_num)
-        if reply.header.response_code not in (0, 200):
-            raise ProtocolError(
-                _response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code))
-            )
-        data = bytearray(reply.payload or b"")
-        expected_total = _embedded_mp4_total_size(data)
-        deadline_misses = 0
-        while True:
-            if expected_total and len(data) >= expected_total:
-                break
-            if max_bytes is not None and len(data) >= max_bytes:
-                break
-            try:
-                msg = self.camera._recv(timeout=recv_timeout)
-            except TimeoutError:
-                deadline_misses += 1
-                if deadline_misses >= idle_timeouts:
+            matcher=matches_preview,
+            maxsize=1024,
+        ) as replies:
+            reply = replies.recv(timeout=self.camera.timeout)
+            if reply.header.response_code not in (0, 200):
+                raise ProtocolError(
+                    _response_detail(reply, const_msg.Error.Response.format(response_code=reply.header.response_code))
+                )
+            data.extend(reply.payload or b"")
+            expected_total = _embedded_mp4_total_size(data)
+            while True:
+                if expected_total and len(data) >= expected_total:
                     break
-                continue
-            if msg.header.msg_num != msg_num and not _is_download_continuation(msg, query.msg_id, bool(data)):
-                continue
-            if msg.header.response_code not in (0, 200):
-                break
-            if not msg.payload:
-                continue
-            remaining = None if max_bytes is None else max(max_bytes - len(data), 0)
-            chunk = msg.payload if remaining is None else msg.payload[:remaining]
-            data.extend(chunk)
-            deadline_misses = 0
-            expected_total = expected_total or _embedded_mp4_total_size(data)
-            if progress and len(data) % (512 * 1024) < len(chunk):
-                total_text = f"/{expected_total}" if expected_total else ""
-                _emit_progress_message(progress, f"  preview dump bytes: {len(data)}{total_text}")
+                if max_bytes is not None and len(data) >= max_bytes:
+                    break
+                try:
+                    msg = replies.recv(timeout=recv_timeout)
+                except TimeoutError:
+                    deadline_misses += 1
+                    if deadline_misses >= idle_timeouts:
+                        break
+                    continue
+                if msg.header.response_code not in (0, 200):
+                    break
+                if not msg.payload:
+                    continue
+                remaining = None if max_bytes is None else max(max_bytes - len(data), 0)
+                chunk = msg.payload if remaining is None else msg.payload[:remaining]
+                data.extend(chunk)
+                deadline_misses = 0
+                expected_total = expected_total or _embedded_mp4_total_size(data)
+                if progress and len(data) % (512 * 1024) < len(chunk):
+                    total_text = f"/{expected_total}" if expected_total else ""
+                    _emit_progress_message(progress, f"  preview dump bytes: {len(data)}{total_text}")
         return bytes(data)
 
 

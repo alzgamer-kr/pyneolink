@@ -9,7 +9,12 @@ from .internal.battery import normalize_mode, parse_battery_xml
 
 
 class Battery:
-    """Battery status helper returned by `Camera.battery()`."""
+    """Battery status helper returned by `Camera.battery()`.
+
+    Requests use the owning camera's dispatcher. Inside another online helper,
+    such as a live stream or motion watch, polling remains on that same managed
+    session and cannot consume the other helper's replies.
+    """
 
     def __init__(self, camera) -> None:
         """Create a battery helper.
@@ -26,7 +31,13 @@ class Battery:
         """
         return self._request(mode=mode).xml_text
 
-    def info(self, *, interval: float | None = None, count: int | None = None, mode: str = "reconnect"):
+    def info(
+        self,
+        *,
+        interval: float | None = None,
+        count: int | None = None,
+        mode: str = "reconnect",
+    ):
         """Return battery info once or an update iterator.
 
         :param interval: Poll interval in seconds. When omitted, a single
@@ -48,7 +59,13 @@ class Battery:
             raise ProtocolError(msg.Error.BatteryInfoFailed.format(response_code=reply.header.response_code))
         return BatteryInfo(parse_battery_xml(reply.xml_root))
 
-    def watch(self, interval: float = 60.0, *, count: int | None = None, mode: str = "reconnect"):
+    def watch(
+        self,
+        interval: float = 60.0,
+        *,
+        count: int | None = None,
+        mode: str = "reconnect",
+    ):
         """Yield parsed battery status repeatedly.
 
         :param interval: Delay between polls in seconds.
@@ -84,7 +101,7 @@ class Battery:
 
 
 class BatteryInfoUpdates:
-    """Iterator/context manager for repeated battery polling."""
+    """Iterator/context manager for dispatcher-routed battery polling."""
 
     def __init__(
         self,

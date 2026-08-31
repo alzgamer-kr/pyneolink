@@ -7,12 +7,12 @@ from datetime import datetime
 import time
 import xml.etree.ElementTree as ET
 
-from .core.bc import ProtocolError, find_text
+from .core.bc import Message, ProtocolError, find_text
 from .core.const import EVENTS, MSG, msg
 
 
 class Motion:
-    """Motion status/watch helper returned by `Camera.motion()`."""
+    """Motion helper using the owning camera's shared dispatcher session."""
 
     def __init__(self, camera, *, channel_id: int | None = None) -> None:
         """Create a motion helper.
@@ -31,7 +31,12 @@ class Motion:
         event, known = self.watch().status(timeout=timeout)
         return event.to_dict(known=known)
 
-    def watch(self, *, duration: float | None = None, keepalive_interval: float = 0.75) -> "CameraEvents":
+    def watch(
+        self,
+        *,
+        duration: float | None = None,
+        keepalive_interval: float = 0.75,
+    ) -> "CameraEvents":
         """Create an iterator of motion events.
 
         :param duration: Optional maximum watch time in seconds.
@@ -105,7 +110,7 @@ class CameraEvent:
 
 
 class CameraEvents(Iterator[CameraEvent]):
-    """Iterator/context manager that yields normalized camera motion events."""
+    """Yield normalized motion events routed by the camera dispatcher."""
 
     def __init__(
         self,
@@ -164,6 +169,10 @@ class CameraEvents(Iterator[CameraEvent]):
                     recv_timeout = min(recv_timeout, max(0.0, self._deadline - time.monotonic()))
                 reply = self._recv_motion(timeout=recv_timeout)
             except TimeoutError:
+                self._restart_closed_subscription()
+                continue
+            except (EOFError, OSError):
+                self._restart_closed_subscription(force_reconnect=True)
                 continue
             if reply.header.msg_id != MSG.MOTION:
                 continue
@@ -178,10 +187,11 @@ class CameraEvents(Iterator[CameraEvent]):
         """Start listening for camera motion events."""
         if self._active:
             return self
-        self._lease = self.camera.require_online()
-        self._lease.__enter__()
-        if getattr(self.camera, "dispatcher_active", False):
-            self._subscription = self.camera.subscribe_messages(MSG.MOTION, maxsize=100)
+        if self._lease is None:
+            self._lease = self.camera.require_online()
+            self._lease.__enter__()
+        self.camera.ensure_connected()
+        self._subscription = self.camera.subscribe_messages(MSG.MOTION, maxsize=100)
         reply = self.camera.command(MSG.MOTION_REQUEST)
         if reply.header.response_code != 200:
             self.close()
@@ -204,15 +214,19 @@ class CameraEvents(Iterator[CameraEvent]):
             self._lease.__exit__(None, None, None)
             self._lease = None
 
-    def status(self, *, timeout: float = 3.0) -> tuple[CameraEvent, bool]:
+    def status(self, *, timeout: float = 3.0, close: bool = True) -> tuple[CameraEvent, bool]:
         """Read one motion status packet.
 
         :param timeout: Seconds to wait before returning an unknown status.
+        :param close: Whether to close the motion watch after reading. Keep the
+            default for one-shot status checks; pass false when polling through
+            an existing watch.
         """
         self.start()
         deadline = time.monotonic() + max(0.0, timeout)
         try:
             while time.monotonic() <= deadline:
+                self._restart_closed_subscription()
                 now = time.monotonic()
                 if now >= self._next_keepalive_at:
                     self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
@@ -220,6 +234,10 @@ class CameraEvents(Iterator[CameraEvent]):
                 try:
                     reply = self._recv_motion(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
                 except TimeoutError:
+                    self._restart_closed_subscription()
+                    continue
+                except (EOFError, OSError):
+                    self._restart_closed_subscription(force_reconnect=True)
                     continue
                 if reply.header.msg_id != MSG.MOTION:
                     continue
@@ -228,12 +246,23 @@ class CameraEvents(Iterator[CameraEvent]):
                     return events[-1], True
             return CameraEvent(EVENTS.none, active=False, channel_id=self.channel_id), False
         finally:
-            self.close()
+            if close:
+                self.close()
 
-    def _recv_motion(self, *, timeout: float):
+    def _restart_closed_subscription(self, *, force_reconnect: bool = False) -> None:
+        if not force_reconnect and (self._subscription is None or self._subscription.active):
+            return
         if self._subscription is not None:
-            return self._subscription.recv(timeout=timeout)
-        return self.camera._recv(timeout=timeout)
+            self._subscription.close()
+        self._subscription = None
+        self._active = False
+        self.camera.reconnect()
+        self.start()
+
+    def _recv_motion(self, *, timeout: float) -> Message:
+        if self._subscription is None:
+            raise RuntimeError("Motion dispatcher subscription is not active")
+        return self._subscription.recv(timeout=timeout)
 
     def _normalize_events(self, events: list[CameraEvent]) -> list[CameraEvent]:
         normalized: list[CameraEvent] = []

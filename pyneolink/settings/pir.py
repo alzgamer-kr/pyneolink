@@ -10,7 +10,7 @@ from pyneolink.core.xmlutil import xml_to_dict
 
 
 class Pir:
-    """PIR motion sensor settings helper."""
+    """PIR motion sensor settings helper using the managed session."""
 
     def __init__(self, camera, *, rf_id: int | None = None) -> None:
         """Create a PIR settings helper.
@@ -70,25 +70,15 @@ class Pir:
     def _set_config(self, element: ET.Element) -> None:
         config_xml = ET.tostring(element, encoding="unicode")
         payload = payloads.xml_document.format(inner=Raw(config_xml)).encode("utf-8")
-        msg_num = self.camera.send(
+        reply = self.camera.command(
             MSG.SET_PIR_ALARM,
             payload,
             extension=payloads.extension_rf.format(rf_id=self.rf_id),
+            retry_on_timeout=False,
+            reconnect_retries=0,
         )
-        self._wait_for_set_reply(msg_num)
-
-    def _wait_for_set_reply(self, msg_num: int) -> None:
-        deadline = time.monotonic() + 0.75
-        while time.monotonic() < deadline:
-            try:
-                reply = self.camera._recv(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
-            except TimeoutError:
-                continue
-            if reply.header.msg_num != msg_num:
-                continue
-            if reply.header.response_code != 200:
-                raise ProtocolError(msg.Error.PirSetFailed.format(response_code=reply.header.response_code))
-            return
+        if reply.header.response_code != 200:
+            raise ProtocolError(msg.Error.PirSetFailed.format(response_code=reply.header.response_code))
 
 
 def _find_pir_config(root: ET.Element | None) -> ET.Element | None:

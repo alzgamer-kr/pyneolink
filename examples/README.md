@@ -25,8 +25,6 @@ python examples/sd_card_example.py
 python examples/battery_example.py
 python examples/battery_runtime_test.py --config config.json --camera "Home-Front" --mode motion
 python examples/battery_runtime_test.py --config config.json --camera "Home-Front" --mode serve --stream high
-python examples/battery_runtime_test.py --config config.json --camera "Home-Front" --mode serve --stream high --single-connection-serve
-python examples/battery_runtime_test.py --config config.json --camera "Home-Front" --mode serve --stream high --no-serve-internal-client
 python examples/stream_session_probe.py --config config.json --camera "Home-Front" --stream high --duration 600 --sample-interval 30
 python examples/dual_camera_session_probe.py --config config.json --camera "Home-Front" --camera "Home-Back" --stream high --duration 3600 --stagger-seconds 600
 python examples/motion_example.py
@@ -44,9 +42,6 @@ Voice file playback requires `ffmpeg` and `ffprobe` in `PATH`. Microphone input 
 `stream_session_probe.py` and `dual_camera_session_probe.py` treat the stream
 as stalled when no media payload arrives for `--stall-window` seconds.
 
-`battery_runtime_test.py --mode serve` opens the live stream through a separate
-`Camera` connection by default. Use `--single-connection-serve` to validate the
-SDK path where one `Camera` session handles both stream payloads and battery
-polling through the internal dispatcher. Use `--no-serve-internal-client` when
-you want the example to start only the HTTP server and you will open the stream
-URL yourself.
+`battery_runtime_test.py` uses one `Camera` and its dispatcher for both the
+active mode and battery polling. In `serve` mode, stream packets and battery
+responses are routed independently by message id and message number.

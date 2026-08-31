@@ -42,6 +42,12 @@ CSV_FIELDS = [
     "payload_bytes",
     "payload_bytes_delta",
     "last_payload_age_seconds",
+    "max_payload_gap_seconds",
+    "sample_max_payload_gap_seconds",
+    "payload_gaps_over_100ms",
+    "payload_gaps_over_250ms",
+    "payload_gaps_over_500ms",
+    "payload_gaps_over_1s",
     "timeouts",
     "timeout_streak",
     "keepalives_sent",
@@ -76,13 +82,35 @@ class ProbeStats:
         self.keepalives_sent = 0
         self.reconnects = 0
         self.last_payload_at: float | None = None
+        self.max_payload_gap = 0.0
+        self.sample_max_payload_gap = 0.0
+        self.payload_gaps_over_100ms = 0
+        self.payload_gaps_over_250ms = 0
+        self.payload_gaps_over_500ms = 0
+        self.payload_gaps_over_1s = 0
         self.last_error = ""
 
     def mark_payload(self, payload: bytes) -> None:
+        now = time.monotonic()
+        if self.last_payload_at is not None:
+            gap = max(0.0, now - self.last_payload_at)
+            self.max_payload_gap = max(self.max_payload_gap, gap)
+            self.sample_max_payload_gap = max(self.sample_max_payload_gap, gap)
+            if gap > 0.1:
+                self.payload_gaps_over_100ms += 1
+            if gap > 0.25:
+                self.payload_gaps_over_250ms += 1
+            if gap > 0.5:
+                self.payload_gaps_over_500ms += 1
+            if gap > 1.0:
+                self.payload_gaps_over_1s += 1
         self.payloads_seen += 1
         self.payload_bytes += len(payload)
         self.timeout_streak = 0
-        self.last_payload_at = time.monotonic()
+        self.last_payload_at = now
+
+    def reset_sample_gap(self) -> None:
+        self.sample_max_payload_gap = 0.0
 
     def mark_timeout(self) -> None:
         self.timeouts += 1
@@ -253,11 +281,13 @@ def run_probe(
                         f"payloads={stats.payloads_seen} "
                         f"delta={stats.payloads_seen - last_payloads_seen} "
                         f"bytes={stats.payload_bytes} "
+                        f"gap_max={stats.sample_max_payload_gap:.3f}s "
                         f"timeouts={stats.timeouts}/{stats.timeout_streak} "
                         f"keepalives={stats.keepalives_sent} reconnects={stats.reconnects}"
                     )
                     last_payloads_seen = stats.payloads_seen
                     last_payload_bytes = stats.payload_bytes
+                    stats.reset_sample_gap()
                     next_sample_at = now + max(1.0, sample_interval)
 
                 try:
@@ -421,6 +451,12 @@ def sample_row(
         "payload_bytes": stats.payload_bytes,
         "payload_bytes_delta": payload_bytes_delta,
         "last_payload_age_seconds": last_payload_age,
+        "max_payload_gap_seconds": f"{stats.max_payload_gap:.6f}",
+        "sample_max_payload_gap_seconds": f"{stats.sample_max_payload_gap:.6f}",
+        "payload_gaps_over_100ms": stats.payload_gaps_over_100ms,
+        "payload_gaps_over_250ms": stats.payload_gaps_over_250ms,
+        "payload_gaps_over_500ms": stats.payload_gaps_over_500ms,
+        "payload_gaps_over_1s": stats.payload_gaps_over_1s,
         "timeouts": stats.timeouts,
         "timeout_streak": stats.timeout_streak,
         "keepalives_sent": stats.keepalives_sent,

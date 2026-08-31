@@ -52,7 +52,6 @@ from pyneolink.stream_server import (
     _read_until_keyframe,
 )
 from datetime import datetime
-
 from pyneolink.sd_card import (
     _FileInfoQuery,
     _download_output_file_name,
@@ -75,6 +74,72 @@ from pyneolink.internal.voice import (
     parse_talk_config,
     serialize_bcmedia_adpcm,
 )
+
+
+class _FakeMessageExchange:
+    """Adapt legacy fake-camera reply lists to the dispatcher request API."""
+
+    def __init__(self, camera, msg_id, payload=b"", **kwargs):
+        self.camera = camera
+        self.msg_id = msg_id
+        self.payload = payload
+        self.kwargs = kwargs
+        self.msg_num = kwargs.get("msg_num")
+        self._first_reply = True
+
+    def __enter__(self):
+        if hasattr(self.camera, "ensure_connected"):
+            self.camera.ensure_connected()
+        send_kwargs = {
+            key: value
+            for key, value in self.kwargs.items()
+            if key
+            in {
+                "extension",
+                "binary_reply",
+                "msg_class",
+                "channel_id",
+                "msg_num",
+                "stream_type",
+            }
+        }
+        self.msg_num = self.camera.send(self.msg_id, self.payload, **send_kwargs)
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def recv(self, *, timeout=None):
+        if self._first_reply and hasattr(self.camera, "_recv_matching"):
+            self._first_reply = False
+            return self.camera._recv_matching(self.msg_id, self.msg_num)
+        self._first_reply = False
+        if self.msg_id == MSG.FILE_PLAYBACK:
+            return self.camera._recv(timeout=timeout, binary_playback_331=True)
+        return self.camera._recv(timeout=timeout)
+
+
+def _fake_request_messages(self, msg_id, payload=b"", **kwargs):
+    return _FakeMessageExchange(self, msg_id, payload, **kwargs)
+
+
+class _FakeMessageSubscription:
+    """Expose a fake camera reply list through the subscription interface."""
+
+    def __init__(self, camera):
+        self.camera = camera
+        self.active = True
+
+    def recv(self, *, timeout=None):
+        return self.camera._recv(timeout=timeout)
+
+    def close(self):
+        self.active = False
+
+
+def _fake_subscribe_messages(self, _msg_id, _msg_num=None, *, maxsize=100):
+    del maxsize
+    return _FakeMessageSubscription(self)
 
 
 def test_bc_xor_roundtrip():
@@ -199,7 +264,17 @@ def test_truncated_udp_packets_are_ignored():
 
 
 def test_udp_ack_state_reports_missing_packets():
-    connection = UdpBcConnection.__new__(UdpBcConnection)
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            pass
+
+    connection = UdpBcConnection(
+        FakeSocket(),
+        ("127.0.0.1", 1234),
+        11,
+        22,
+        auto_maintenance=False,
+    )
     connection.next_recv_id = 10
     connection.recv_chunks = {11: b"a", 12: b"b", 14: b"c"}
     packet_id, payload, group_id = connection._ack_state()
@@ -220,11 +295,62 @@ def test_udp_heartbeat_reuses_connection_tid():
             self.sent.append((data, addr))
 
     sock = FakeSocket()
-    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, heartbeat_tid=77)
+    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, heartbeat_tid=77, auto_maintenance=False)
     connection._send_heartbeat()
     tid, xml = decode_discovery_packet(sock.sent[0][0])
     assert tid == 77
     assert "<C2D_HB>" in xml
+
+
+def test_udp_background_maintenance_sends_ack_and_heartbeat():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+            self.lock = threading.Lock()
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendto(self, data, addr):
+            with self.lock:
+                if self.closed:
+                    raise OSError("closed")
+                self.sent.append((data, addr))
+
+        def close(self):
+            with self.lock:
+                self.closed = True
+
+    sock = FakeSocket()
+    connection = UdpBcConnection(
+        sock,
+        ("127.0.0.1", 1234),
+        11,
+        22,
+        heartbeat_tid=77,
+        auto_maintenance=False,
+    )
+    connection.last_heartbeat_at = time.monotonic() - 2.0
+
+    connection.start_maintenance()
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with sock.lock:
+                sent = list(sock.sent)
+            if any(decode_udp_packet(data) and decode_udp_packet(data)[0] == "ack" for data, _addr in sent):
+                discovery_packets = [decode_discovery_packet(data) for data, _addr in sent]
+                if any(packet and packet[0] == 77 and "<C2D_HB>" in packet[1] for packet in discovery_packets):
+                    break
+            time.sleep(0.01)
+    finally:
+        connection.close()
+
+    parsed_packets = [decode_udp_packet(data) for data, _addr in sent]
+    discovery_packets = [decode_discovery_packet(data) for data, _addr in sent]
+    assert any(packet and packet[0] == "ack" for packet in parsed_packets)
+    assert any(packet and packet[0] == 77 and "<C2D_HB>" in packet[1] for packet in discovery_packets)
 
 
 def test_udp_maintenance_runs_while_data_arrives():
@@ -243,7 +369,7 @@ def test_udp_maintenance_runs_while_data_arrives():
             return self.received.pop(0), ("127.0.0.1", 1234)
 
     sock = FakeSocket()
-    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, heartbeat_tid=77)
+    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, heartbeat_tid=77, auto_maintenance=False)
     connection.last_ack_at = time.monotonic()
     connection.last_heartbeat_at = time.monotonic() - 2.0
 
@@ -711,7 +837,9 @@ def test_camera_battery_info_requests_channel_extension():
     extension = sent[24 : 24 + (header.payload_offset or 0)]
     assert header.msg_id == MSG.BATTERY
     assert b"<channelId>2</channelId>" in extension
-    assert camera.sock.discarded == 1
+    # UDP packet acknowledgements own resend cleanup. The dispatcher must not
+    # clear every pending command when concurrent requests share one session.
+    assert camera.sock.discarded == 0
 
 
 def test_camera_command_reconnects_once_after_timeout():
@@ -737,6 +865,12 @@ def test_camera_command_reconnects_once_after_timeout():
     camera.ensure_connected = ensure_connected
     camera.send = send
     camera._recv_matching = recv_matching
+    camera.request_messages = lambda msg_id, payload=b"", **kwargs: _FakeMessageExchange(
+        camera,
+        msg_id,
+        payload,
+        **kwargs,
+    )
     camera.reconnect = reconnect
 
     reply = camera.command(MSG.UID)
@@ -870,6 +1004,72 @@ def test_camera_start_stream_uses_neolink_substream_preview():
     assert msg_num in camera.binary_msg_nums
 
 
+def test_camera_continue_preview_uses_long_time_preview_command():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    reply = encode_modern(MSG.LONG_TIME_PREVIEW, 1, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = FakeSocket(reply)
+    camera.login_xml = "<logged-in />"
+    camera.cipher = Cipher("none")
+
+    result = camera.continue_preview("low")
+    sent = bytes(camera.sock.sent)
+    header = Header.unpack_from(sent[:24])
+    payload = sent[24:]
+
+    assert result.header.response_code == 200
+    assert header.msg_id == MSG.LONG_TIME_PREVIEW
+    assert int(header.msg_id) == 250
+    assert b'<LongTimePreview version="1.1">' in payload
+    assert b"<channelId>0</channelId>" in payload
+    assert b"<streamType>subStream</streamType>" in payload
+    assert b"<continuePreview>1</continuePreview>" in payload
+
+
+def test_camera_continue_preview_can_disable_preview_continuation():
+    class FakeSocket:
+        def __init__(self, reply):
+            self.reply = bytearray(reply)
+            self.sent = bytearray()
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def recv(self, size):
+            chunk = bytes(self.reply[:size])
+            del self.reply[:size]
+            return chunk
+
+    reply = encode_modern(MSG.LONG_TIME_PREVIEW, 1, response_code=200, cipher=Cipher("none"))
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = FakeSocket(reply)
+    camera.login_xml = "<logged-in />"
+    camera.cipher = Cipher("none")
+
+    camera.continue_preview("mainStream", enabled=False)
+
+    assert b"<streamType>mainStream</streamType>" in bytes(camera.sock.sent)
+    assert b"<continuePreview>0</continuePreview>" in bytes(camera.sock.sent)
+
+
 def test_camera_context_manager_starts_dispatcher(monkeypatch):
     camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     calls = []
@@ -882,6 +1082,279 @@ def test_camera_context_manager_starts_dispatcher(monkeypatch):
         assert opened is camera
 
     assert calls == ["connect", "login", "dispatch"]
+
+
+def test_camera_reconnect_restarts_dead_dispatcher(monkeypatch):
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._dispatch_thread = DeadThread()
+    calls = []
+
+    monkeypatch.setattr(camera, "connect", lambda: calls.append("connect"))
+    monkeypatch.setattr(camera, "login", lambda: calls.append("login"))
+    monkeypatch.setattr(camera, "start_dispatcher", lambda: calls.append("dispatch") or camera)
+
+    camera.reconnect()
+
+    assert calls == ["connect", "login", "dispatch"]
+
+
+def test_camera_reconnect_preserves_dispatcher_managed_keepalive(monkeypatch):
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    old_socket = FakeSocket()
+    new_socket = FakeSocket()
+    camera.sock = old_socket
+    camera.login_xml = "<logged-in />"
+    camera._dispatch_thread = DeadThread()
+    camera._dispatcher_requested = True
+    calls = []
+
+    def connect():
+        calls.append("connect")
+        camera.sock = new_socket
+
+    def login():
+        calls.append("login")
+        camera.login_xml = "<logged-in />"
+
+    def start_dispatcher():
+        calls.append("dispatch")
+        camera._dispatch_thread = AliveThread()
+        camera._dispatcher_requested = True
+        return camera
+
+    monkeypatch.setattr(camera, "connect", connect)
+    monkeypatch.setattr(camera, "login", login)
+    monkeypatch.setattr(camera, "start_dispatcher", start_dispatcher)
+    monkeypatch.setattr(camera, "send", lambda msg_id, **kwargs: calls.append((msg_id, kwargs)) or 0)
+    monkeypatch.setattr(camera, "_recv", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("_recv called")))
+
+    camera.reconnect()
+
+    assert old_socket.closed is True
+    assert camera.sock is new_socket
+    assert camera._dispatcher_requested is True
+    assert calls == ["connect", "login", "dispatch"]
+    assert camera.keepalive() == "sent"
+    assert calls[-1] == (MSG.UDP_KEEPALIVE, {"channel_id": 0, "msg_num": 0})
+
+
+def test_camera_stream_uses_dispatcher_on_same_transport(monkeypatch):
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._dispatch_thread = AliveThread()
+    camera._dispatcher_requested = True
+    camera.sock = object()
+    camera.login_xml = "<logged-in />"
+
+    monkeypatch.setattr(camera, "_read_stream_payloads_dispatched", lambda stream, *, stall_timeout: iter([b"payload"]))
+
+    assert not hasattr(camera, "session")
+    assert next(camera.read_stream_payloads("high")) == b"payload"
+
+
+def test_battery_one_shot_uses_dispatcher_managed_session(monkeypatch):
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._dispatch_thread = AliveThread()
+    camera._dispatcher_requested = True
+
+    def command(msg_id, payload=b"", extension=b"", **kwargs):
+        xml = xml_document(
+            "<BatteryInfo>"
+            "<channelId>0</channelId>"
+            "<chargeStatus>charging</chargeStatus>"
+            "<adapterStatus>solarPanel</adapterStatus>"
+            "<batteryPercent>99</batteryPercent>"
+            "</BatteryInfo>"
+        )
+        return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+    monkeypatch.setattr(camera, "command", command)
+
+    assert camera.battery().info(mode="online")["level_percent"] == 99
+
+
+def test_motion_watch_uses_dispatcher_managed_session(monkeypatch):
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    class Lease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    class Subscription:
+        active = True
+
+        def close(self):
+            self.active = False
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._dispatch_thread = AliveThread()
+    camera._dispatcher_requested = True
+    camera.sock = object()
+    camera.login_xml = "<logged-in />"
+    subscriptions = []
+
+    def subscribe_messages(msg_id, msg_num=None, *, maxsize=100):
+        subscriptions.append((msg_id, msg_num, maxsize))
+        return Subscription()
+
+    monkeypatch.setattr(camera, "require_online", lambda: Lease())
+    monkeypatch.setattr(camera, "subscribe_messages", subscribe_messages)
+    monkeypatch.setattr(
+        camera,
+        "command",
+        lambda msg_id, payload=b"", extension=b"", **kwargs: Message(
+            Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN),
+            payload=b"",
+        ),
+    )
+
+    with camera.motion().watch():
+        pass
+
+    assert subscriptions == [(MSG.MOTION, None, 100)]
+
+
+def test_keepalive_does_not_receive_from_dispatcher_managed_session(monkeypatch):
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    class FakeSocket:
+        def __init__(self):
+            self.maintained = False
+
+        def maintain(self):
+            self.maintained = True
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = FakeSocket()
+    camera.login_xml = "<logged-in />"
+    camera._dispatch_thread = AliveThread()
+    camera._dispatcher_requested = True
+    sent = []
+
+    monkeypatch.setattr(camera, "send", lambda msg_id, **kwargs: sent.append((msg_id, kwargs)) or 0)
+    monkeypatch.setattr(camera, "_recv", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("_recv called")))
+
+    assert camera.keepalive() == "sent"
+    assert camera.sock.maintained is True
+    assert sent == [(MSG.UDP_KEEPALIVE, {"channel_id": 0, "msg_num": 0})]
+
+
+def test_keepalive_restarts_dead_dispatcher_without_receiving(monkeypatch):
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    class FakeSocket:
+        def maintain(self):
+            pass
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = FakeSocket()
+    camera.login_xml = "<logged-in />"
+    camera._dispatch_thread = DeadThread()
+    camera._dispatcher_requested = True
+    calls = []
+
+    def start_dispatcher():
+        calls.append("dispatch")
+        camera._dispatch_thread = AliveThread()
+        return camera
+
+    monkeypatch.setattr(camera, "start_dispatcher", start_dispatcher)
+    monkeypatch.setattr(camera, "send", lambda msg_id, **kwargs: calls.append((msg_id, kwargs)) or 0)
+    monkeypatch.setattr(camera, "_recv", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("_recv called")))
+
+    assert camera.keepalive() == "sent"
+    assert calls == ["dispatch", (MSG.UDP_KEEPALIVE, {"channel_id": 0, "msg_num": 0})]
+
+
+def test_camera_read_stream_payloads_reconnects_after_stream_timeout(monkeypatch):
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    calls = {"stream": 0, "reconnect": 0}
+
+    def read_once(stream, *, stall_timeout):
+        calls["stream"] += 1
+        if calls["stream"] == 1:
+            raise TimeoutError("stream payload stalled")
+        yield b"payload"
+
+    def reconnect():
+        calls["reconnect"] += 1
+
+    monkeypatch.setattr(camera, "ensure_connected", lambda: None)
+    monkeypatch.setattr(camera, "_read_stream_payloads_dispatched", read_once)
+    monkeypatch.setattr(camera, "reconnect", reconnect)
+
+    payloads = camera.read_stream_payloads("high")
+
+    assert next(payloads) == b"payload"
+    assert calls == {"stream": 2, "reconnect": 1}
+
+
+def test_camera_read_stream_payloads_reconnects_after_stream_start_400(monkeypatch):
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    calls = {"stream": 0, "reconnect": 0}
+
+    def read_once(stream, *, stall_timeout):
+        calls["stream"] += 1
+        if calls["stream"] == 1:
+            raise ProtocolError("Stream start failed with response 400")
+        yield b"payload"
+
+    def reconnect():
+        calls["reconnect"] += 1
+
+    monkeypatch.setattr(camera, "ensure_connected", lambda: None)
+    monkeypatch.setattr(camera, "_read_stream_payloads_dispatched", read_once)
+    monkeypatch.setattr(camera, "reconnect", reconnect)
+
+    payloads = camera.read_stream_payloads("high")
+
+    assert next(payloads) == b"payload"
+    assert calls == {"stream": 2, "reconnect": 1}
 
 
 def test_camera_stop_stream_ignores_camera_400_reply():
@@ -930,7 +1403,8 @@ def test_camera_dispatcher_routes_messages_by_id_and_number():
     motion = Message(Header(MSG.MOTION, 6, 0, 0, 2, 200, MSG_CLASS.MODERN), payload=b"motion")
 
     with (
-        camera.subscribe_messages(MSG.VIDEO, 7) as stream,
+        camera.subscribe_messages(MSG.VIDEO, 7) as stream_7,
+        camera.subscribe_messages(MSG.VIDEO, 8) as stream_8,
         camera.subscribe_messages(MSG.BATTERY, 8) as battery,
         camera.subscribe_messages(MSG.MOTION) as events,
     ):
@@ -939,10 +1413,32 @@ def test_camera_dispatcher_routes_messages_by_id_and_number():
         camera._dispatch_message(battery_8)
         camera._dispatch_message(motion)
 
-        assert stream.recv(timeout=0.01) is video_7
+        assert stream_7.recv(timeout=0.01) is video_7
+        assert stream_8.recv(timeout=0.01) is video_8
         assert battery.recv(timeout=0.01) is battery_8
         assert events.recv(timeout=0.01) is motion
-        assert camera._recv_dispatched(timeout=0.01) is video_8
+
+
+def test_dispatcher_returns_queued_reply_before_transport_error():
+    class FakeThread:
+        def is_alive(self):
+            return True
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._dispatch_thread = FakeThread()
+    reply = Message(Header(MSG.BATTERY, 0, 0, 0, 12, 200, MSG_CLASS.MODERN), payload=b"battery")
+    subscription = camera.subscribe_messages(MSG.BATTERY, 12)
+
+    subscription.put(reply)
+    subscription.fail(EOFError("closed after reply"))
+
+    assert subscription.recv(timeout=0.01) is reply
+    try:
+        subscription.recv(timeout=0.01)
+    except EOFError as exc:
+        assert str(exc) == "closed after reply"
+    else:
+        raise AssertionError("dispatcher error must follow the already queued reply")
 
 
 def test_camera_replies_to_incoming_keepalive():
@@ -1097,6 +1593,11 @@ def test_camera_events_status_returns_immediate_motion_event():
         def require_online(self):
             return Lease()
 
+        def ensure_connected(self):
+            pass
+
+        subscribe_messages = _fake_subscribe_messages
+
         def motion(self, *, channel_id=None):
             from pyneolink.motion import Motion
 
@@ -1120,6 +1621,145 @@ def test_camera_events_status_returns_immediate_motion_event():
     assert event.active is True
 
 
+def test_camera_events_status_can_keep_watch_open():
+    class Lease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    class FakeCamera:
+        def __init__(self):
+            self.config = type("Config", (), {"channel_id": 0})()
+            self.commands = 0
+            self.replies = [
+                Message(
+                    Header(MSG.MOTION, 0, 0, 0, 2, 200, MSG_CLASS.MODERN),
+                    payload=xml_document(
+                        '<AlarmEventList version="1.1">'
+                        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status>'
+                        "<AItype>people</AItype></AlarmEvent>"
+                        "</AlarmEventList>"
+                    ),
+                ),
+                Message(
+                    Header(MSG.MOTION, 0, 0, 0, 3, 200, MSG_CLASS.MODERN),
+                    payload=xml_document(
+                        '<AlarmEventList version="1.1">'
+                        '<AlarmEvent version="1.1"><channelId>0</channelId><status>none</status>'
+                        "</AlarmEvent></AlarmEventList>"
+                    ),
+                ),
+            ]
+
+        def require_online(self):
+            return Lease()
+
+        def ensure_connected(self):
+            pass
+
+        subscribe_messages = _fake_subscribe_messages
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            self.commands += 1
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+        def send(self, *args, **kwargs):
+            pass
+
+        def _recv(self, timeout=None):
+            if self.replies:
+                return self.replies.pop(0)
+            raise TimeoutError("done")
+
+    with CameraEvents(FakeCamera()) as events:
+        event, known = events.status(timeout=0.1, close=False)
+        assert known is True
+        assert event.type == EVENTS.human
+        assert events._active is True
+
+        event, known = events.status(timeout=0.1, close=False)
+        assert known is True
+        assert event.type == EVENTS.human
+        assert event.active is False
+        assert events.camera.commands == 1
+
+
+def test_camera_events_status_restarts_closed_subscription():
+    class Lease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    class ClosedSubscription:
+        active = False
+
+        def close(self):
+            pass
+
+    class FakeCamera:
+        def __init__(self):
+            self.config = type("Config", (), {"channel_id": 0})()
+            self.commands = 0
+            self.subscriptions = 0
+            self.replies = [
+                Message(
+                    Header(MSG.MOTION, 0, 0, 0, 2, 200, MSG_CLASS.MODERN),
+                    payload=xml_document(
+                        '<AlarmEventList version="1.1">'
+                        '<AlarmEvent version="1.1"><channelId>0</channelId><status>MD</status>'
+                        "</AlarmEvent></AlarmEventList>"
+                    ),
+                )
+            ]
+
+        @property
+        def dispatcher_active(self):
+            return True
+
+        def require_online(self):
+            return Lease()
+
+        def ensure_connected(self):
+            pass
+
+        def reconnect(self):
+            pass
+
+        def subscribe_messages(self, msg_id, msg_num=None, *, maxsize=100):
+            self.subscriptions += 1
+            return self
+
+        def command(self, msg_id, payload=b"", *, extension=b""):
+            self.commands += 1
+            return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
+
+        def recv(self, *, timeout=None):
+            if self.replies:
+                return self.replies.pop(0)
+            raise TimeoutError("done")
+
+        def send(self, *args, **kwargs):
+            pass
+
+        def _unsubscribe(self, subscription):
+            pass
+
+    events = CameraEvents(FakeCamera())
+    events.start()
+    events._subscription = ClosedSubscription()
+
+    event, known = events.status(timeout=0.1, close=False)
+
+    assert known is True
+    assert event.type == EVENTS.motion
+    assert events.camera.subscriptions == 2
+    assert events.camera.commands == 2
+
+
 def test_camera_motion_status_marks_timeout_as_unknown():
     class Lease:
         def __enter__(self):
@@ -1134,6 +1774,11 @@ def test_camera_motion_status_marks_timeout_as_unknown():
 
         def require_online(self):
             return Lease()
+
+        def ensure_connected(self):
+            pass
+
+        subscribe_messages = _fake_subscribe_messages
 
         def motion(self, *, channel_id=None):
             from pyneolink.motion import Motion
@@ -1170,6 +1815,11 @@ def test_motion_watch_duration_stops_iterator():
 
         def require_online(self):
             return Lease()
+
+        def ensure_connected(self):
+            pass
+
+        subscribe_messages = _fake_subscribe_messages
 
         def command(self, msg_id, payload=b"", *, extension=b""):
             return Message(Header(msg_id, 0, 0, 0, 1, 200, MSG_CLASS.MODERN), payload=b"")
@@ -1522,7 +2172,10 @@ def test_ir_auto_updates_state_and_preserves_status_led():
                 ),
             ]
 
-        def command(self, msg_id, payload=b"", *, extension=b""):
+        def command(self, msg_id, payload=b"", *, extension=b"", **_kwargs):
+            if msg_id == MSG.SET_LED:
+                self.sent.append((msg_id, payload, extension))
+                return Message(Header(msg_id, 0, 0, 0, 11, 200, MSG_CLASS.MODERN), payload=b"")
             xml = self.replies.pop(0)
             return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
@@ -1605,7 +2258,10 @@ def test_pir_on_updates_enable_and_preserves_payload_shape():
                 ),
             ]
 
-        def command(self, msg_id, payload=b"", *, extension=b""):
+        def command(self, msg_id, payload=b"", *, extension=b"", **_kwargs):
+            if msg_id == MSG.SET_PIR_ALARM:
+                self.sent.append((msg_id, payload, extension))
+                return Message(Header(msg_id, 0, 0, 0, 9, 200, MSG_CLASS.MODERN), payload=b"")
             xml = self.replies.pop(0)
             return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
 
@@ -1708,26 +2364,12 @@ def test_camera_snapshot_collects_binary_snap_packets(tmp_path):
     assert path == tmp_path / "front.jpg"
     assert path.read_bytes() == b"\xff\xd8\xff\xd9"
 
-    camera.sock = FakeSocket(snap_replies(3))
-    camera.snapshot(stream_type="sub")
-    sent = bytes(camera.sock.sent)
-    payload = sent[24:]
-    assert b"<streamType>sub</streamType>" in payload
-    assert b"<fullFrame>0</fullFrame>" in payload
-
-    camera.sock = FakeSocket(snap_replies(4))
-    camera.snapshot(stream_type="main")
-    sent = bytes(camera.sock.sent)
-    payload = sent[24:]
-    assert b"<streamType>main</streamType>" in payload
-    assert b"<fullFrame>0</fullFrame>" in payload
-
 
 def test_camera_snapshot_reconnects_once_after_timeout(tmp_path):
     camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
     calls = {"snapshot": 0, "reconnect": 0}
 
-    def snapshot_once(*, out, stream_type):
+    def snapshot_once(*, out):
         calls["snapshot"] += 1
         if calls["snapshot"] == 1:
             raise TimeoutError("Timed out waiting for UDP Baichuan data")
@@ -1746,7 +2388,6 @@ def test_camera_snapshot_reconnects_once_after_timeout(tmp_path):
 def test_stream_recorder_writes_mpegts_and_stops_stream(tmp_path):
     class FakeCamera:
         def __init__(self):
-            self.sent = []
             self.stopped = []
             self.replies = [
                 Message(
@@ -1755,24 +2396,19 @@ def test_stream_recorder_writes_mpegts_and_stops_stream(tmp_path):
                 )
             ]
 
-        def start_stream(self, stream):
+        def read_stream_payloads(self, stream):
             self.stream = stream
-            return 7
-
-        def send(self, *args, **kwargs):
-            self.sent.append((args, kwargs))
-
-        def _recv(self, timeout=None):
-            if self.replies:
-                return self.replies.pop(0)
-            raise TimeoutError("done")
-
-        def stop_stream(self, stream, msg_num):
-            self.stopped.append((stream, msg_num))
+            try:
+                while self.replies:
+                    yield self.replies.pop(0).payload
+            finally:
+                self.stopped.append((stream, 7))
 
     out = tmp_path / "clip"
     camera = FakeCamera()
-    path = StreamRecorder(camera, out=out, stream="mainStream", duration=0.01).start().wait()
+    # Slow Windows CI runners can miss a 10 ms deadline before the recorder
+    # thread reads the first fake stream packet.
+    path = StreamRecorder(camera, out=out, stream="mainStream", duration=1.0).start().wait()
     data = path.read_bytes()
 
     assert path == tmp_path / "clip.ts"
@@ -1920,6 +2556,7 @@ def test_sd_card_download_treats_400_after_partial_data_as_interrupted_download(
         config = type("Config", (), {"channel_id": 0})()
         sock = None
         binary_msg_nums = set()
+        request_messages = _fake_request_messages
 
         def __init__(self):
             self.next_msg_num = 0
@@ -1977,6 +2614,7 @@ def test_sd_card_download_treats_400_after_partial_data_as_interrupted_download(
 def test_playback_331_continues_to_normal_completion(tmp_path):
     class FakeCamera:
         sock = None
+        request_messages = _fake_request_messages
 
         def __init__(self):
             self.binary_msg_nums = set()
@@ -2026,6 +2664,7 @@ def test_playback_331_continues_to_normal_completion(tmp_path):
 def test_response_331_remains_terminal_for_non_playback_downloads(tmp_path):
     class FakeCamera:
         sock = None
+        request_messages = _fake_request_messages
 
         def __init__(self):
             self.binary_msg_nums = set()
@@ -2062,6 +2701,8 @@ def test_response_331_remains_terminal_for_non_playback_downloads(tmp_path):
 def test_sd_card_preview_debug_returns_probe_responses():
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
+        timeout = 0.1
+        request_messages = _fake_request_messages
 
         def __init__(self):
             self.sent = []
@@ -2099,6 +2740,8 @@ def test_sd_card_preview_debug_returns_probe_responses():
 def test_sd_card_preview_debug_collects_bcmedia_continuation(monkeypatch):
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
+        timeout = 0.1
+        request_messages = _fake_request_messages
 
         def send(self, msg_id, payload=b"", **kwargs):
             return 5
@@ -2138,6 +2781,8 @@ def test_sd_card_preview_debug_collects_bcmedia_continuation(monkeypatch):
 def test_sd_card_preview_debug_reports_embedded_mp4(monkeypatch):
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
+        timeout = 0.1
+        request_messages = _fake_request_messages
 
         def send(self, msg_id, payload=b"", **kwargs):
             return 5
@@ -2179,6 +2824,8 @@ def test_sd_card_preview_debug_reports_embedded_mp4(monkeypatch):
 def test_sd_card_preview_dump_writes_embedded_mp4(tmp_path):
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
+        timeout = 0.1
+        request_messages = _fake_request_messages
 
         def send(self, msg_id, payload=b"", **kwargs):
             self.sent = (msg_id, payload, kwargs)
@@ -2389,10 +3036,14 @@ def test_sd_card_list_reads_all_handle_pages():
 
 def test_battery_runtime_test_helpers(tmp_path):
     from examples.battery_runtime_test import (
+        ModeStatus,
         format_hms,
         result_filename,
         result_status_label,
+        sample_row,
         sanitize_filename,
+        _recover_stream,
+        _restart_stream_after_implicit_reconnect,
         write_csv_rows,
         write_html_report,
     )
@@ -2420,6 +3071,7 @@ def test_battery_runtime_test_helpers(tmp_path):
             "mode": "motion",
             "mode_status": "motion-watch",
             "payloads_seen": 0,
+            "mode_last_event": "2026-08-28T12:29:59 none stop",
             "mode_last_error": "",
             "note": "",
         },
@@ -2435,6 +3087,7 @@ def test_battery_runtime_test_helpers(tmp_path):
             "mode": "motion",
             "mode_status": "motion-watch",
             "payloads_seen": 0,
+            "mode_last_event": "2026-08-28T12:29:59 none stop",
             "mode_last_error": "",
             "note": "",
         },
@@ -2461,6 +3114,90 @@ def test_battery_runtime_test_helpers(tmp_path):
     assert "PyNeolink Battery Runtime Test" in report
     assert "Successful" in report
     assert "charging" in report
+    assert "none stop" in report
+
+    motion_status = ModeStatus()
+    motion_counts = motion_status.record_motion_status(
+        {
+            "type": "human",
+            "active": True,
+            "known": True,
+            "status": "MD",
+            "ai_type": "people",
+            "received_at": "2026-08-28T12:29:59+03:00",
+        }
+    )
+    motion_row = sample_row(
+        {"level_percent": 78, "is_charging": False},
+        mode="motion",
+        mode_status=motion_status.snapshot(),
+        started_at=time.monotonic(),
+    )
+    assert motion_counts == {"human": 1}
+    assert motion_row["payloads_seen"] == 1
+    assert motion_row["mode_last_event"].endswith("type=human active=True status=MD ai=people known")
+    assert motion_row["motion_human"] == 1
+    assert motion_row["motion_unknown_status"] == 0
+
+    class FakeCamera:
+        def __init__(self):
+            self.sock = object()
+            self.started = []
+
+        def start_stream(self, stream):
+            self.started.append(stream)
+            return len(self.started)
+
+    camera = FakeCamera()
+    status = ModeStatus()
+    previous = id(camera.sock)
+    assert (
+        _restart_stream_after_implicit_reconnect(
+            camera,
+            previous_connection_id=previous,
+            stream="high",
+            status=status,
+            fallback_msg_num=7,
+        )
+        == 7
+    )
+    camera.sock = object()
+    assert (
+        _restart_stream_after_implicit_reconnect(
+            camera,
+            previous_connection_id=previous,
+            stream="high",
+            status=status,
+            fallback_msg_num=7,
+        )
+        == 1
+    )
+    assert camera.started == ["high"]
+
+    class RecoverCamera:
+        def __init__(self):
+            self.reconnected = 0
+
+        def reconnect(self):
+            self.reconnected += 1
+
+        def start_stream(self, stream):
+            self.stream = stream
+            return 9
+
+    recover_camera = RecoverCamera()
+    assert (
+        _recover_stream(
+            recover_camera,
+            stream="high",
+            status=ModeStatus(),
+            reconnect_window=1.0,
+            exc=TimeoutError("dispatcher stopped"),
+        )
+        == 9
+    )
+    assert recover_camera.reconnected == 1
+    assert recover_camera.stream == "high"
 
 
 def test_stream_session_probe_helpers(tmp_path):
@@ -2485,8 +3222,8 @@ def test_stream_session_probe_helpers(tmp_path):
     )
 
     stats = ProbeStats()
-    stats.payloads_seen = 10
-    stats.payload_bytes = 4096
+    stats.mark_payload(b"first")
+    stats.mark_payload(b"second")
     stats.keepalives_sent = 3
     started_at = time.monotonic()
     row = sample_row(
@@ -2494,14 +3231,16 @@ def test_stream_session_probe_helpers(tmp_path):
         stream="high",
         state="streaming",
         stats=stats,
-        payloads_delta=10,
-        payload_bytes_delta=4096,
+        payloads_delta=2,
+        payload_bytes_delta=11,
         socket_stats=None,
         note="",
     )
     assert row["stream"] == "high"
     assert row["state"] == "streaming"
-    assert row["payloads_seen"] == 10
+    assert row["payloads_seen"] == 2
+    assert float(row["max_payload_gap_seconds"]) >= 0.0
+    assert row["payload_gaps_over_1s"] == 0
     assert not stream_stalled(started_at, stats, 60.0)
 
     csv_path = tmp_path / "probe.csv"

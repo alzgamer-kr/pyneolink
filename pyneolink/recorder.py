@@ -4,12 +4,12 @@ from pathlib import Path
 import threading
 import time
 
-from .core.const import MSG, msg
+from .core.const import msg
 from .core.media import MediaParser, MediaPacket
 
 
 class StreamRecorder:
-    """Background local recorder for a camera live stream."""
+    """Record a dispatcher-managed camera stream in a background thread."""
 
     def __init__(
         self,
@@ -95,38 +95,19 @@ class StreamRecorder:
         parser = MediaParser()
         muxer = None
         bootstrap_packets: list[MediaPacket] = []
-        stream_msg_num = self.camera.start_stream(self.stream)
-        sock = getattr(self.camera, "sock", None)
-        if hasattr(sock, "discard_sent"):
-            sock.discard_sent()
-        if hasattr(sock, "set_max_pending_chunks"):
-            sock.set_max_pending_chunks(512)
         deadline = None if self.duration is None else time.monotonic() + max(self.duration, 0.0)
-        next_keepalive_at = time.monotonic() + 0.75
         next_flush_at = self.flush_bytes
+        payloads = self.camera.read_stream_payloads(self.stream)
 
         try:
             with self.path.open("wb") as fh:
-                while not self._stop.is_set():
+                for payload in payloads:
+                    if self._stop.is_set():
+                        break
                     if deadline is not None and time.monotonic() >= deadline:
-                        return
+                        break
 
-                    now = time.monotonic()
-                    if now >= next_keepalive_at:
-                        self.camera.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
-                        sock = getattr(self.camera, "sock", None)
-                        if hasattr(sock, "discard_sent"):
-                            sock.discard_sent()
-                        next_keepalive_at = now + 0.75
-
-                    try:
-                        reply = self.camera._recv(timeout=0.5)
-                    except TimeoutError:
-                        continue
-                    if reply.header.msg_id != MSG.VIDEO or reply.header.msg_num != stream_msg_num or not reply.payload:
-                        continue
-
-                    for packet in parser.feed(reply.payload):
+                    for packet in parser.feed(payload):
                         if muxer is None:
                             if packet.kind == "info":
                                 bootstrap_packets = [packet]
@@ -146,10 +127,7 @@ class StreamRecorder:
                             next_flush_at = self.bytes_written + self.flush_bytes
                 fh.flush()
         finally:
-            sock = getattr(self.camera, "sock", None)
-            if hasattr(sock, "set_max_pending_chunks"):
-                sock.set_max_pending_chunks(None)
-            self.camera.stop_stream(self.stream, stream_msg_num)
+            payloads.close()
 
     def _write_packet(self, fh, muxer, packet: MediaPacket) -> None:
         for chunk in muxer.feed(packet):

@@ -5,17 +5,12 @@ import socket
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
 
 from .config import CameraConfig
-from .core.bc import (
-    ProtocolError,
-    encode_legacy_login,
-    encode_modern,
-    find_text,
-    recv_message,
-)
+from .core.bc import Message, ProtocolError, encode_legacy_login, encode_modern, find_text, recv_message
 from .core.const import MSG, MSG_CLASS, msg, payloads
 from .battery import Battery
 from .core.crypto import Cipher, make_aes_key, md5_hex
@@ -33,12 +28,17 @@ from .settings import Settings
 from .voice import Voice
 
 
+RECOVERABLE_STREAM_ERRORS = (TimeoutError, EOFError, OSError, ProtocolError)
+DEFAULT_STREAM_STALL_TIMEOUT = 15.0
+
+
 class Camera(AbstractContextManager["Camera"]):
     """High-level Reolink camera client.
 
-    `Camera` owns the transport connection, login state, encryption mode, and
-    module factories such as `sd_card()`, `battery()`, `motion()`, `voice()`,
-    and `settings()`.
+    One `Camera` owns one transport session, login state, encryption mode, and
+    a dispatcher that routes concurrent replies by message id and message
+    number. Helpers such as `battery()`, `motion()`, `sd_card()`, `voice()`, and
+    `settings()` all share that managed session.
     """
 
     def __init__(
@@ -106,10 +106,13 @@ class Camera(AbstractContextManager["Camera"]):
         self.debug = debug
         self._online_required = 0
         self._send_lock = threading.RLock()
+        self._reconnect_lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
         self._dispatch_stop = threading.Event()
         self._dispatch_thread: threading.Thread | None = None
+        self._dispatcher_requested = False
         self._dispatch_waiters: dict[tuple[int, int | None], list[_MessageSubscription]] = {}
+        self._dispatch_filters: list[_MessageSubscription] = []
         self._dispatch_unmatched: deque = deque()
         self._dispatch_error: BaseException | None = None
 
@@ -169,20 +172,27 @@ class Camera(AbstractContextManager["Camera"]):
 
     def close(self) -> None:
         """Close the current transport connection and clear login state."""
-        self.stop_dispatcher()
-        if self.sock:
-            self.sock.close()
-            self.sock = None
-        self.login_xml = ""
+        with self._reconnect_lock:
+            self.stop_dispatcher()
+            if self.sock:
+                self.sock.close()
+                self.sock = None
+            self.login_xml = ""
 
     def reconnect(self) -> None:
         """Close, reconnect, and log in again."""
-        restart_dispatcher = self.dispatcher_active
-        self.close()
-        self.connect()
-        self.login()
-        if restart_dispatcher:
-            self.start_dispatcher()
+        with self._reconnect_lock:
+            restart_dispatcher = self._dispatcher_requested or self._dispatch_thread is not None
+            self.stop_dispatcher(clear_requested=not restart_dispatcher)
+            self._dispatcher_requested = restart_dispatcher
+            if self.sock:
+                self.sock.close()
+                self.sock = None
+            self.login_xml = ""
+            self.connect()
+            self.login()
+            if restart_dispatcher:
+                self.start_dispatcher()
 
     @property
     def dispatcher_active(self) -> bool:
@@ -190,7 +200,8 @@ class Camera(AbstractContextManager["Camera"]):
         return self._dispatch_thread is not None and self._dispatch_thread.is_alive()
 
     def start_dispatcher(self) -> "Camera":
-        """Start the background message dispatcher for concurrent API use."""
+        """Start the single-session reply dispatcher for concurrent API use."""
+        self._dispatcher_requested = True
         if self.dispatcher_active:
             return self
         self._dispatch_stop.clear()
@@ -203,10 +214,17 @@ class Camera(AbstractContextManager["Camera"]):
         self._dispatch_thread.start()
         return self
 
-    def stop_dispatcher(self) -> None:
+    def stop_dispatcher(self, *, clear_requested: bool = True) -> None:
         """Stop the background message dispatcher if it is running."""
+        if clear_requested:
+            self._dispatcher_requested = False
         thread = self._dispatch_thread
         if thread is None:
+            with self._dispatch_lock:
+                self._dispatch_waiters.clear()
+                self._dispatch_filters.clear()
+                self._dispatch_unmatched.clear()
+                self._dispatch_error = None
             return
         self._dispatch_stop.set()
         if thread is not threading.current_thread():
@@ -214,7 +232,9 @@ class Camera(AbstractContextManager["Camera"]):
         self._dispatch_thread = None
         with self._dispatch_lock:
             subscriptions = [waiter for waiters in self._dispatch_waiters.values() for waiter in waiters]
+            subscriptions.extend(self._dispatch_filters)
             self._dispatch_waiters.clear()
+            self._dispatch_filters.clear()
             self._dispatch_unmatched.clear()
             self._dispatch_error = None
         for subscription in subscriptions:
@@ -224,8 +244,8 @@ class Camera(AbstractContextManager["Camera"]):
     def online_required(self) -> bool:
         return self._online_required > 0
 
-    def require_online(self):
-        """Return a context manager that marks the camera as required online."""
+    def require_online(self) -> CameraOnlineLease:
+        """Keep this camera's managed session online within a context."""
         return CameraOnlineLease(self)
 
     def keepalive(self, *, timeout: float = 0.05) -> str:
@@ -236,6 +256,10 @@ class Camera(AbstractContextManager["Camera"]):
         self.ensure_connected()
         if hasattr(self.sock, "maintain"):
             self.sock.maintain()
+        if self._should_use_dispatcher():
+            self._ensure_dispatcher_active()
+            self.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
+            return "sent"
         try:
             msg = self._recv(timeout=timeout)
         except TimeoutError:
@@ -249,9 +273,12 @@ class Camera(AbstractContextManager["Camera"]):
         *,
         maxsize: int = 100,
     ) -> "_MessageSubscription":
-        """Subscribe to dispatched messages by id and optional message number."""
-        if not self.dispatcher_active:
-            raise RuntimeError("Camera dispatcher is not active")
+        """Subscribe to replies by message id and optional message number.
+
+        Exact `(msg_id, msg_num)` subscriptions separate request/reply traffic.
+        A `None` message number subscribes to unsolicited events of one type.
+        """
+        self._dispatcher_requested = True
         subscription = _MessageSubscription(self, msg_id, msg_num, maxsize=maxsize)
         key = (msg_id, msg_num)
         with self._dispatch_lock:
@@ -264,7 +291,71 @@ class Camera(AbstractContextManager["Camera"]):
                 else:
                     remaining.append(message)
             self._dispatch_unmatched = remaining
+        self._ensure_dispatcher_active()
         return subscription
+
+    def subscribe_matching(
+        self,
+        predicate: Callable[[Message], bool],
+        *,
+        maxsize: int = 100,
+    ) -> "_MessageSubscription":
+        """Subscribe to messages accepted by a dispatcher-side predicate.
+
+        Predicate subscriptions are intended for multipart protocol operations
+        whose continuation packets may use several message ids or numbers.
+        """
+        self._dispatcher_requested = True
+        subscription = _MessageSubscription(self, predicate=predicate, maxsize=maxsize)
+        with self._dispatch_lock:
+            self._dispatch_filters.append(subscription)
+            remaining = deque()
+            while self._dispatch_unmatched:
+                message = self._dispatch_unmatched.popleft()
+                if subscription.matches(message):
+                    subscription.put(message)
+                else:
+                    remaining.append(message)
+            self._dispatch_unmatched = remaining
+        self._ensure_dispatcher_active()
+        return subscription
+
+    def request_messages(
+        self,
+        msg_id: int,
+        payload: bytes = b"",
+        *,
+        extension: bytes = b"",
+        binary_reply: bool = False,
+        msg_class: int = MSG_CLASS.MODERN,
+        channel_id: int | None = None,
+        msg_num: int | None = None,
+        stream_type: int = 0,
+        response_msg_id: int | None = None,
+        matcher: Callable[[Message, int], bool] | None = None,
+        maxsize: int = 100,
+    ) -> "_MessageExchange":
+        """Create a dispatcher-managed request and multipart reply context.
+
+        The context registers its routing rule before sending the request, so
+        even immediate camera replies cannot fall into the unmatched queue.
+        Use `matcher` for protocol exchanges whose continuation packets change
+        message id or message number.
+        """
+        return _MessageExchange(
+            self,
+            msg_id,
+            payload,
+            extension=extension,
+            binary_reply=binary_reply,
+            msg_class=msg_class,
+            channel_id=channel_id,
+            msg_num=msg_num,
+            stream_type=stream_type,
+            response_msg_id=response_msg_id,
+            matcher=matcher,
+            maxsize=maxsize,
+        )
 
     def login(self, max_encryption: str = "aes") -> str:
         """Log in and return the raw login XML.
@@ -354,7 +445,6 @@ class Camera(AbstractContextManager["Camera"]):
         self,
         *,
         out: str | Path | None = None,
-        stream_type: str = "main",
         retry_on_timeout: bool = True,
         reconnect_retries: int = 1,
     ) -> bytes | Path:
@@ -362,8 +452,6 @@ class Camera(AbstractContextManager["Camera"]):
 
         :param out: Optional file path or directory. When omitted, bytes are
             returned. When a directory is provided, the camera file name is used.
-        :param stream_type: Explicit snapshot stream type, usually `main` or
-            `sub`.
         :param retry_on_timeout: Reconnect and retry the whole snapshot request
             when the current UDP session times out.
         :param reconnect_retries: Number of reconnect attempts for stale snapshot
@@ -373,7 +461,7 @@ class Camera(AbstractContextManager["Camera"]):
         last_error: TimeoutError | None = None
         for attempt in range(attempts):
             try:
-                return self._snapshot_once(out=out, stream_type=stream_type)
+                return self._snapshot_once(out=out)
             except TimeoutError as exc:
                 last_error = exc
                 if attempt >= attempts - 1:
@@ -389,39 +477,36 @@ class Camera(AbstractContextManager["Camera"]):
         self,
         *,
         out: str | Path | None,
-        stream_type: str | None,
     ) -> bytes | Path:
-        self.ensure_connected()
-        requested_stream = _snapshot_stream_type(stream_type)
-        msg_num = self.send(
+        def matches_snapshot(message, sent_msg_num: int) -> bool:
+            return message.header.msg_id == MSG.SNAP and (
+                message.header.msg_num == sent_msg_num or message.xml_root is None
+            )
+
+        with self.request_messages(
             MSG.SNAP,
             payloads.snapshot.format(
                 channel_id=self.config.channel_id,
-                stream_type=requested_stream,
+                stream_type="main",
             ),
             extension=payloads.extension.format(channel_id=self.config.channel_id),
-        )
+            matcher=matches_snapshot,
+            maxsize=4096,
+        ) as replies:
+            info = replies.recv(timeout=self.timeout)
+            if info.header.response_code != 200:
+                raise ProtocolError(msg.Error.SnapshotInfoFailed.format(response_code=info.header.response_code))
 
-        info = self._recv_matching(MSG.SNAP, msg_num)
-        if info.header.response_code != 200:
-            raise ProtocolError(msg.Error.SnapshotInfoFailed.format(response_code=info.header.response_code))
-
-        file_name, expected_size = parse_snapshot_info(info.xml_root)
-        data = bytearray()
-        deadline = time.monotonic() + self.timeout
-        while True:
-            reply = self._recv()
-            if reply.header.msg_id != MSG.SNAP:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=MSG.SNAP, msg_num=msg_num))
-                continue
-            if reply.payload:
-                data.extend(reply.payload)
-            if reply.header.response_code == 201:
-                break
-            if reply.header.response_code != 200:
-                raise ProtocolError(msg.Error.SnapshotDataFailed.format(response_code=reply.header.response_code))
-            deadline = time.monotonic() + self.timeout
+            file_name, expected_size = parse_snapshot_info(info.xml_root)
+            data = bytearray()
+            while True:
+                reply = replies.recv(timeout=self.timeout)
+                if reply.payload:
+                    data.extend(reply.payload)
+                if reply.header.response_code == 201:
+                    break
+                if reply.header.response_code != 200:
+                    raise ProtocolError(msg.Error.SnapshotDataFailed.format(response_code=reply.header.response_code))
 
         if expected_size is not None and len(data) != expected_size:
             raise ProtocolError(
@@ -526,30 +611,29 @@ class Camera(AbstractContextManager["Camera"]):
         extension: bytes = b"",
         retry_on_timeout: bool = True,
         reconnect_retries: int = 1,
-    ):
+    ) -> Message:
         """Send a command and wait for the matching reply.
 
         :param msg_id: Baichuan message id.
         :param payload: Optional command payload bytes.
         :param extension: Optional Baichuan extension bytes.
-        :param retry_on_timeout: Reconnect and retry when the current UDP
-            session times out before the matching reply arrives.
-        :param reconnect_retries: Number of reconnect attempts for stale command
-            sessions. The default retries once.
+        :param retry_on_timeout: Reconnect and retry after a timeout or closed
+            transport before the matching reply arrives.
+        :param reconnect_retries: Number of reconnect attempts for a stale or
+            closed session. The default retries once.
         """
         attempts = max(0, reconnect_retries if retry_on_timeout else 0) + 1
-        last_error: TimeoutError | None = None
+        last_error: BaseException | None = None
         for attempt in range(attempts):
-            self.ensure_connected()
             try:
-                if self.dispatcher_active:
-                    msg_num = self._next_msg()
-                    with self.subscribe_messages(msg_id, msg_num, maxsize=10) as replies:
-                        self._send_modern(msg_id, msg_num, payload, extension=extension)
-                        return replies.recv(timeout=self.timeout)
-                msg_num = self.send(msg_id, payload, extension=extension)
-                return self._recv_matching(msg_id, msg_num)
-            except TimeoutError as exc:
+                with self.request_messages(
+                    msg_id,
+                    payload,
+                    extension=extension,
+                    maxsize=10,
+                ) as replies:
+                    return replies.recv(timeout=self.timeout)
+            except (TimeoutError, EOFError, OSError) as exc:
                 last_error = exc
                 if attempt >= attempts - 1:
                     break
@@ -559,28 +643,6 @@ class Camera(AbstractContextManager["Camera"]):
         if last_error is not None:
             raise last_error
         raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=msg_id, msg_num="?"))
-
-    def _recv_matching(self, msg_id: int, msg_num: int):
-        if self.dispatcher_active:
-            with self.subscribe_messages(msg_id, msg_num, maxsize=10) as replies:
-                return replies.recv(timeout=self.timeout)
-        deadline = time.monotonic() + self.timeout
-        while True:
-            reply_msg = self._recv()
-            if reply_msg.header.msg_num == msg_num:
-                if hasattr(self.sock, "discard_sent"):
-                    self.sock.discard_sent()
-                return reply_msg
-            if self.debug:
-                print(
-                    msg.Log.IgnoringUnmatchedMessage.format(
-                        msg_id=reply_msg.header.msg_id,
-                        msg_num=reply_msg.header.msg_num,
-                        expected_msg_num=msg_num,
-                    )
-                )
-            if time.monotonic() > deadline:
-                raise TimeoutError(msg.Error.TimedOutResponse.format(msg_id=msg_id, msg_num=msg_num))
 
     def send(
         self,
@@ -620,41 +682,27 @@ class Camera(AbstractContextManager["Camera"]):
         )
         return sent_msg_num
 
-    def start_stream(self, stream: str = "mainStream"):
+    def start_stream(self, stream: str = "mainStream") -> int:
         """Start live stream payload delivery.
 
         :param stream: Stream alias/name such as `high`, `low`, `mainStream`,
             or `subStream`.
         """
-        self.ensure_connected()
-        msg_num = self._next_msg()
         stream_name, stream_code, handle = stream_params(stream)
         payload = payloads.preview_start.format(
             channel_id=self.config.channel_id, handle=handle, stream_type=stream_name
         )
-        if self.dispatcher_active:
-            with self.subscribe_messages(MSG.VIDEO, msg_num, maxsize=10) as replies:
-                self._send_modern(MSG.VIDEO, msg_num, payload, stream_type=stream_code)
-                reply_msg = replies.recv(timeout=self.timeout)
-                if reply_msg.header.response_code != 200:
-                    raise ProtocolError(
-                        msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code)
-                    )
-                self.binary_msg_nums.add(msg_num)
-                return msg_num
-        self._send_modern(MSG.VIDEO, msg_num, payload, stream_type=stream_code)
-        deadline = time.monotonic() + self.timeout
-        while True:
-            reply_msg = self._recv()
-            if reply_msg.header.msg_id == MSG.VIDEO and reply_msg.header.msg_num == msg_num:
-                if reply_msg.header.response_code != 200:
-                    raise ProtocolError(
-                        msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code)
-                    )
-                self.binary_msg_nums.add(msg_num)
-                return msg_num
-            if time.monotonic() > deadline:
-                raise TimeoutError(msg.Error.StreamStartTimeout.format(msg_num=msg_num))
+        with self.request_messages(
+            MSG.VIDEO,
+            payload,
+            stream_type=stream_code,
+            maxsize=10,
+        ) as replies:
+            reply_msg = replies.recv(timeout=self.timeout)
+            if reply_msg.header.response_code != 200:
+                raise ProtocolError(msg.Error.StreamStartFailed.format(response_code=reply_msg.header.response_code))
+            self.binary_msg_nums.add(replies.msg_num)
+            return replies.msg_num
 
     def stop_stream(self, stream: str = "mainStream", msg_num: int | None = None) -> None:
         """Stop live stream payload delivery.
@@ -663,79 +711,113 @@ class Camera(AbstractContextManager["Camera"]):
         :param msg_num: Optional stream message number returned by
             `start_stream()`.
         """
-        self.ensure_connected()
         _stream_name, stream_code, handle = stream_params(stream)
-        sent_msg_num = self._next_msg() if msg_num is None else msg_num
         payload = payloads.preview_stop.format(channel_id=self.config.channel_id, handle=handle)
-        self.binary_msg_nums.discard(sent_msg_num)
-        if self.dispatcher_active:
-            with self.subscribe_messages(MSG.VIDEO_STOP, sent_msg_num, maxsize=10) as replies:
-                self._send_modern(MSG.VIDEO_STOP, sent_msg_num, payload, stream_type=stream_code)
-                try:
-                    reply_msg = replies.recv(timeout=min(self.timeout, 2.0))
-                except TimeoutError:
-                    return
-                if reply_msg.header.response_code not in (0, 200) and self.debug:
-                    print(msg.Log.StreamStopReturned.format(response_code=reply_msg.header.response_code))
-                return
-        self._send_modern(MSG.VIDEO_STOP, sent_msg_num, payload, stream_type=stream_code)
-        deadline = time.monotonic() + min(self.timeout, 2.0)
-        while time.monotonic() <= deadline:
+        with self.request_messages(
+            MSG.VIDEO_STOP,
+            payload,
+            msg_num=msg_num,
+            stream_type=stream_code,
+            maxsize=10,
+        ) as replies:
+            self.binary_msg_nums.discard(replies.msg_num)
             try:
-                reply_msg = self._recv(timeout=0.5)
+                reply_msg = replies.recv(timeout=min(self.timeout, 2.0))
             except TimeoutError:
                 return
-            if reply_msg.header.msg_id == MSG.VIDEO_STOP and reply_msg.header.msg_num == sent_msg_num:
-                if reply_msg.header.response_code not in (0, 200):
-                    if self.debug:
-                        print(msg.Log.StreamStopReturned.format(response_code=reply_msg.header.response_code))
-                    return
-                return
+            if reply_msg.header.response_code not in (0, 200) and self.debug:
+                print(msg.Log.StreamStopReturned.format(response_code=reply_msg.header.response_code))
 
-    def read_stream_payloads(self, stream: str = "mainStream"):
+    def continue_preview(
+        self,
+        stream: str = "mainStream",
+        *,
+        enabled: bool = True,
+        retry_on_timeout: bool = True,
+        reconnect_retries: int = 1,
+    ) -> Message:
+        """Request live preview continuation for battery-camera sessions.
+
+        This mirrors the official client's `LongTimePreview` command. It is
+        useful for experiments around battery-camera live-view session limits.
+
+        :param stream: Stream alias/name such as `high`, `low`, `mainStream`,
+            or `subStream`.
+        :param enabled: Send `continuePreview` as 1 when true, otherwise 0.
+        :param retry_on_timeout: Reconnect and retry when the command reply
+            times out.
+        :param reconnect_retries: Number of reconnect attempts after timeout.
+        """
+        self.ensure_connected()
+        stream_name, _stream_code, _handle = stream_params(stream)
+        payload = payloads.long_time_preview.format(
+            channel_id=self.config.channel_id,
+            stream_type=stream_name,
+            continue_preview=1 if enabled else 0,
+        )
+        return self.command(
+            MSG.LONG_TIME_PREVIEW,
+            payload,
+            retry_on_timeout=retry_on_timeout,
+            reconnect_retries=reconnect_retries,
+        )
+
+    def read_stream_payloads(
+        self,
+        stream: str = "mainStream",
+        *,
+        reconnect: bool = True,
+        stall_timeout: float = DEFAULT_STREAM_STALL_TIMEOUT,
+    ) -> Iterator[bytes]:
         """Yield raw BCMedia payloads from a live stream.
 
         :param stream: Stream alias/name such as `high`, `low`, `mainStream`,
             or `subStream`.
+        :param reconnect: Reconnect and restart the stream after recoverable
+            transport errors or a stalled stream.
+        :param stall_timeout: Seconds without video payloads before the stream
+            is treated as stalled.
+
+        The stream and every concurrent helper share this camera's dispatcher.
+        Recoverable failures replace the transport session and re-register the
+        stream route without exposing session management to callers.
         """
         with self.require_online():
-            if self.dispatcher_active:
-                yield from self._read_stream_payloads_dispatched(stream)
-                return
-            msg_num = self.start_stream(stream)
-            next_keepalive_at = time.monotonic() + 0.75
-            try:
-                while True:
-                    now = time.monotonic()
-                    if now >= next_keepalive_at:
-                        self.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
-                        next_keepalive_at = now + 0.75
-                    try:
-                        msg = self._recv(timeout=1.0)
-                    except TimeoutError:
-                        continue
-                    if msg.header.msg_id == MSG.VIDEO and msg.header.msg_num == msg_num and msg.payload:
-                        yield msg.payload
-            finally:
+            while True:
                 try:
-                    self.stop_stream(stream, msg_num)
-                except Exception as exc:
+                    self.ensure_connected()
+                    yield from self._read_stream_payloads_dispatched(stream, stall_timeout=stall_timeout)
+                    return
+                except RECOVERABLE_STREAM_ERRORS as exc:
+                    if not reconnect:
+                        raise
                     if self.debug:
-                        print(msg.Log.StreamStopCloseFailed.format(exc_type=type(exc).__name__, exc=exc))
+                        print(msg.Log.Pyneolink.format(message=f"stream stalled; reconnecting after {exc!r}"))
+                    self.reconnect()
 
-    def _read_stream_payloads_dispatched(self, stream: str = "mainStream"):
-        msg_num = self._next_msg()
+    def _read_stream_payloads_dispatched(
+        self,
+        stream: str = "mainStream",
+        *,
+        stall_timeout: float,
+    ) -> Iterator[bytes]:
         stream_name, stream_code, handle = stream_params(stream)
         payload = payloads.preview_start.format(
             channel_id=self.config.channel_id, handle=handle, stream_type=stream_name
         )
-        with self.subscribe_messages(MSG.VIDEO, msg_num, maxsize=200) as replies:
-            self._send_modern(MSG.VIDEO, msg_num, payload, stream_type=stream_code)
+        with self.request_messages(
+            MSG.VIDEO,
+            payload,
+            stream_type=stream_code,
+            maxsize=200,
+        ) as replies:
+            msg_num = replies.msg_num
             start_reply = replies.recv(timeout=self.timeout)
             if start_reply.header.response_code != 200:
                 raise ProtocolError(msg.Error.StreamStartFailed.format(response_code=start_reply.header.response_code))
             self.binary_msg_nums.add(msg_num)
             next_keepalive_at = time.monotonic() + 0.75
+            last_payload_at = time.monotonic()
             try:
                 while True:
                     now = time.monotonic()
@@ -745,15 +827,23 @@ class Camera(AbstractContextManager["Camera"]):
                     try:
                         message = replies.recv(timeout=1.0)
                     except TimeoutError:
+                        self._raise_if_stream_stalled(last_payload_at, stall_timeout)
                         continue
                     if message.payload:
+                        last_payload_at = time.monotonic()
                         yield message.payload
+                    else:
+                        self._raise_if_stream_stalled(last_payload_at, stall_timeout)
             finally:
                 try:
                     self.stop_stream(stream, msg_num)
                 except Exception as exc:
                     if self.debug:
                         print(msg.Log.StreamStopCloseFailed.format(exc_type=type(exc).__name__, exc=exc))
+
+    def _raise_if_stream_stalled(self, last_payload_at: float, stall_timeout: float) -> None:
+        if time.monotonic() - last_payload_at >= max(0.1, stall_timeout):
+            raise TimeoutError("stream payload stalled")
 
     def _resolve_address(self) -> tuple[str, int] | tuple[str, int, str]:
         if self.config.address:
@@ -781,11 +871,13 @@ class Camera(AbstractContextManager["Camera"]):
         raise ValueError(msg.Error.CameraAddressRequired)
 
     def ensure_connected(self) -> None:
-        """Connect and log in if needed."""
-        if self.sock is None:
-            self.connect()
-        if not self.login_xml:
-            self.login()
+        """Connect, log in, and start the shared reply dispatcher if needed."""
+        with self._reconnect_lock:
+            if self.sock is None:
+                self.connect()
+            if not self.login_xml:
+                self.login()
+            self.start_dispatcher()
 
     def _next_msg(self) -> int:
         with self._send_lock:
@@ -832,17 +924,27 @@ class Camera(AbstractContextManager["Camera"]):
         timeout: float | None = None,
         *,
         binary_playback_331: bool = False,
-    ):
-        if self.dispatcher_active and threading.current_thread() is not self._dispatch_thread:
+    ) -> Message:
+        if self._should_use_dispatcher():
+            self._ensure_dispatcher_active()
             return self._recv_dispatched(timeout=timeout)
         return self._recv_direct(timeout=timeout, binary_playback_331=binary_playback_331)
+
+    def _should_use_dispatcher(self) -> bool:
+        return self._dispatcher_requested and threading.current_thread() is not self._dispatch_thread
+
+    def _ensure_dispatcher_active(self) -> None:
+        if self._dispatcher_requested and not self.dispatcher_active:
+            with self._reconnect_lock:
+                if self._dispatcher_requested and not self.dispatcher_active:
+                    self.start_dispatcher()
 
     def _recv_direct(
         self,
         timeout: float | None = None,
         *,
         binary_playback_331: bool = False,
-    ):
+    ) -> Message:
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
         message = recv_message(
@@ -856,7 +958,7 @@ class Camera(AbstractContextManager["Camera"]):
             self._reply_keepalive(message)
         return message
 
-    def _recv_dispatched(self, timeout: float | None = None):
+    def _recv_dispatched(self, timeout: float | None = None) -> Message:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self._dispatch_lock:
@@ -875,20 +977,22 @@ class Camera(AbstractContextManager["Camera"]):
     def _dispatch_loop(self) -> None:
         while not self._dispatch_stop.is_set():
             try:
-                message = self._recv_direct(timeout=0.5)
+                message = self._recv_direct(timeout=0.5, binary_playback_331=True)
             except TimeoutError:
                 continue
             except BaseException as exc:
                 with self._dispatch_lock:
                     self._dispatch_error = exc
                     subscriptions = [waiter for waiters in self._dispatch_waiters.values() for waiter in waiters]
+                    subscriptions.extend(self._dispatch_filters)
                     self._dispatch_waiters.clear()
+                    self._dispatch_filters.clear()
                 for subscription in subscriptions:
-                    subscription.close()
+                    subscription.fail(exc)
                 return
             self._dispatch_message(message)
 
-    def _dispatch_message(self, message) -> None:
+    def _dispatch_message(self, message: Message) -> None:
         if message.header.msg_id == MSG.UDP_KEEPALIVE:
             return
         with self._dispatch_lock:
@@ -898,6 +1002,10 @@ class Camera(AbstractContextManager["Camera"]):
                     if waiter.active:
                         waiter.put(message)
                         delivered = True
+            for waiter in list(self._dispatch_filters):
+                if waiter.active and waiter.matches(message):
+                    waiter.put(message)
+                    delivered = True
             if delivered:
                 return
             self._dispatch_unmatched.append(message)
@@ -905,6 +1013,11 @@ class Camera(AbstractContextManager["Camera"]):
                 self._dispatch_unmatched.popleft()
 
     def _unsubscribe(self, subscription: "_MessageSubscription") -> None:
+        if subscription.predicate is not None:
+            with self._dispatch_lock:
+                if subscription in self._dispatch_filters:
+                    self._dispatch_filters.remove(subscription)
+            return
         key = (subscription.msg_id, subscription.msg_num)
         with self._dispatch_lock:
             waiters = self._dispatch_waiters.get(key)
@@ -915,7 +1028,7 @@ class Camera(AbstractContextManager["Camera"]):
             if not waiters:
                 self._dispatch_waiters.pop(key, None)
 
-    def _reply_keepalive(self, keepalive_msg) -> None:
+    def _reply_keepalive(self, keepalive_msg: Message) -> None:
         if self.sock is None:
             return
         try:
@@ -937,12 +1050,24 @@ class Camera(AbstractContextManager["Camera"]):
 
 
 class _MessageSubscription:
-    def __init__(self, camera: Camera, msg_id: int, msg_num: int | None, *, maxsize: int = 100) -> None:
+    """Thread-safe queue for one dispatcher routing rule."""
+
+    def __init__(
+        self,
+        camera: Camera,
+        msg_id: int | None = None,
+        msg_num: int | None = None,
+        *,
+        predicate: Callable[[Message], bool] | None = None,
+        maxsize: int = 100,
+    ) -> None:
         self.camera = camera
         self.msg_id = msg_id
         self.msg_num = msg_num
+        self.predicate = predicate
         self.active = True
-        self._queue: queue.Queue = queue.Queue(maxsize=max(1, maxsize))
+        self._error: BaseException | None = None
+        self._queue: queue.Queue[Message] = queue.Queue(maxsize=max(1, maxsize))
 
     def __enter__(self) -> "_MessageSubscription":
         return self
@@ -950,7 +1075,7 @@ class _MessageSubscription:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def put(self, message) -> None:
+    def put(self, message: Message) -> None:
         if not self.active:
             return
         while True:
@@ -963,13 +1088,34 @@ class _MessageSubscription:
                 except queue.Empty:
                     return
 
-    def recv(self, *, timeout: float | None = None):
-        if not self.active:
+    def matches(self, message: Message) -> bool:
+        """Return whether this subscription accepts a message."""
+        if self.predicate is not None:
+            return self.predicate(message)
+        if self.msg_id is None:
+            return False
+        return _message_matches(message, self.msg_id, self.msg_num)
+
+    def recv(self, *, timeout: float | None = None) -> Message:
+        if not self._queue.empty():
+            return self._queue.get_nowait()
+        if self._error is not None:
+            raise self._error
+        if not self.active and self._queue.empty():
             raise TimeoutError(msg.Error.EventListenerClosed)
         try:
             return self._queue.get(timeout=timeout)
         except queue.Empty:
+            if self._error is not None:
+                raise self._error
+            if not self.active:
+                raise TimeoutError(msg.Error.EventListenerClosed) from None
             raise TimeoutError(msg.Error.UdpBaichuanTimeout) from None
+
+    def fail(self, error: BaseException) -> None:
+        """Close the subscription and preserve the dispatcher error."""
+        self._error = error
+        self.active = False
 
     def close(self) -> None:
         if self.active:
@@ -977,18 +1123,83 @@ class _MessageSubscription:
             self.camera._unsubscribe(self)
 
 
-def _message_matches(message, msg_id: int, msg_num: int | None) -> bool:
+class _MessageExchange:
+    """Context manager that subscribes before sending one request."""
+
+    def __init__(
+        self,
+        camera: Camera,
+        msg_id: int,
+        payload: bytes,
+        *,
+        extension: bytes,
+        binary_reply: bool,
+        msg_class: int,
+        channel_id: int | None,
+        msg_num: int | None,
+        stream_type: int,
+        response_msg_id: int | None,
+        matcher: Callable[[Message, int], bool] | None,
+        maxsize: int,
+    ) -> None:
+        self.camera = camera
+        self.msg_id = msg_id
+        self.payload = payload
+        self.extension = extension
+        self.binary_reply = binary_reply
+        self.msg_class = msg_class
+        self.channel_id = channel_id
+        self.msg_num = msg_num
+        self.stream_type = stream_type
+        self.response_msg_id = msg_id if response_msg_id is None else response_msg_id
+        self.matcher = matcher
+        self.maxsize = maxsize
+        self._subscription: _MessageSubscription | None = None
+
+    def __enter__(self) -> "_MessageExchange":
+        self.camera.ensure_connected()
+        if self.msg_num is None:
+            self.msg_num = self.camera._next_msg()
+        sent_msg_num = self.msg_num
+        if self.matcher is None:
+            self._subscription = self.camera.subscribe_messages(
+                self.response_msg_id,
+                sent_msg_num,
+                maxsize=self.maxsize,
+            )
+        else:
+            self._subscription = self.camera.subscribe_matching(
+                lambda message: self.matcher(message, sent_msg_num),
+                maxsize=self.maxsize,
+            )
+        try:
+            self.camera._send_modern(
+                self.msg_id,
+                sent_msg_num,
+                self.payload,
+                extension=self.extension,
+                binary_reply=self.binary_reply,
+                msg_class=self.msg_class,
+                channel_id=self.channel_id,
+                stream_type=self.stream_type,
+            )
+        except BaseException:
+            self._subscription.close()
+            self._subscription = None
+            raise
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._subscription is not None:
+            self._subscription.close()
+            self._subscription = None
+
+    def recv(self, *, timeout: float | None = None) -> Message:
+        """Receive the next reply routed to this exchange."""
+        if self._subscription is None:
+            raise RuntimeError("Message exchange is not active")
+        return self._subscription.recv(timeout=timeout)
+
+
+def _message_matches(message: Message, msg_id: int, msg_num: int | None) -> bool:
     return message.header.msg_id == msg_id and (msg_num is None or message.header.msg_num == msg_num)
-
-
-def _snapshot_stream_type(stream_type: str | None) -> str:
-    normalized = "main" if stream_type is None else stream_type.strip().lower()
-    mapping = {
-        "main": "main",
-        "mainstream": "main",
-        "sub": "sub",
-        "substream": "sub",
-    }
-    if normalized not in mapping:
-        raise ValueError(msg.Error.StreamValue)
-    return mapping[normalized]
