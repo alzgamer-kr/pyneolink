@@ -30,9 +30,9 @@ def info_example() -> dict:
         return info
 
 
-def snapshot_example(output: str = SNAPSHOT_DIR, stream_type: str = "main") -> Path:
+def snapshot_example(output: str = SNAPSHOT_DIR) -> Path:
     with open_camera() as camera:
-        path = camera.snapshot(out=output, stream_type=stream_type)
+        path = camera.snapshot(out=output)
         print(f"Saved snapshot: {path}")
         return path
 

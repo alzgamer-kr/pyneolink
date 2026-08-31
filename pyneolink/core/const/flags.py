@@ -75,6 +75,7 @@ class MSG(IntEnum):
     TALKCONFIG = 201
     TALK = 202
     UDP_KEEPALIVE = 234
+    LONG_TIME_PREVIEW = 250
     BATTERY = 253
     PLAY_AUDIO = 263
 

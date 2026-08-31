@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 import xml.etree.ElementTree as ET
 
 from pyneolink.core.bc import ProtocolError, find_text
@@ -18,7 +17,7 @@ _MODE_TO_STATE = {value: key for key, value in _STATE_TO_MODE.items()}
 
 
 class Ir:
-    """IR light settings helper."""
+    """IR light settings helper using the camera's managed session."""
 
     def __init__(self, camera, *, channel_id: int | None = None) -> None:
         """Create an IR light settings helper.
@@ -79,25 +78,15 @@ class Ir:
     def _set_config(self, element: ET.Element) -> None:
         config_xml = ET.tostring(element, encoding="unicode")
         payload = payloads.xml_document.format(inner=Raw(config_xml)).encode("utf-8")
-        msg_num = self.camera.send(
+        reply = self.camera.command(
             MSG.SET_LED,
             payload,
             extension=payloads.extension.format(channel_id=self.channel_id),
+            retry_on_timeout=False,
+            reconnect_retries=0,
         )
-        self._wait_for_set_reply(msg_num)
-
-    def _wait_for_set_reply(self, msg_num: int) -> None:
-        deadline = time.monotonic() + 0.75
-        while time.monotonic() < deadline:
-            try:
-                reply = self.camera._recv(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
-            except TimeoutError:
-                continue
-            if reply.header.msg_num != msg_num:
-                continue
-            if reply.header.response_code != 200:
-                raise ProtocolError(msg.Error.IrSetFailed.format(response_code=reply.header.response_code))
-            return
+        if reply.header.response_code != 200:
+            raise ProtocolError(msg.Error.IrSetFailed.format(response_code=reply.header.response_code))
 
 
 def _find_led_state(root: ET.Element | None) -> ET.Element | None:

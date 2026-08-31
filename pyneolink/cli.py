@@ -14,14 +14,12 @@ if __package__ in (None, ""):
     from pyneolink.config import CameraConfig, load_config, write_json_config
     from pyneolink.core.const import msg
     from pyneolink.core.discovery import local_discover, remote_uid_lookup
-    from pyneolink.core.media import MediaParser
     from pyneolink.stream_server import serve_streams
 else:
     from .camera import Camera
     from .config import CameraConfig, load_config, write_json_config
     from .core.const import msg
     from .core.discovery import local_discover, remote_uid_lookup
-    from .core.media import MediaParser
     from .stream_server import serve_streams
 
 
@@ -59,7 +57,6 @@ class CLI:
             "pir": self.run_camera_command,
             "ir": self.run_camera_command,
             "ptz": self.run_camera_command,
-            "raw-stream": self.run_camera_command,
         }
         self.camera_handlers: dict[str, CameraCommandHandler] = {
             "status": self.camera_status,
@@ -76,7 +73,6 @@ class CLI:
             "pir": self.camera_pir,
             "ir": self.camera_ir,
             "ptz": self.camera_ptz,
-            "raw-stream": self.camera_raw_stream,
         }
 
     def run(self) -> int:
@@ -153,7 +149,6 @@ class CLI:
         self.add_common_options(snapshot)
         self.add_camera_option(snapshot)
         snapshot.add_argument("-out", "--out", required=True, help="Path or directory for the JPEG snapshot")
-        snapshot.add_argument("--stream-type", default="main", choices=["main", "sub"], help="Snapshot stream type")
 
         record = subparsers.add_parser("record")
         self.add_common_options(record)
@@ -212,15 +207,6 @@ class CLI:
         discover.add_argument("--uid")
         discover.add_argument("--timeout", type=float, default=5.0)
         discover.add_argument("--remote", action="store_true")
-
-        raw_stream = subparsers.add_parser("raw-stream")
-        self.add_common_options(raw_stream)
-        self.add_camera_option(raw_stream)
-        raw_stream.add_argument("--stream", default="mainStream", choices=["mainStream", "subStream"])
-        raw_stream.add_argument("--output", required=True)
-        raw_stream.add_argument(
-            "--packets", type=int, default=0, help="Stop after N video packets; 0 means keep running"
-        )
 
         serve = subparsers.add_parser("serve")
         self.add_common_options(serve)
@@ -445,7 +431,7 @@ class CLI:
         :param cam_cfg: Selected camera configuration.
         """
 
-        path = cam.snapshot(out=args.out, stream_type=args.stream_type)
+        path = cam.snapshot(out=args.out)
         print(msg.Log.SnapshotSaved.format(output=path))
         return 0
 
@@ -628,28 +614,6 @@ class CLI:
             self.parser.error("PTZ preset ID is required: pyneolink ptz preset <id>")
         ptz.goto_preset(args.preset_id)
         print(msg.Log.PtzPresetRecalled.format(preset_id=args.preset_id))
-        return 0
-
-    def camera_raw_stream(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
-        """
-        Write raw H.264 video packets from a stream to a file.
-
-        :param args: Parsed CLI arguments.
-        :param cam: Connected camera instance.
-        :param cam_cfg: Selected camera configuration.
-        """
-
-        parser = MediaParser()
-        written = 0
-        with open(args.output, "wb") as fh:
-            for payload in cam.read_stream_payloads(args.stream):
-                for packet in parser.feed(payload):
-                    if packet.kind in ("iframe", "pframe") and packet.codec == "H264":
-                        fh.write(packet.data)
-                        written += 1
-                        if args.packets and written >= args.packets:
-                            print(msg.Log.VideoPacketsWritten.format(count=written, output=args.output))
-                            return 0
         return 0
 
 

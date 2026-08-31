@@ -18,6 +18,7 @@ _STREAM_END = object()
 _STREAM_QUEUE_TIMEOUT = 0.25
 _DEFAULT_HLS_BUFFER_MB = 100
 _DEFAULT_HLS_SEGMENT_SECONDS = 2.0
+_DEFAULT_HLS_RECONNECT_SECONDS = 5.0
 
 
 class StreamServer:
@@ -226,7 +227,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         camera = Camera(camera_config, state_path=self.server.state_path, debug=self.server.debug)
         parser = MediaParser()
         try:
-            camera.__enter__()
+            _open_stream_camera(camera)
             payloads = camera.read_stream_payloads(stream)
             first_packets, codec, fps = _read_until_keyframe(payloads, parser)
             first_packets = _buffer_initial_video(payloads, parser, first_packets, fps, self.server.buffer_seconds)
@@ -525,6 +526,7 @@ class HlsSession:
         self.next_sequence = 0
         self.started = False
         self.error: BaseException | None = None
+        self.reconnects = 0
 
     def start(self) -> None:
         with self.lock:
@@ -566,10 +568,30 @@ class HlsSession:
         return None
 
     def _run(self) -> None:
+        while True:
+            try:
+                self._run_stream()
+            except Exception as exc:
+                with self.condition:
+                    self.reconnects += 1
+                    self.error = exc if not self.segments else None
+                    self.condition.notify_all()
+                if self.debug:
+                    print(
+                        "[pyneolink] HLS stream "
+                        f"{self.camera_config.name}/{self.stream} stopped with {type(exc).__name__}: {exc}; "
+                        f"reconnecting in {_DEFAULT_HLS_RECONNECT_SECONDS:g}s"
+                    )
+                time.sleep(_DEFAULT_HLS_RECONNECT_SECONDS)
+
+    def _run_stream(self) -> None:
         camera = Camera(self.camera_config, state_path=self.state_path, debug=self.debug)
         parser = MediaParser()
         try:
-            camera.__enter__()
+            with self.condition:
+                self.error = None
+                self.condition.notify_all()
+            _open_stream_camera(camera)
             payloads = camera.read_stream_payloads(self.stream)
             first_packets, codec, fps = _read_until_keyframe(payloads, parser)
             if codec not in ("H264", "H265"):
@@ -584,7 +606,11 @@ class HlsSession:
                 nonlocal current, started_at, saw_video
                 now = time.monotonic()
                 if packet.kind == "iframe" and saw_video and current and now - started_at >= self.segment_seconds:
-                    self._append_segment(bytes(current), now - started_at)
+                    self._append_segment(
+                        bytes(current),
+                        now - started_at,
+                        socket_stats=_socket_debug_snapshot(camera),
+                    )
                     current = bytearray()
                     started_at = now
                 if not current:
@@ -600,14 +626,10 @@ class HlsSession:
             for payload in payloads:
                 for packet in parser.feed(payload):
                     add_packet(packet)
-        except BaseException as exc:
-            with self.condition:
-                self.error = exc
-                self.condition.notify_all()
         finally:
             camera.close()
 
-    def _append_segment(self, data: bytes, duration: float) -> None:
+    def _append_segment(self, data: bytes, duration: float, *, socket_stats: dict | None = None) -> None:
         if not data:
             return
         with self.condition:
@@ -618,6 +640,16 @@ class HlsSession:
             while self.segments and self.total_bytes > self.buffer_bytes:
                 removed = self.segments.pop(0)
                 self.total_bytes -= len(removed.data)
+            if self.debug:
+                udp_detail = _format_udp_debug(socket_stats)
+                print(
+                    "[pyneolink] HLS segment "
+                    f"{self.camera_config.name}/{self.stream} "
+                    f"seq={segment.sequence} duration={segment.duration:.3f}s "
+                    f"bytes={len(segment.data)} buffered={len(self.segments)} "
+                    f"buffer_mb={self.total_bytes / 1024 / 1024:.1f} "
+                    f"reconnects={self.reconnects}{udp_detail}"
+                )
             self.condition.notify_all()
 
 
@@ -642,6 +674,27 @@ def _hls_playlist(segments: list[HlsSegment], segment_seconds: float) -> str:
         lines.append(f"#EXTINF:{segment.duration:.3f},")
         lines.append(f"segments/{segment.sequence}.ts")
     return "\n".join(lines) + "\n"
+
+
+def _socket_debug_snapshot(camera: Camera) -> dict | None:
+    sock = getattr(camera, "sock", None)
+    snapshot = getattr(sock, "debug_snapshot", None)
+    if not callable(snapshot):
+        return None
+    return snapshot()
+
+
+def _format_udp_debug(socket_stats: dict | None) -> str:
+    if not socket_stats:
+        return ""
+    return (
+        " "
+        f"udp_data={socket_stats.get('udp_data_packets')} "
+        f"udp_acks={socket_stats.get('udp_acks_sent')}/{socket_stats.get('udp_acks_received')} "
+        f"udp_hb={socket_stats.get('udp_heartbeats_sent')} "
+        f"udp_gaps={socket_stats.get('udp_pending_gaps')} "
+        f"udp_buffer={socket_stats.get('udp_buffered_bytes')}"
+    )
 
 
 def _produce_mpegts_chunks(
@@ -684,6 +737,11 @@ def _put_stream_item(chunks: queue.Queue[object], stop_event: threading.Event, i
 
 def _stream_queue_size(fps: int, buffer_seconds: float) -> int:
     return max(512, int(max(fps, 1) * max(buffer_seconds, 1.0) * 64))
+
+
+def _open_stream_camera(camera: Camera) -> None:
+    camera.connect()
+    camera.login()
 
 
 def _mpegts_null_packet() -> bytes:

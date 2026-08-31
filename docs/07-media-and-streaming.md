@@ -129,9 +129,9 @@ The playlist uses active in-memory segments and gives a timeshift behavior: the 
 
 ## Snapshot
 
-`Camera.snapshot(out=None, stream_type="main")`:
+`Camera.snapshot(out=None)`:
 
-1. sends the requested explicit snapshot `stream_type`;
+1. requests the camera's standard JPEG snapshot;
 2. sends `MSG.SNAP` with a snapshot payload and channel extension;
 3. reads XML metadata with file name and expected picture size;
 4. reads binary snapshot payloads until response code `201`;

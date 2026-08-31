@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import struct
 import sys
+import threading
 import time
 from collections import OrderedDict
 
@@ -15,6 +16,9 @@ from .const import MAGIC, msg
 
 MTU = 1350
 UDP_DATA_HEADER_SIZE = 20
+UDP_ACK_INTERVAL_SECONDS = 0.01
+UDP_HEARTBEAT_INTERVAL_SECONDS = 1.0
+UDP_RESEND_INTERVAL_SECONDS = 0.5
 
 
 class UdpBcConnection:
@@ -29,6 +33,7 @@ class UdpBcConnection:
         *,
         timeout: float = 10.0,
         heartbeat_tid: int | None = None,
+        auto_maintenance: bool = True,
     ) -> None:
         """Create a UDP Baichuan connection.
 
@@ -38,6 +43,7 @@ class UdpBcConnection:
         :param camera_id: Remote/camera connection id.
         :param timeout: Read timeout in seconds.
         :param heartbeat_tid: Optional discovery heartbeat transaction id.
+        :param auto_maintenance: Start a background ACK/heartbeat worker.
         """
         self.sock = sock
         self.addr = addr
@@ -72,7 +78,13 @@ class UdpBcConnection:
         self.last_data_packet_id: int | None = None
         self.max_data_packet_id: int | None = None
         self.last_data_at = 0.0
+        self._state_lock = threading.RLock()
+        self._send_lock = threading.RLock()
+        self._maintenance_stop = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
         self.sock.settimeout(0.01)
+        if auto_maintenance:
+            self.start_maintenance()
 
     def settimeout(self, timeout: float | None) -> None:
         """
@@ -91,13 +103,16 @@ class UdpBcConnection:
         :param data: Bytes to send.
         """
 
-        for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
-            packet_id = self.next_send_id
-            packet = encode_udp_data(self.camera_id, packet_id, chunk)
-            self.sent_chunks[packet_id] = chunk
-            self.sock.sendto(packet, self.addr)
-            self.next_send_id += 1
-        self.last_resend_at = time.monotonic()
+        packets = []
+        with self._state_lock:
+            for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
+                packet_id = self.next_send_id
+                packet = encode_udp_data(self.camera_id, packet_id, chunk)
+                self.sent_chunks[packet_id] = chunk
+                self.next_send_id += 1
+                packets.append(packet)
+            self.last_resend_at = time.monotonic()
+        self._send_packets(packets)
 
     def send_untracked(self, data: bytes) -> None:
         """
@@ -106,11 +121,14 @@ class UdpBcConnection:
         :param data: Bytes to send.
         """
 
-        for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
-            packet_id = self.next_send_id
-            packet = encode_udp_data(self.camera_id, packet_id, chunk)
-            self.sock.sendto(packet, self.addr)
-            self.next_send_id += 1
+        packets = []
+        with self._state_lock:
+            for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
+                packet_id = self.next_send_id
+                packet = encode_udp_data(self.camera_id, packet_id, chunk)
+                self.next_send_id += 1
+                packets.append(packet)
+        self._send_packets(packets)
 
     def recv(self, size: int) -> bytes:
         """
@@ -146,14 +164,44 @@ class UdpBcConnection:
         return result
 
     def close(self) -> None:
+        if self.closed:
+            return
         self.closed = True
-        self.sock.close()
+        self.stop_maintenance()
+        if hasattr(self.sock, "close"):
+            self.sock.close()
 
     def maintain(self) -> None:
         self._maintenance()
 
+    def start_maintenance(self) -> None:
+        """Start independent UDP ACK/heartbeat maintenance."""
+
+        if self.closed:
+            return
+        thread = self._maintenance_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._maintenance_stop.clear()
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            name="pyneolink-udp-maintenance",
+            daemon=True,
+        )
+        self._maintenance_thread.start()
+
+    def stop_maintenance(self) -> None:
+        """Stop independent UDP ACK/heartbeat maintenance."""
+
+        self._maintenance_stop.set()
+        thread = self._maintenance_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        self._maintenance_thread = None
+
     def discard_sent(self) -> None:
-        self.sent_chunks.clear()
+        with self._state_lock:
+            self.sent_chunks.clear()
 
     def set_max_pending_chunks(self, limit: int | None) -> None:
         """
@@ -162,7 +210,8 @@ class UdpBcConnection:
         :param limit: Maximum pending chunk count, or ``None`` for no limit.
         """
 
-        self.max_pending_chunks = limit
+        with self._state_lock:
+            self.max_pending_chunks = limit
 
     def _recv_one(self) -> None:
         self._maintenance()
@@ -176,55 +225,61 @@ class UdpBcConnection:
         kind = parsed[0]
         if kind == "data":
             _kind, connection_id, packet_id, payload = parsed
-            if connection_id != self.client_id:
-                self.ignored_packets += 1
-                return
-            if packet_id in self.recv_chunks or packet_id < self.next_recv_id:
-                self.duplicate_packets_received += 1
+            with self._state_lock:
+                if connection_id != self.client_id:
+                    self.ignored_packets += 1
+                    return
+                if packet_id in self.recv_chunks or packet_id < self.next_recv_id:
+                    self.duplicate_packets_received += 1
+                    self.last_data_at = time.monotonic()
+                    self._maybe_send_ack()
+                    return
+                self.recv_chunks[packet_id] = payload
+                self.data_packets_received += 1
+                self.data_bytes_received += len(payload)
+                self.last_data_packet_id = packet_id
+                self.max_data_packet_id = (
+                    packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
+                )
                 self.last_data_at = time.monotonic()
+                self._feed_ack_latency()
                 self._maybe_send_ack()
-                return
-            self.recv_chunks[packet_id] = payload
-            self.data_packets_received += 1
-            self.data_bytes_received += len(payload)
-            self.last_data_packet_id = packet_id
-            self.max_data_packet_id = (
-                packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
-            )
-            self.last_data_at = time.monotonic()
-            self._feed_ack_latency()
-            self._maybe_send_ack()
-            self._raise_if_pending_overflow()
-            while self.next_recv_id in self.recv_chunks:
-                self.buffer.extend(self.recv_chunks.pop(self.next_recv_id))
-                self.next_recv_id += 1
+                self._raise_if_pending_overflow()
+                while self.next_recv_id in self.recv_chunks:
+                    self.buffer.extend(self.recv_chunks.pop(self.next_recv_id))
+                    self.next_recv_id += 1
         elif kind == "ack":
             _kind, connection_id, _group_id, packet_id, _latency, payload = parsed
             if connection_id == self.client_id:
-                self.acks_received += 1
-                self._handle_ack(packet_id, payload)
+                with self._state_lock:
+                    self.acks_received += 1
+                    self._handle_ack(packet_id, payload)
         elif kind == "discovery":
             return
         else:
-            self.unknown_packets += 1
+            with self._state_lock:
+                self.unknown_packets += 1
 
     def _send_ack(self) -> None:
-        packet_id, payload, group_id = self._ack_state()
-        self.sock.sendto(
-            encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=self.ack_latency), self.addr
-        )
-        if packet_id != 0xFFFFFFFF:
-            self.last_ack_packet_id = packet_id
-        self.acks_sent += 1
-        self.last_ack_at = time.monotonic()
+        with self._state_lock:
+            packet_id, payload, group_id = self._ack_state()
+            ack_latency = self.ack_latency
+        packet = encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=ack_latency)
+        self._send_packets([packet])
+        with self._state_lock:
+            if packet_id != 0xFFFFFFFF:
+                self.last_ack_packet_id = packet_id
+            self.acks_sent += 1
+            self.last_ack_at = time.monotonic()
 
     def _raise_if_pending_overflow(self) -> None:
-        if self.max_pending_chunks is None or len(self.recv_chunks) <= self.max_pending_chunks:
-            return
-        self.recv_chunks.clear()
-        self.buffer.clear()
-        if self.max_data_packet_id is not None:
-            self.next_recv_id = self.max_data_packet_id + 1
+        with self._state_lock:
+            if self.max_pending_chunks is None or len(self.recv_chunks) <= self.max_pending_chunks:
+                return
+            self.recv_chunks.clear()
+            self.buffer.clear()
+            if self.max_data_packet_id is not None:
+                self.next_recv_id = self.max_data_packet_id + 1
         raise TimeoutError(msg.Error.UdpBaichuanTimeout)
 
     def _maybe_send_ack(self, *, force: bool = False) -> None:
@@ -244,36 +299,35 @@ class UdpBcConnection:
             self._send_ack()
 
     def _ack_state(self) -> tuple[int, bytes, int]:
-        if self.next_recv_id == 0:
-            return 0xFFFFFFFF, b"", 0xFFFFFFFF
-        first_missing = self.next_recv_id
-        while first_missing in self.recv_chunks:
-            first_missing += 1
-        end = max(self.recv_chunks.keys(), default=first_missing - 1)
-        payload = bytes(1 if packet_id in self.recv_chunks else 0 for packet_id in range(first_missing, end + 1))
-        return first_missing - 1, payload, 0
+        with self._state_lock:
+            if self.next_recv_id == 0:
+                return 0xFFFFFFFF, b"", 0xFFFFFFFF
+            first_missing = self.next_recv_id
+            while first_missing in self.recv_chunks:
+                first_missing += 1
+            end = max(self.recv_chunks.keys(), default=first_missing - 1)
+            payload = bytes(1 if packet_id in self.recv_chunks else 0 for packet_id in range(first_missing, end + 1))
+            return first_missing - 1, payload, 0
 
     def _handle_ack(self, packet_id: int, payload: bytes) -> None:
-        if packet_id != 0xFFFFFFFF:
-            for sent_id in list(self.sent_chunks):
-                if sent_id <= packet_id:
-                    del self.sent_chunks[sent_id]
-            for idx, value in enumerate(payload):
-                sent_id = packet_id + 1 + idx
-                if value:
-                    self.sent_chunks.pop(sent_id, None)
-        self._feed_ack_latency()
+        with self._state_lock:
+            if packet_id != 0xFFFFFFFF:
+                for sent_id in list(self.sent_chunks):
+                    if sent_id <= packet_id:
+                        del self.sent_chunks[sent_id]
+                for idx, value in enumerate(payload):
+                    sent_id = packet_id + 1 + idx
+                    if value:
+                        self.sent_chunks.pop(sent_id, None)
+            self._feed_ack_latency()
 
     def _maintenance(self) -> None:
         now = time.monotonic()
-        if now - self.last_ack_at >= 0.2:
+        if now - self.last_ack_at >= UDP_ACK_INTERVAL_SECONDS:
             self._maybe_send_ack(force=True)
-        if self.sent_chunks and now - self.last_resend_at >= 0.5:
-            for packet_id, chunk in list(self.sent_chunks.items()):
-                self.sock.sendto(encode_udp_data(self.camera_id, packet_id, chunk), self.addr)
-                self.resend_packets_sent += 1
-            self.last_resend_at = now
-        if now - self.last_heartbeat_at >= 1.0:
+        if now - self.last_resend_at >= UDP_RESEND_INTERVAL_SECONDS:
+            self._resend_pending(now)
+        if now - self.last_heartbeat_at >= UDP_HEARTBEAT_INTERVAL_SECONDS:
             self._send_heartbeat()
 
     def _feed_ack_latency(self) -> None:
@@ -292,36 +346,69 @@ class UdpBcConnection:
 
     def _send_heartbeat(self) -> None:
         xml = f"<P2P><C2D_HB><cid>{self.client_id}</cid><did>{self.camera_id}</did></C2D_HB></P2P>"
-        self.sock.sendto(encode_discovery_xml(self.heartbeat_tid, xml), self.addr)
-        self.heartbeats_sent += 1
-        self.last_heartbeat_at = time.monotonic()
+        self._send_packets([encode_discovery_xml(self.heartbeat_tid, xml)])
+        with self._state_lock:
+            self.heartbeats_sent += 1
+            self.last_heartbeat_at = time.monotonic()
+
+    def _resend_pending(self, now: float | None = None) -> None:
+        with self._state_lock:
+            if not self.sent_chunks:
+                return
+            packets = [
+                encode_udp_data(self.camera_id, packet_id, chunk) for packet_id, chunk in list(self.sent_chunks.items())
+            ]
+            self.last_resend_at = time.monotonic() if now is None else now
+        self._send_packets(packets)
+        with self._state_lock:
+            self.resend_packets_sent += len(packets)
+
+    def _maintenance_loop(self) -> None:
+        while not self._maintenance_stop.wait(UDP_ACK_INTERVAL_SECONDS):
+            if self.closed:
+                return
+            try:
+                self._maintenance()
+            except OSError:
+                return
+
+    def _send_packets(self, packets: list[bytes]) -> None:
+        if not packets:
+            return
+        with self._send_lock:
+            if self.closed:
+                return
+            for packet in packets:
+                self.sock.sendto(packet, self.addr)
 
     def debug_snapshot(self) -> dict:
         now = time.monotonic()
-        max_id = self.max_data_packet_id
-        pending_gaps = 0
-        if max_id is not None and self.next_recv_id <= max_id:
-            pending_gaps = sum(
-                1 for packet_id in range(self.next_recv_id, max_id + 1) if packet_id not in self.recv_chunks
-            )
-        return {
-            "udp_next_recv_id": self.next_recv_id,
-            "udp_last_packet_id": self.last_data_packet_id,
-            "udp_max_packet_id": max_id,
-            "udp_pending_chunks": len(self.recv_chunks),
-            "udp_pending_gaps": pending_gaps,
-            "udp_buffered_bytes": len(self.buffer),
-            "udp_data_packets": self.data_packets_received,
-            "udp_data_bytes": self.data_bytes_received,
-            "udp_duplicates": self.duplicate_packets_received,
-            "udp_ignored": self.ignored_packets,
-            "udp_unknown": self.unknown_packets,
-            "udp_acks_sent": self.acks_sent,
-            "udp_acks_received": self.acks_received,
-            "udp_heartbeats_sent": self.heartbeats_sent,
-            "udp_resend_packets": self.resend_packets_sent,
-            "udp_seconds_since_data": round(now - self.last_data_at, 3) if self.last_data_at else None,
-        }
+        with self._state_lock:
+            max_id = self.max_data_packet_id
+            pending_gaps = 0
+            if max_id is not None and self.next_recv_id <= max_id:
+                pending_gaps = sum(
+                    1 for packet_id in range(self.next_recv_id, max_id + 1) if packet_id not in self.recv_chunks
+                )
+            seconds_since_data = round(now - self.last_data_at, 3) if self.last_data_at else None
+            return {
+                "udp_next_recv_id": self.next_recv_id,
+                "udp_last_packet_id": self.last_data_packet_id,
+                "udp_max_packet_id": max_id,
+                "udp_pending_chunks": len(self.recv_chunks),
+                "udp_pending_gaps": pending_gaps,
+                "udp_buffered_bytes": len(self.buffer),
+                "udp_data_packets": self.data_packets_received,
+                "udp_data_bytes": self.data_bytes_received,
+                "udp_duplicates": self.duplicate_packets_received,
+                "udp_ignored": self.ignored_packets,
+                "udp_unknown": self.unknown_packets,
+                "udp_acks_sent": self.acks_sent,
+                "udp_acks_received": self.acks_received,
+                "udp_heartbeats_sent": self.heartbeats_sent,
+                "udp_resend_packets": self.resend_packets_sent,
+                "udp_seconds_since_data": seconds_since_data,
+            }
 
 
 def connect_local_direct(

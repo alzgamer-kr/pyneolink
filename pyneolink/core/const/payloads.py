@@ -121,6 +121,16 @@ preview_stop = XmlTemplate(
     '<Preview version="1.1"><channelId>{channel_id}</channelId><handle>{handle}</handle></Preview>'
 )
 
+long_time_preview = XmlTemplate(
+    '<LongTimePreview version="1.1">'
+    "<Preview>"
+    "<channelId>{channel_id}</channelId>"
+    "<streamType>{stream_type}</streamType>"
+    "<continuePreview>{continue_preview}</continuePreview>"
+    "</Preview>"
+    "</LongTimePreview>"
+)
+
 snapshot = XmlTemplate(
     '<Snap version="1.1">'
     "<channelId>{channel_id}</channelId>"
