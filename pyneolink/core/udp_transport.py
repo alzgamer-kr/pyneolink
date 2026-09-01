@@ -16,7 +16,7 @@ from .const import MAGIC, msg
 
 MTU = 1350
 UDP_DATA_HEADER_SIZE = 20
-UDP_ACK_INTERVAL_SECONDS = 0.01
+UDP_ACK_INTERVAL_SECONDS = 0.031
 UDP_HEARTBEAT_INTERVAL_SECONDS = 1.0
 UDP_RESEND_INTERVAL_SECONDS = 0.5
 
@@ -132,18 +132,25 @@ class UdpBcConnection:
 
     def recv(self, size: int) -> bytes:
         """
-        Receive exactly ``size`` bytes from the buffered UDP stream.
+        Receive up to ``size`` bytes from the buffered UDP stream.
+
+        This mirrors ``socket.recv`` semantics. Returning available data lets
+        callers such as ``recv_exact`` reset their timeout after each part of a
+        large Baichuan message instead of abandoning a partially received body.
 
         :param size: Number of bytes to return.
         """
 
+        if size <= 0:
+            return b""
         deadline = time.monotonic() + self.timeout
-        while len(self.buffer) < size:
+        while not self.buffer:
             if time.monotonic() > deadline:
                 raise TimeoutError(msg.Error.UdpBaichuanTimeout)
             self._recv_one()
-        result = bytes(self.buffer[:size])
-        del self.buffer[:size]
+        take = min(size, len(self.buffer))
+        result = bytes(self.buffer[:take])
+        del self.buffer[:take]
         return result
 
     def recv_some(self, size: int) -> bytes:
@@ -232,7 +239,6 @@ class UdpBcConnection:
                 if packet_id in self.recv_chunks or packet_id < self.next_recv_id:
                     self.duplicate_packets_received += 1
                     self.last_data_at = time.monotonic()
-                    self._maybe_send_ack()
                     return
                 self.recv_chunks[packet_id] = payload
                 self.data_packets_received += 1
@@ -242,8 +248,6 @@ class UdpBcConnection:
                     packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
                 )
                 self.last_data_at = time.monotonic()
-                self._feed_ack_latency()
-                self._maybe_send_ack()
                 self._raise_if_pending_overflow()
                 while self.next_recv_id in self.recv_chunks:
                     self.buffer.extend(self.recv_chunks.pop(self.next_recv_id))
@@ -282,22 +286,6 @@ class UdpBcConnection:
                 self.next_recv_id = self.max_data_packet_id + 1
         raise TimeoutError(msg.Error.UdpBaichuanTimeout)
 
-    def _maybe_send_ack(self, *, force: bool = False) -> None:
-        packet_id, payload, _group_id = self._ack_state()
-        if force:
-            self._send_ack()
-            return
-        if payload:
-            self._send_ack()
-            return
-        if packet_id == 0xFFFFFFFF:
-            return
-        if self.last_ack_packet_id is None or packet_id - self.last_ack_packet_id >= 16:
-            self._send_ack()
-            return
-        if time.monotonic() - self.last_ack_at >= 0.15:
-            self._send_ack()
-
     def _ack_state(self) -> tuple[int, bytes, int]:
         with self._state_lock:
             if self.next_recv_id == 0:
@@ -323,8 +311,12 @@ class UdpBcConnection:
 
     def _maintenance(self) -> None:
         now = time.monotonic()
-        if now - self.last_ack_at >= UDP_ACK_INTERVAL_SECONDS:
-            self._maybe_send_ack(force=True)
+        with self._state_lock:
+            ack_due = now - self.last_ack_at >= UDP_ACK_INTERVAL_SECONDS
+            if ack_due:
+                self.last_ack_at = now
+        if ack_due:
+            self._send_ack()
         if now - self.last_resend_at >= UDP_RESEND_INTERVAL_SECONDS:
             self._resend_pending(now)
         if now - self.last_heartbeat_at >= UDP_HEARTBEAT_INTERVAL_SECONDS:

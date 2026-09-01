@@ -115,6 +115,7 @@ class Camera(AbstractContextManager["Camera"]):
         self._dispatch_filters: list[_MessageSubscription] = []
         self._dispatch_unmatched: deque = deque()
         self._dispatch_error: BaseException | None = None
+        self._playback_resync_requests = 0
 
     def __enter__(self) -> "Camera":
         self.connect()
@@ -953,6 +954,7 @@ class Camera(AbstractContextManager["Camera"]):
             timeout=self.timeout if timeout is None else timeout,
             binary_msg_nums=self.binary_msg_nums,
             binary_playback_331=binary_playback_331,
+            recover_invalid_magic=self._playback_resync_requests > 0,
         )
         if message.header.msg_id == MSG.UDP_KEEPALIVE:
             self._reply_keepalive(message)
@@ -1155,9 +1157,14 @@ class _MessageExchange:
         self.matcher = matcher
         self.maxsize = maxsize
         self._subscription: _MessageSubscription | None = None
+        self._playback_resync_active = False
 
     def __enter__(self) -> "_MessageExchange":
         self.camera.ensure_connected()
+        if self.msg_id == MSG.FILE_PLAYBACK:
+            with self.camera._dispatch_lock:
+                self.camera._playback_resync_requests += 1
+            self._playback_resync_active = True
         if self.msg_num is None:
             self.msg_num = self.camera._next_msg()
         sent_msg_num = self.msg_num
@@ -1186,6 +1193,7 @@ class _MessageExchange:
         except BaseException:
             self._subscription.close()
             self._subscription = None
+            self._disable_playback_resync()
             raise
         return self
 
@@ -1193,6 +1201,14 @@ class _MessageExchange:
         if self._subscription is not None:
             self._subscription.close()
             self._subscription = None
+        self._disable_playback_resync()
+
+    def _disable_playback_resync(self) -> None:
+        if not self._playback_resync_active:
+            return
+        with self.camera._dispatch_lock:
+            self.camera._playback_resync_requests = max(0, self.camera._playback_resync_requests - 1)
+        self._playback_resync_active = False
 
     def recv(self, *, timeout: float | None = None) -> Message:
         """Receive the next reply routed to this exchange."""
