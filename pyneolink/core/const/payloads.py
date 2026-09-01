@@ -337,6 +337,7 @@ replay_download = XmlTemplate(
 playback_download = XmlTemplate(
     '<FileInfoList version="1.1">'
     "<FileInfo>"
+    "{name}"
     "<logicChnBitmap>255</logicChnBitmap>"
     "<channelId>{channel_id}</channelId>"
     "<supportSub>{support_sub}</supportSub>"
@@ -350,6 +351,7 @@ playback_download = XmlTemplate(
 playback_download_no_support = XmlTemplate(
     '<FileInfoList version="1.1">'
     "<FileInfo>"
+    "{name}"
     "<logicChnBitmap>255</logicChnBitmap>"
     "<channelId>{channel_id}</channelId>"
     "<streamType>{stream_type}</streamType>"
@@ -358,6 +360,8 @@ playback_download_no_support = XmlTemplate(
     "</FileInfo>"
     "</FileInfoList>"
 )
+
+playback_download_name = XmlTemplate("<name>{name}</name>", document=False, binary=False)
 
 download_file = XmlTemplate(
     '<FileInfoList version="1.1"><FileInfo><channelId>{channel_id}</channelId>{fields}</FileInfo></FileInfoList>'

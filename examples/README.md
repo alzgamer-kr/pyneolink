@@ -4,6 +4,7 @@ Small library-use examples for PyNeolink.
 
 - `camera_example.py`: camera info, snapshot, LED read/set, and guarded reboot helper.
 - `sd_card_example.py`: list recordings as `SDFile` objects, download through `file.download()`, serve preview playback, and guarded remove/format helpers.
+- `download_test.py`: concurrent real-camera SD-card download test with one session per camera and output under `.tmp/download-test`.
 - `battery_example.py`: one-shot battery info plus reconnect and online polling modes.
 - `battery_runtime_test.py`: long motion/serve battery runtime checks with CSV and optional HTML output.
 - `stream_session_probe.py`: live stream session diagnostics without battery polling.
@@ -22,6 +23,7 @@ Run examples:
 ```powershell
 python examples/camera_example.py
 python examples/sd_card_example.py
+python examples/download_test.py --config config.json --days 2 --quality high --sort desc --max-files 1
 python examples/battery_example.py
 python examples/battery_runtime_test.py --config config.json --camera "Home-Front" --mode motion
 python examples/battery_runtime_test.py --config config.json --camera "Home-Front" --mode serve --stream high
