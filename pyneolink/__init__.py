@@ -10,8 +10,13 @@ from .ptz import Ptz, PtzPreset
 from .recorder import StreamRecorder
 from .sd_card import (
     DangerousSdCardOperation,
+    DownloadBatchError,
+    DownloadBatchResult,
+    DownloadItemResult,
+    DownloadProgress,
     DownloadSizeMismatch,
     SDFile,
+    SDFileCollection,
     SDFilePreview,
     SDFilePreviewServer,
     SdCard,
@@ -35,8 +40,13 @@ __all__ = [
     "BatteryInfoUpdates",
     "Config",
     "DangerousSdCardOperation",
+    "DownloadBatchError",
+    "DownloadBatchResult",
+    "DownloadItemResult",
+    "DownloadProgress",
     "DownloadSizeMismatch",
     "SDFile",
+    "SDFileCollection",
     "SDFilePreview",
     "SDFilePreviewServer",
     "SdCard",
@@ -56,4 +66,4 @@ __all__ = [
     "serve_streams",
     "__version__",
 ]
-__version__ = "0.4.4"
+__version__ = "0.5.0"

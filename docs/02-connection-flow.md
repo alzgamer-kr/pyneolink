@@ -105,6 +105,17 @@ def ensure_connected(self):
 
 This means `camera.info()`, `camera.command()`, and `camera.sd_card()` operations can bring up connection/login on demand.
 
+## Battery-Camera Session Readiness
+
+Some battery cameras report device type `wifi_solo_ipc` during login but reject
+an ordinary command immediately afterwards. For that type, `Camera` starts its
+dispatcher and waits for the first unsolicited `BatteryList` (`msg_id=252`)
+status event before `with Camera(...)` or `ensure_connected()` returns.
+
+The same wait happens after `reconnect()`. It prevents a first command from
+racing session initialization; it does not send a camera-setting command or
+change camera behavior.
+
 ## `reconnect()`
 
 `reconnect()` always performs:

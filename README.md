@@ -7,7 +7,7 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.4.4` alpha.
+Version: `0.5.0` alpha.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -27,8 +27,8 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 - BC XOR encryption and AES-CFB support through `cryptography`
 - Camera information, UID, LED command, and reboot command
 - Battery status, including reconnect and online polling modes
-- SD-card recording list with pagination and time sorting
-- SD-card recording download with high/low quality selection
+- SD-card recording list with pagination, filtering, metadata sorting, and size limits
+- Resilient SD-card recording download with high/low quality selection, batch results, retryable failed collections, progress, and optional completion notifications
 - SD-card preview playback cache with an HTTP stream helper for players such as VLC
 - Snapshot download to bytes or JPEG file
 - Local MPEG-TS recording from the live stream with `Camera.record()` or the
@@ -37,13 +37,15 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 - HLS timeshift viewing with an in-memory sliding buffer
 - Concurrent SDK stream, motion, battery, and command handling inside one
   `with Camera(...)` session
+- Battery-camera sessions wait for their initial status event before accepting
+  regular commands
 - Automatic dispatcher and live-stream recovery when a camera session closes
 - Motion status and motion event watch mode
 - Two-way voice/talk from microphone, audio file, or generated test tone
 - Camera siren trigger
 - PIR status and PIR on/off settings
 - IR light status and IR on/off/auto settings
-- Stored PTZ preset listing and recall
+- Stored PTZ preset listing and recall by ID or exact preset name
 
 ## Current Limits
 
@@ -63,13 +65,13 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 From PyPI:
 
 ```powershell
-python -m pip install pyneolink==0.4.4
+python -m pip install pyneolink==0.5.0
 ```
 
 With microphone voice input support:
 
 ```powershell
-python -m pip install "pyneolink[voice]==0.4.4"
+python -m pip install "pyneolink[voice]==0.5.0"
 ```
 
 For local development from a checkout:
@@ -186,6 +188,7 @@ PTZ presets:
 ```powershell
 python pyneolink/cli.py ptz --config config.json --camera "Home-Front" presets
 python pyneolink/cli.py ptz --config config.json --camera "Home-Front" preset 3
+python pyneolink/cli.py ptz --config config.json --camera "Home-Front" preset garage
 ```
 
 The tested Argus PT Ultra requires a snapshot exchange after login before it
@@ -193,6 +196,12 @@ accepts PTZ preset recall. The SDK caller must perform that snapshot and recall
 in the same `Camera` session; `goto_preset()` does not do it automatically.
 On that model, the standalone `ptz preset` CLI command may still return `400`
 because it does not currently perform that snapshot warm-up automatically.
+
+For battery cameras reporting device type `wifi_solo_ipc`, entering
+`with Camera(...)` also waits for the first unsolicited `BatteryList` status
+event after login. This prevents an ordinary command from racing the camera's
+session initialization. It is separate from the Argus PT Ultra snapshot
+prerequisite above.
 
 Voice and siren:
 
@@ -272,9 +281,30 @@ from pyneolink import Camera
 with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as camera:
     sd = camera.sd_card()
     videos = sd.files(start="2026-06-03", end="2026-06-03", name=".mp4")
-    if videos:
-        videos[-1].download("downloads", quality="high", rewrite_exists=False, progress=True)
+    print(videos.count(), videos.names(), videos.size)
+
+    videos.sort(key="size", reverse=True)
+    videos = videos.limit_size(2 * 1024**3)
+
+    result = videos.download(
+        "downloads",
+        quality="high",
+        rewrite_exists=False,
+        progress=True,
+        delayed_reconnect_retries=2,
+        delayed_reconnect_delay=120,
+        notify_on_finish=True,
+    )
+    print(result.info())
+
+    failed = result.failed_list()
+    if failed:
+        failed.download("downloads", quality="high", rewrite_exists=False)
 ```
+
+`SdCard.files()` returns a list-compatible `SDFileCollection`: existing
+iteration, indexing, and slicing continue to work. Its batch `download()`
+stores only result metadata, so completed media is never retained in RAM.
 
 Motion:
 

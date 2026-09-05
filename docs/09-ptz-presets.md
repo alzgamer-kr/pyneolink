@@ -9,6 +9,7 @@ presets = camera.ptz().presets()
 # Required by the tested Argus PT Ultra before preset recall.
 camera.snapshot()
 camera.ptz().goto_preset(3)
+camera.ptz().goto_preset("garage")
 ```
 
 ## Protocol
@@ -16,6 +17,10 @@ camera.ptz().goto_preset(3)
 Preset listing sends Baichuan message `190` (`MSG.PTZ_PRESET_LIST`) with the
 normal channel extension. The response contains `<PtzPreset><presetList>`
 entries with an ID, optional name, and optional enabled flag.
+
+`goto_preset()` accepts either an integer ID or an exact case-insensitive preset
+name. Name lookup reads the current preset list in the same camera session and
+rejects missing or ambiguous names before sending a movement command.
 
 Preset recall sends Baichuan message `19` (`MSG.PTZ_PRESET`) with a modern
 encrypted XML payload:
@@ -43,3 +48,8 @@ it has no model-specific side effects and does not start continuous video.
 This behavior is verified on that model and firmware only. Other models may not
 need the snapshot prerequisite, so applications should apply it only where
 their camera model requires it.
+
+This is distinct from battery-session readiness. For a `wifi_solo_ipc` camera,
+PyNeolink waits for the initial unsolicited `BatteryList` status after login
+before it sends regular commands. That avoids an early-session `400`, but does
+not replace a model-specific snapshot prerequisite for PTZ recall.

@@ -43,6 +43,7 @@ class Error(StrEnum):
     SdDownloadTimeout = "Timed out waiting for download response"
     RecordStopTimeout = "Timed out waiting for recording to stop"
     EventListenerClosed = "Camera event listener is closed"
+    SessionReadyTimeout = "Battery camera session did not become ready within {timeout:g} seconds"
     EventStartFailed = "Event listener start failed with response {response_code}"
     VoiceNotSupported = "Camera does not report usable talk/voice ability"
     VoiceNeedsAdpcm = "Camera talk protocol requires ADPCM audio"
@@ -57,6 +58,9 @@ class Error(StrEnum):
     LedStateMissing = "Camera did not return LedState"
     IrModeValue = 'IR mode must be "on", "off", or "auto"'
     PtzPresetId = "PTZ preset id must be an integer from 0 through 255"
+    PtzPresetName = "PTZ preset name must not be empty"
+    PtzPresetNotFound = "No PTZ preset named {name!r}"
+    PtzPresetAmbiguous = "More than one PTZ preset is named {name!r}"
     PtzPresetListMalformed = "Camera returned malformed PTZ preset data"
 
     LoginFailed = "Login failed with response {response_code}"

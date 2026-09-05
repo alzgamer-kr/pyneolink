@@ -1,22 +1,271 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 import sys
 import threading
+import time
+from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import MethodType
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pyneolink import Camera, CameraConfig, CameraConnectionError, load_config
+from pyneolink.core.const import MSG
 
 
 DEFAULT_DAYS = 2
 DEFAULT_OUTPUT_DIR = Path(".tmp/download-test")
+
+
+class DownloadMessageTrace:
+    """Write every camera send/receive header to a line-buffered CSV file."""
+
+    columns = (
+        "datetime",
+        "datetime_utc",
+        "direction",
+        "phase",
+        "file_index",
+        "file_name",
+        "msg_id",
+        "message_name",
+        "msg_num",
+        "response_code",
+        "msg_class",
+        "channel_id",
+        "stream_type",
+        "body_len",
+        "payload_offset",
+        "extension_bytes",
+        "payload_bytes",
+        "raw_payload_bytes",
+        "encrypted_bytes",
+        "resync_bytes",
+        "xml_or_event",
+    )
+
+    def __init__(self, camera: Camera, path: Path) -> None:
+        self.camera = camera
+        self.path = path
+        self.phase = "connect"
+        self.file_index = ""
+        self.file_name = ""
+        self._lock = threading.Lock()
+        self._stream = None
+        self._writer = None
+        self._original_recv = camera._recv_direct
+        self._original_send = camera._send_modern
+        self._counts: Counter[tuple[str, int, int | str]] = Counter()
+        self._message_names = _message_names()
+        self._last_timeout_event = 0.0
+
+    def __enter__(self) -> "DownloadMessageTrace":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.path.open("w", encoding="utf-8", newline="", buffering=1)
+        self._writer = csv.DictWriter(self._stream, fieldnames=self.columns)
+        self._writer.writeheader()
+
+        def recv_traced(_camera, timeout=None, *, binary_playback_331=False):
+            try:
+                message = self._original_recv(
+                    timeout=timeout,
+                    binary_playback_331=binary_playback_331,
+                )
+            except BaseException as exc:
+                if not isinstance(exc, TimeoutError) or time.monotonic() - self._last_timeout_event >= 5.0:
+                    self._last_timeout_event = time.monotonic()
+                    self._write_event("rx-error", f"{type(exc).__name__}: {exc}")
+                raise
+            self._write_rx(message)
+            return message
+
+        def send_traced(
+            _camera,
+            msg_id,
+            msg_num,
+            payload=b"",
+            *,
+            extension=b"",
+            binary_reply=False,
+            msg_class=0x6414,
+            channel_id=None,
+            stream_type=0,
+        ):
+            self._write_tx(
+                msg_id,
+                msg_num,
+                payload,
+                extension=extension,
+                msg_class=msg_class,
+                channel_id=channel_id,
+                stream_type=stream_type,
+                binary_reply=binary_reply,
+            )
+            return self._original_send(
+                msg_id,
+                msg_num,
+                payload,
+                extension=extension,
+                binary_reply=binary_reply,
+                msg_class=msg_class,
+                channel_id=channel_id,
+                stream_type=stream_type,
+            )
+
+        self.camera._recv_direct = MethodType(recv_traced, self.camera)
+        self.camera._send_modern = MethodType(send_traced, self.camera)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.camera._recv_direct = self._original_recv
+        self.camera._send_modern = self._original_send
+        if self._stream is not None:
+            self._stream.close()
+        self._print_summary()
+
+    def select_file(self, index: int, total: int, name: str) -> None:
+        """Associate subsequent packets with one selected recording."""
+        with self._lock:
+            self.phase = "download"
+            self.file_index = f"{index}/{total}"
+            self.file_name = name
+
+    def set_phase(self, phase: str) -> None:
+        """Label subsequent packets with the current test phase."""
+        with self._lock:
+            self.phase = phase
+
+    def _write_tx(
+        self,
+        msg_id: int,
+        msg_num: int,
+        payload: bytes,
+        *,
+        extension: bytes,
+        msg_class: int,
+        channel_id: int | None,
+        stream_type: int,
+        binary_reply: bool,
+    ) -> None:
+        event = _xml_preview(payload) or ("binary_reply=1" if binary_reply else "")
+        self._write(
+            direction="tx",
+            msg_id=int(msg_id),
+            msg_num=msg_num,
+            response_code="",
+            msg_class=msg_class,
+            channel_id=self.camera.config.channel_id if channel_id is None else channel_id,
+            stream_type=stream_type,
+            body_len=len(extension) + len(payload),
+            payload_offset=len(extension),
+            extension_bytes=len(extension),
+            payload_bytes=len(payload),
+            raw_payload_bytes="",
+            encrypted_bytes="",
+            resync_bytes="",
+            xml_or_event=event,
+        )
+
+    def _write_rx(self, message) -> None:
+        header = message.header
+        self._write(
+            direction="rx",
+            msg_id=int(header.msg_id),
+            msg_num=header.msg_num,
+            response_code=header.response_code,
+            msg_class=header.msg_class,
+            channel_id=header.channel_id,
+            stream_type=header.stream_type,
+            body_len=header.body_len,
+            payload_offset=header.payload_offset if header.payload_offset is not None else "",
+            extension_bytes=len(message.extension),
+            payload_bytes=len(message.payload),
+            raw_payload_bytes=message.raw_payload_len,
+            encrypted_bytes=message.encrypted_len if message.encrypted_len is not None else "",
+            resync_bytes=len(message.resync_data),
+            xml_or_event=_xml_preview(message.payload),
+        )
+
+    def _write_event(self, direction: str, event: str) -> None:
+        self._write(
+            direction=direction,
+            msg_id="",
+            msg_num="",
+            response_code="",
+            msg_class="",
+            channel_id="",
+            stream_type="",
+            body_len="",
+            payload_offset="",
+            extension_bytes="",
+            payload_bytes="",
+            raw_payload_bytes="",
+            encrypted_bytes="",
+            resync_bytes="",
+            xml_or_event=event,
+        )
+
+    def _write(self, *, direction: str, msg_id, response_code, msg_class, **values) -> None:
+        with self._lock:
+            if self._writer is None or self._stream is None:
+                return
+            msg_id_value = int(msg_id) if msg_id != "" else ""
+            response_value = int(response_code) if response_code != "" else ""
+            class_value = f"0x{int(msg_class):04x}" if msg_class != "" else ""
+            now = datetime.now().astimezone()
+            self._writer.writerow(
+                {
+                    "datetime": now.isoformat(timespec="milliseconds"),
+                    "datetime_utc": now.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+                    "direction": direction,
+                    "phase": self.phase,
+                    "file_index": self.file_index,
+                    "file_name": self.file_name,
+                    "msg_id": msg_id_value,
+                    "message_name": self._message_names.get(msg_id_value, ""),
+                    "response_code": response_value,
+                    "msg_class": class_value,
+                    **values,
+                }
+            )
+            self._stream.flush()
+            if msg_id_value != "":
+                self._counts[(direction, msg_id_value, response_value)] += 1
+
+    def _print_summary(self) -> None:
+        print(f"Message trace: {self.path}", flush=True)
+        for (direction, msg_id, response), count in sorted(self._counts.items()):
+            name = self._message_names.get(msg_id, "unknown")
+            response_text = response if response != "" else "-"
+            print(
+                f"  {direction} msg_id={msg_id} ({name}) response={response_text} count={count}",
+                flush=True,
+            )
+
+
+def _message_names() -> dict[int, str]:
+    names = {int(item): item.name for item in MSG}
+    catalog = PROJECT_ROOT / "docs" / "10-official-sdk-message-catalog.md"
+    if not catalog.exists():
+        return names
+    for line in catalog.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"\| (\d+) \| `([^`]+)` \|", line)
+        if match:
+            names.setdefault(int(match.group(1)), match.group(2))
+    return names
+
+
+def _xml_preview(payload: bytes, limit: int = 1000) -> str:
+    if not payload.lstrip().startswith((b"<", b"<?xml")):
+        return ""
+    return payload.decode("utf-8", errors="replace").replace("\r", " ").replace("\n", " ")[:limit]
 
 
 @dataclass
@@ -46,6 +295,8 @@ class DownloadTest:
         max_files: int | None = None,
         debug: bool = False,
         ignore_playback_terminal: bool = False,
+        message_trace: Path | None = None,
+        recv_timeout: float = 2.0,
     ) -> None:
         self.camera_configs = camera_configs
         self.start_date = start_date
@@ -57,6 +308,8 @@ class DownloadTest:
         self.max_files = max_files
         self.debug = debug
         self.ignore_playback_terminal = ignore_playback_terminal
+        self.message_trace = message_trace
+        self.recv_timeout = recv_timeout
         self.threads: list[threading.Thread] = []
         self.results: list[CameraDownloadResult] = []
         self._result_lock = threading.Lock()
@@ -88,14 +341,23 @@ class DownloadTest:
     def _download_camera(self, camera_config: CameraConfig) -> None:
         result = CameraDownloadResult(camera_name=camera_config.name)
         state_path = self.output_dir / ".state" / f"{safe_path_name(camera_config.name)}.json"
+        camera = Camera(config=camera_config, state_path=state_path, debug=self.debug)
+        trace_path = self._trace_path(camera_config.name)
+        trace = DownloadMessageTrace(camera, trace_path) if trace_path is not None else None
         try:
-            with Camera(config=camera_config, state_path=state_path, debug=self.debug) as camera:
+            if trace is not None:
+                trace.__enter__()
+            with camera:
+                if trace is not None:
+                    trace.set_phase("camera-info")
                 camera_name = str(camera.info().get("name") or camera_config.name)
                 result.camera_name = camera_name
                 result.output_dir = self.output_dir / safe_path_name(camera_name)
                 result.output_dir.mkdir(parents=True, exist_ok=True)
 
                 sd_card = camera.sd_card()
+                if trace is not None:
+                    trace.set_phase("sd-list")
                 files = sd_card.files(
                     start=self.start_date.isoformat(),
                     end=self.end_date.isoformat(),
@@ -110,16 +372,41 @@ class DownloadTest:
                 for index, replay in enumerate(files, start=1):
                     info = replay.info()
                     source_name = info.get("file_name") or info.get("path") or f"recording {index}"
+                    if trace is not None:
+                        trace.select_file(index, len(files), str(source_name))
                     self._print(camera_name, f"[{index}/{len(files)}] downloading {source_name}")
-                    replay.download(
-                        result.output_dir,
-                        quality=self.quality,
-                        rewrite_exists=self.rewrite_exists,
-                        reconnect_retries=0 if self.ignore_playback_terminal else 3,
-                        progress=lambda message, name=camera_name: self._print(name, message),
-                        ignore_playback_terminal=self.ignore_playback_terminal,
-                    )
-                    result.files_saved += 1
+                    try:
+                        replay.download(
+                            result.output_dir,
+                            quality=self.quality,
+                            rewrite_exists=self.rewrite_exists,
+                            reconnect_retries=0 if self.ignore_playback_terminal else 3,
+                            progress=lambda message, name=camera_name: self._print(name, message),
+                            recv_timeout=self.recv_timeout,
+                            ignore_playback_terminal=self.ignore_playback_terminal,
+                        )
+                        result.files_saved += 1
+                    except Exception as exc:
+                        if not self.ignore_playback_terminal:
+                            raise
+                        error = f"{type(exc).__name__}: {exc}"
+                        result.error = f"{result.error}; {error}" if result.error else error
+                        self._print(
+                            camera_name,
+                            f"[{index}/{len(files)}] probe inconclusive: {error}",
+                        )
+                        if index < len(files):
+                            if trace is not None:
+                                trace.set_phase("reconnect")
+                            self._print(camera_name, "reconnecting before the next independent probe")
+                            time.sleep(5)
+                            try:
+                                camera.reconnect()
+                            except Exception as reconnect_exc:
+                                reconnect_error = f"{type(reconnect_exc).__name__}: {reconnect_exc}"
+                                result.error = f"{result.error}; reconnect: {reconnect_error}"
+                                self._print(camera_name, f"probe reconnect failed: {reconnect_error}")
+                                break
         except CameraConnectionError as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             self._print(result.camera_name, f"camera connection error: {exc}")
@@ -127,8 +414,18 @@ class DownloadTest:
             result.error = f"{type(exc).__name__}: {exc}"
             self._print(result.camera_name, f"test failed: {result.error}")
         finally:
+            if trace is not None:
+                trace.__exit__(None, None, None)
             with self._result_lock:
                 self.results.append(result)
+
+    def _trace_path(self, camera_name: str) -> Path | None:
+        if self.message_trace is None:
+            return None
+        if len(self.camera_configs) == 1:
+            return self.message_trace
+        suffix = self.message_trace.suffix or ".csv"
+        return self.message_trace.with_name(f"{self.message_trace.stem}-{safe_path_name(camera_name)}{suffix}")
 
     def _clean_old_files(self, directory: Path) -> None:
         for path in directory.iterdir():
@@ -186,7 +483,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ignore-playback-terminal",
         action="store_true",
-        help="diagnostic: ignore playback response 300 and read until interrupted or failed",
+        help="diagnostic: observe messages after playback response 300 until the transfer becomes idle",
+    )
+    parser.add_argument(
+        "--message-trace",
+        type=Path,
+        help="write every received and sent message header to a line-buffered CSV file",
+    )
+    parser.add_argument(
+        "--recv-timeout",
+        type=float,
+        default=2.0,
+        help="per-read timeout; probe idle window is ten times this value, at least 20 seconds",
     )
     return parser
 
@@ -210,6 +518,8 @@ def main() -> int:
         raise SystemExit("--days must be zero or greater")
     if args.max_files is not None and args.max_files < 1:
         raise SystemExit("--max-files must be one or greater")
+    if args.recv_timeout <= 0:
+        raise SystemExit("--recv-timeout must be greater than zero")
     end_date = args.end_date or date.today()
     start_date = args.start_date or end_date - timedelta(days=args.days)
     if start_date > end_date:
@@ -234,6 +544,8 @@ def main() -> int:
         max_files=args.max_files,
         debug=args.debug,
         ignore_playback_terminal=args.ignore_playback_terminal,
+        message_trace=args.message_trace,
+        recv_timeout=args.recv_timeout,
     )
     return 0 if test.start() else 1
 

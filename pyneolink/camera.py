@@ -30,6 +30,7 @@ from .voice import Voice
 
 RECOVERABLE_STREAM_ERRORS = (TimeoutError, EOFError, OSError, ProtocolError)
 DEFAULT_STREAM_STALL_TIMEOUT = 15.0
+BATTERY_CAMERA_TYPES = frozenset({"wifi_solo_ipc"})
 
 
 class Camera(AbstractContextManager["Camera"]):
@@ -116,11 +117,15 @@ class Camera(AbstractContextManager["Camera"]):
         self._dispatch_unmatched: deque = deque()
         self._dispatch_error: BaseException | None = None
         self._playback_resync_requests = 0
+        self._session_readiness_required = False
+        self._session_ready = threading.Event()
+        self._session_ready.set()
 
     def __enter__(self) -> "Camera":
         self.connect()
         self.login()
         self.start_dispatcher()
+        self._wait_for_session_ready()
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -179,6 +184,7 @@ class Camera(AbstractContextManager["Camera"]):
                 self.sock.close()
                 self.sock = None
             self.login_xml = ""
+            self._reset_session_readiness()
 
     def reconnect(self) -> None:
         """Close, reconnect, and log in again."""
@@ -190,10 +196,12 @@ class Camera(AbstractContextManager["Camera"]):
                 self.sock.close()
                 self.sock = None
             self.login_xml = ""
+            self._reset_session_readiness()
             self.connect()
             self.login()
             if restart_dispatcher:
                 self.start_dispatcher()
+                self._wait_for_session_ready()
 
     @property
     def dispatcher_active(self) -> bool:
@@ -389,6 +397,12 @@ class Camera(AbstractContextManager["Camera"]):
         if modern.header.response_code != 200:
             raise ProtocolError(msg.Error.LoginFailed.format(response_code=modern.header.response_code))
         self.login_xml = modern.xml_text or ""
+        device_type = (find_text(modern.xml_root, "type") or "").casefold()
+        self._session_readiness_required = device_type in BATTERY_CAMERA_TYPES
+        if self._session_readiness_required:
+            self._session_ready.clear()
+        else:
+            self._session_ready.set()
         return self.login_xml
 
     def info(self, *, include_sensitive: bool = False) -> dict:
@@ -879,6 +893,22 @@ class Camera(AbstractContextManager["Camera"]):
             if not self.login_xml:
                 self.login()
             self.start_dispatcher()
+            self._wait_for_session_ready()
+
+    def _wait_for_session_ready(self) -> None:
+        if not self._session_readiness_required or self._session_ready.is_set():
+            return
+        if self._session_ready.wait(timeout=self.timeout):
+            return
+        with self._dispatch_lock:
+            dispatch_error = self._dispatch_error
+        if dispatch_error is not None:
+            raise dispatch_error
+        raise TimeoutError(msg.Error.SessionReadyTimeout.format(timeout=self.timeout))
+
+    def _reset_session_readiness(self) -> None:
+        self._session_readiness_required = False
+        self._session_ready.set()
 
     def _next_msg(self) -> int:
         with self._send_lock:
@@ -995,6 +1025,8 @@ class Camera(AbstractContextManager["Camera"]):
             self._dispatch_message(message)
 
     def _dispatch_message(self, message: Message) -> None:
+        if message.header.msg_id == MSG.BATTERY_LIST:
+            self._session_ready.set()
         if message.header.msg_id == MSG.UDP_KEEPALIVE:
             return
         with self._dispatch_lock:

@@ -13,8 +13,10 @@ Small library-use examples for PyNeolink.
 - `record_example.py`: local MPEG-TS recording for a fixed duration or until Ctrl+C.
 - `voice_example.py`: play an audio file, use the microphone, send a test tone, and guarded siren helper.
 - `settings_example.py`: PIR and IR status plus guarded setting helpers.
-- `ptz_example.py`: list stored PTZ presets and recall one by ID.
+- `ptz_example.py`: list stored PTZ presets and recall one by ID or name.
 - `stream_example.py`: live MPEG-TS and HLS timeshift HTTP server from a dict config.
+- `physical_camera_smoke_test.py`: non-destructive camera info, battery,
+  IR/LED/PIR status, SD list, snapshot, 20-second recording, and one download.
 
 Each example keeps camera settings and tuning values as small constants near the top of the file. Edit those values directly or replace them with your own config loader.
 
@@ -35,7 +37,24 @@ python examples/voice_example.py
 python examples/settings_example.py
 python examples/ptz_example.py
 python examples/stream_example.py
+python examples/physical_camera_smoke_test.py --config config.json --camera "Home-Front" --debug
 ```
+
+The physical smoke test writes all media and its incremental `result.json` to
+`.tmp/physical-camera-smoke`. It does not run voice or any setting-changing
+commands. Use `--skip-download` when only the bounded status, snapshot, and
+20-second recording checks are needed.
+
+Test the live HTTP server separately and stop it with Ctrl+C after checking the
+selected camera in VLC:
+
+```powershell
+python -u pyneolink/cli.py serve --config config.json --host 127.0.0.1 --port 8565 --debug --buffer-seconds 3 --hls-segment-seconds 4 --hls-buffer-mb 128
+```
+
+For a camera named `Home-Front`, open
+`http://127.0.0.1:8565/Home-Front/high/hls.m3u8`. Opening a URL is what starts
+that camera's stream; the other configured cameras remain unopened.
 
 `remove_example()`, `format_example()`, `reboot_example()`, `siren_example()`, `pir_on_example()`, `pir_off_example()`, `ir_on_example()`, `ir_off_example()`, and `ir_auto_example()` are guarded. Keep them that way unless you have selected the exact target and intentionally pass the confirmation arguments.
 

@@ -38,15 +38,17 @@ class Ptz:
             raise ProtocolError(msg.Error.PtzPresetListFailed.format(response_code=reply.header.response_code))
         return _parse_preset_list(reply.xml_root)
 
-    def goto_preset(self, preset_id: int) -> None:
-        """Recall a stored preset without starting a continuous video stream.
+    def goto_preset(self, preset_id: int | str) -> None:
+        """Recall a stored preset by ID or name.
 
         The command is deliberately not retried after sending: if a response is
         lost, the camera may already be moving and a duplicate recall offers no
         benefit. Some battery camera models require their caller to perform a
         snapshot exchange in the same authenticated session before recall.
+
+        :param preset_id: Numeric preset ID or exact case-insensitive name.
         """
-        validated_id = _validate_preset_id(preset_id)
+        validated_id = self._resolve_preset_id(preset_id)
         reply = self.camera.command(
             MSG.PTZ_PRESET,
             payloads.ptz_preset.format(channel_id=self.channel_id, preset_id=validated_id),
@@ -56,6 +58,21 @@ class Ptz:
         )
         if reply.header.response_code != 200:
             raise ProtocolError(msg.Error.PtzPresetRecallFailed.format(response_code=reply.header.response_code))
+
+    def _resolve_preset_id(self, preset_id: int | str) -> int:
+        if not isinstance(preset_id, str):
+            return _validate_preset_id(preset_id)
+
+        name = preset_id.strip()
+        if not name:
+            raise ValueError(msg.Error.PtzPresetName)
+
+        matches = [preset for preset in self.presets() if (preset.name or "").casefold() == name.casefold()]
+        if not matches:
+            raise ValueError(msg.Error.PtzPresetNotFound.format(name=name))
+        if len(matches) > 1:
+            raise ValueError(msg.Error.PtzPresetAmbiguous.format(name=name))
+        return matches[0].id
 
 
 def _validate_preset_id(preset_id: int) -> int:
