@@ -132,11 +132,24 @@ The connection tracks:
 
 ## ACK, Resend, And Heartbeat
 
-`UdpBcConnection._maintenance()` runs during read timeouts:
+`UdpBcConnection` runs independent receive and maintenance workers by default:
+
+- the receive worker continuously drains the UDP socket, reorders chunks, and
+  wakes the next Baichuan reader when contiguous data is available;
+- the maintenance worker sends ACKs, resends unacknowledged outbound chunks,
+  and sends a P2P heartbeat once per second.
+
+The receive socket requests a 4 MiB OS buffer where the platform permits it.
+This keeps a fast remote download from overflowing the socket while Python is
+parsing or writing earlier packets.
+
+`UdpBcConnection._maintenance()`:
 
 - forces ACK when no ACK has been sent recently;
 - resends unacked sent chunks;
-- sends a P2P heartbeat once per second.
+- sends a P2P heartbeat once per second;
+- carries the measured receive rate in outgoing ACK packets, matching the
+  rate-oriented ACK behavior observed during successful remote downloads.
 
 ACK payloads describe which packet ids after the last contiguous packet have already been received. This helps with gaps.
 
@@ -148,12 +161,16 @@ ACK payloads describe which packet ids after the last contiguous packet have alr
 - `udp_max_packet_id`;
 - `udp_pending_chunks`;
 - `udp_pending_gaps`;
+- `udp_pending_send_chunks`;
 - `udp_buffered_bytes`;
 - `udp_data_packets`;
 - `udp_data_bytes`;
 - `udp_duplicates`;
 - `udp_acks_sent`;
 - `udp_acks_received`;
+- `udp_ack_receive_rate`;
+- `udp_receiver_alive`;
+- `udp_socket_receive_buffer`;
 - `udp_resend_packets`;
 - `udp_seconds_since_data`.
 

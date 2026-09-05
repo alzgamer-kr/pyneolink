@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.5.0
+
+Reliable SD-card downloads and batch download API.
+
+### Added
+
+- Added list-compatible `SDFileCollection` results from `SdCard.files()` with
+  `count()`, `names()`, metadata `info()`, local sorting, total `size`, and
+  `limit_size()` for volume-limited download selections.
+- Added sequential `SDFileCollection.download()` with structured progress,
+  compact `DownloadBatchResult` metadata, reusable completed/skipped/failed
+  collections, JSON-ready reporting, and optional best-effort desktop
+  notification on completion.
+- Added regular and delayed reconnect tiers with independent retry jitter for
+  long-running downloads from multiple cameras.
+- Added download packet tracing to `examples/download_test.py` for controlled
+  physical diagnostics, including local and UTC timestamps, message headers,
+  payload sizes, and readable XML events.
+- Added a static official-SDK Baichuan message catalog and documented the
+  evidence level for each mapping.
+
+### Changed
+
+- Made the reliable UDP transport drain and reorder incoming datagrams in a
+  dedicated receiver worker, with independent ACK/heartbeat maintenance and a
+  larger requested socket receive buffer.
+- Send the measured receive rate in UDP ACK packets and expose receive,
+  buffering, ACK, resend, and receiver-health counters through
+  `debug_snapshot()`.
+- SD-card download progress now includes file index, camera name, transferred
+  size, rate, ETA, chunk count, and visible packet-gap diagnostics.
+
+### Fixed
+
+- Treat the camera's explicit successful terminal response (`300`) as the
+  authoritative SD-card download completion signal instead of guessing from
+  listed file size or a quiet timeout.
+- Keep outbound UDP acknowledgement and receive processing active while media
+  bytes are being decoded or written, preventing remote transfers from stalling
+  behind a full receive socket.
+- Preserve incomplete recordings as `*.part` files and restart them only after
+  reconnecting; finalized files are not silently replaced by partial data.
+- Avoid synchronized P2P reconnect bursts when several remote camera workers
+  encounter the same temporary transport failure.
+- Wait for the initial unsolicited `BatteryList` status event after login on
+  `wifi_solo_ipc` battery cameras, preventing ordinary commands from racing an
+  unready session and receiving an initial `400` response.
+
+### Validation
+
+- A four-camera physical download run completed all 1,050 selected recordings
+  with no failed files or leftover `*.part` files. Twelve interrupted transfers
+  and sixteen reconnects recovered successfully; all twenty LAN discovery
+  misses fell back to successful UID/P2P registration.
+- The fixes were refined against an additional remote battery-camera model and
+  verified without changing that camera's configuration or behavior.
+
+---
+
 ## 0.4.4
 
 Single-session streaming and recovery patch.

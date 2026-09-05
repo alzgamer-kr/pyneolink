@@ -27,6 +27,13 @@ CommandHandler = Callable[[argparse.Namespace], int]
 CameraCommandHandler = Callable[[argparse.Namespace, Camera, CameraConfig], int]
 
 
+def _parse_preset_selector(value: str) -> int | str:
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 class CLI:
     """Command-line interface wrapper around the public SDK."""
 
@@ -200,7 +207,7 @@ class CLI:
         self.add_common_options(ptz)
         self.add_camera_option(ptz)
         ptz.add_argument("action", choices=["presets", "preset"])
-        ptz.add_argument("preset_id", nargs="?", type=int)
+        ptz.add_argument("preset_id", nargs="?", type=_parse_preset_selector)
 
         discover = subparsers.add_parser("discover")
         self.add_common_options(discover)
@@ -600,7 +607,7 @@ class CLI:
         ptz = cam.ptz()
         if args.action == "presets":
             if args.preset_id is not None:
-                self.parser.error("PTZ preset ID is only valid with 'ptz preset'")
+                self.parser.error("PTZ preset selector is only valid with 'ptz preset'")
             presets = ptz.presets()
             print(
                 json.dumps(
@@ -611,7 +618,7 @@ class CLI:
             )
             return 0
         if args.preset_id is None:
-            self.parser.error("PTZ preset ID is required: pyneolink ptz preset <id>")
+            self.parser.error("PTZ preset ID or name is required: pyneolink ptz preset <id-or-name>")
         ptz.goto_preset(args.preset_id)
         print(msg.Log.PtzPresetRecalled.format(preset_id=args.preset_id))
         return 0

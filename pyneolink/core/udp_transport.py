@@ -19,6 +19,7 @@ UDP_DATA_HEADER_SIZE = 20
 UDP_ACK_INTERVAL_SECONDS = 0.031
 UDP_HEARTBEAT_INTERVAL_SECONDS = 1.0
 UDP_RESEND_INTERVAL_SECONDS = 0.5
+UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 class UdpBcConnection:
@@ -34,6 +35,7 @@ class UdpBcConnection:
         timeout: float = 10.0,
         heartbeat_tid: int | None = None,
         auto_maintenance: bool = True,
+        auto_receive: bool | None = None,
     ) -> None:
         """Create a UDP Baichuan connection.
 
@@ -44,6 +46,8 @@ class UdpBcConnection:
         :param timeout: Read timeout in seconds.
         :param heartbeat_tid: Optional discovery heartbeat transaction id.
         :param auto_maintenance: Start a background ACK/heartbeat worker.
+        :param auto_receive: Start a worker that continuously drains the UDP
+            socket. Defaults to the value of ``auto_maintenance``.
         """
         self.sock = sock
         self.addr = addr
@@ -62,10 +66,9 @@ class UdpBcConnection:
         self.last_ack_packet_id: int | None = None
         self.last_resend_at = 0.0
         self.last_heartbeat_at = 0.0
-        self.ack_latency = 0
-        self._ack_latency_values: list[int] = []
-        self._last_ack_latency_recv_at: float | None = None
-        self._last_ack_latency_display_at: float | None = None
+        self.ack_receive_rate = 0
+        self._ack_receive_bytes = 0
+        self._ack_receive_window_started_at = time.monotonic()
         self.data_packets_received = 0
         self.data_bytes_received = 0
         self.duplicate_packets_received = 0
@@ -79,10 +82,25 @@ class UdpBcConnection:
         self.max_data_packet_id: int | None = None
         self.last_data_at = 0.0
         self._state_lock = threading.RLock()
+        self._data_ready = threading.Condition(self._state_lock)
         self._send_lock = threading.RLock()
         self._maintenance_stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
+        self._receive_stop = threading.Event()
+        self._receive_thread: threading.Thread | None = None
+        self._receive_error: BaseException | None = None
+        self._receive_requested = auto_maintenance if auto_receive is None else auto_receive
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_SOCKET_BUFFER_BYTES)
+        except (AttributeError, OSError):
+            pass
+        try:
+            self.socket_receive_buffer = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        except (AttributeError, OSError):
+            self.socket_receive_buffer = None
         self.sock.settimeout(0.01)
+        if self._receive_requested:
+            self.start_receiver()
         if auto_maintenance:
             self.start_maintenance()
 
@@ -143,15 +161,7 @@ class UdpBcConnection:
 
         if size <= 0:
             return b""
-        deadline = time.monotonic() + self.timeout
-        while not self.buffer:
-            if time.monotonic() > deadline:
-                raise TimeoutError(msg.Error.UdpBaichuanTimeout)
-            self._recv_one()
-        take = min(size, len(self.buffer))
-        result = bytes(self.buffer[:take])
-        del self.buffer[:take]
-        return result
+        return self._recv_buffered(size)
 
     def recv_some(self, size: int) -> bytes:
         """
@@ -160,26 +170,69 @@ class UdpBcConnection:
         :param size: Maximum number of bytes to return.
         """
 
+        return self._recv_buffered(size)
+
+    def _recv_buffered(self, size: int) -> bytes:
         deadline = time.monotonic() + self.timeout
-        while not self.buffer:
-            if time.monotonic() > deadline:
-                raise TimeoutError(msg.Error.UdpBaichuanTimeout)
+        while True:
+            with self._data_ready:
+                if self.buffer:
+                    take = min(size, len(self.buffer))
+                    result = bytes(self.buffer[:take])
+                    del self.buffer[:take]
+                    return result
+                if self._receive_error is not None:
+                    raise self._receive_error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(msg.Error.UdpBaichuanTimeout)
+                if self._receive_requested:
+                    self._data_ready.wait(timeout=remaining)
+                    continue
             self._recv_one()
-        take = min(size, len(self.buffer))
-        result = bytes(self.buffer[:take])
-        del self.buffer[:take]
-        return result
 
     def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
+        with self._data_ready:
+            self.closed = True
+            self._data_ready.notify_all()
+        self.stop_receiver()
         self.stop_maintenance()
         if hasattr(self.sock, "close"):
             self.sock.close()
 
     def maintain(self) -> None:
         self._maintenance()
+
+    def start_receiver(self) -> None:
+        """Start the worker that drains and reorders incoming UDP packets."""
+
+        if self.closed:
+            return
+        thread = self._receive_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._receive_requested = True
+        self._receive_error = None
+        self._receive_stop.clear()
+        self._receive_thread = threading.Thread(
+            target=self._receive_loop,
+            name="pyneolink-udp-receive",
+            daemon=True,
+        )
+        self._receive_thread.start()
+
+    def stop_receiver(self) -> None:
+        """Stop the background UDP receive worker."""
+
+        self._receive_stop.set()
+        with self._data_ready:
+            self._data_ready.notify_all()
+        thread = self._receive_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        self._receive_thread = None
 
     def start_maintenance(self) -> None:
         """Start independent UDP ACK/heartbeat maintenance."""
@@ -243,6 +296,8 @@ class UdpBcConnection:
                 self.recv_chunks[packet_id] = payload
                 self.data_packets_received += 1
                 self.data_bytes_received += len(payload)
+                self._ack_receive_bytes += len(payload)
+                self._refresh_ack_receive_rate()
                 self.last_data_packet_id = packet_id
                 self.max_data_packet_id = (
                     packet_id if self.max_data_packet_id is None else max(self.max_data_packet_id, packet_id)
@@ -252,6 +307,8 @@ class UdpBcConnection:
                 while self.next_recv_id in self.recv_chunks:
                     self.buffer.extend(self.recv_chunks.pop(self.next_recv_id))
                     self.next_recv_id += 1
+                if self.buffer:
+                    self._data_ready.notify_all()
         elif kind == "ack":
             _kind, connection_id, _group_id, packet_id, _latency, payload = parsed
             if connection_id == self.client_id:
@@ -267,8 +324,9 @@ class UdpBcConnection:
     def _send_ack(self) -> None:
         with self._state_lock:
             packet_id, payload, group_id = self._ack_state()
-            ack_latency = self.ack_latency
-        packet = encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=ack_latency)
+            self._refresh_ack_receive_rate()
+            receive_rate = self.ack_receive_rate
+        packet = encode_udp_ack(self.camera_id, packet_id, payload, group_id, maybe_latency=receive_rate)
         self._send_packets([packet])
         with self._state_lock:
             if packet_id != 0xFFFFFFFF:
@@ -307,7 +365,6 @@ class UdpBcConnection:
                     sent_id = packet_id + 1 + idx
                     if value:
                         self.sent_chunks.pop(sent_id, None)
-            self._feed_ack_latency()
 
     def _maintenance(self) -> None:
         now = time.monotonic()
@@ -322,19 +379,16 @@ class UdpBcConnection:
         if now - self.last_heartbeat_at >= UDP_HEARTBEAT_INTERVAL_SECONDS:
             self._send_heartbeat()
 
-    def _feed_ack_latency(self) -> None:
-        now = time.monotonic()
-        if self._last_ack_latency_recv_at is not None:
-            self._ack_latency_values.append(int((now - self._last_ack_latency_recv_at) * 1_000_000))
-        self._last_ack_latency_recv_at = now
-        if self._last_ack_latency_display_at is None:
-            self._last_ack_latency_display_at = now
-            self.ack_latency = 0
-        elif now - self._last_ack_latency_display_at > 1.0:
-            self._last_ack_latency_display_at = now
-            if self._ack_latency_values:
-                self.ack_latency = sum(self._ack_latency_values) // len(self._ack_latency_values)
-                self._ack_latency_values = []
+    def _refresh_ack_receive_rate(self, now: float | None = None) -> None:
+        """Update the receive-rate value carried in outgoing UDP ACK packets."""
+
+        current = time.monotonic() if now is None else now
+        elapsed = current - self._ack_receive_window_started_at
+        if elapsed < 1.0:
+            return
+        self.ack_receive_rate = int(self._ack_receive_bytes / elapsed)
+        self._ack_receive_bytes = 0
+        self._ack_receive_window_started_at = current
 
     def _send_heartbeat(self) -> None:
         xml = f"<P2P><C2D_HB><cid>{self.client_id}</cid><did>{self.camera_id}</did></C2D_HB></P2P>"
@@ -364,6 +418,20 @@ class UdpBcConnection:
             except OSError:
                 return
 
+    def _receive_loop(self) -> None:
+        while not self._receive_stop.is_set():
+            if self.closed:
+                return
+            try:
+                self._recv_one()
+            except BaseException as exc:
+                if self.closed or self._receive_stop.is_set():
+                    return
+                with self._data_ready:
+                    self._receive_error = exc
+                    self._data_ready.notify_all()
+                return
+
     def _send_packets(self, packets: list[bytes]) -> None:
         if not packets:
             return
@@ -377,6 +445,7 @@ class UdpBcConnection:
         now = time.monotonic()
         with self._state_lock:
             max_id = self.max_data_packet_id
+            ack_packet_id, ack_payload, _ack_group_id = self._ack_state()
             pending_gaps = 0
             if max_id is not None and self.next_recv_id <= max_id:
                 pending_gaps = sum(
@@ -389,6 +458,7 @@ class UdpBcConnection:
                 "udp_max_packet_id": max_id,
                 "udp_pending_chunks": len(self.recv_chunks),
                 "udp_pending_gaps": pending_gaps,
+                "udp_pending_send_chunks": len(self.sent_chunks),
                 "udp_buffered_bytes": len(self.buffer),
                 "udp_data_packets": self.data_packets_received,
                 "udp_data_bytes": self.data_bytes_received,
@@ -397,6 +467,13 @@ class UdpBcConnection:
                 "udp_unknown": self.unknown_packets,
                 "udp_acks_sent": self.acks_sent,
                 "udp_acks_received": self.acks_received,
+                "udp_last_ack_packet_id": self.last_ack_packet_id,
+                "udp_ack_packet_id": ack_packet_id,
+                "udp_ack_payload_bytes": len(ack_payload),
+                "udp_ack_missing_packets": ack_payload.count(0),
+                "udp_ack_receive_rate": self.ack_receive_rate,
+                "udp_receiver_alive": bool(self._receive_thread and self._receive_thread.is_alive()),
+                "udp_socket_receive_buffer": self.socket_receive_buffer,
                 "udp_heartbeats_sent": self.heartbeats_sent,
                 "udp_resend_packets": self.resend_packets_sent,
                 "udp_seconds_since_data": seconds_since_data,

@@ -14,5 +14,6 @@ Recommended reading order:
 8. [07-media-and-streaming.md](07-media-and-streaming.md): BCMedia parsing, MPEG-TS, HLS timeshift, snapshots, and local recording.
 9. [08-motion-voice-and-controls.md](08-motion-voice-and-controls.md): motion status/watch, two-way voice, siren, PIR, IR, and basic camera controls.
 10. [09-ptz-presets.md](09-ptz-presets.md): stored PTZ preset listing and recall.
+11. [10-official-sdk-message-catalog.md](10-official-sdk-message-catalog.md): static official-SDK mappings for additional Baichuan message IDs.
 
 This is not official Reolink documentation. It describes the current PyNeolink implementation and the reverse-engineered behavior it relies on.

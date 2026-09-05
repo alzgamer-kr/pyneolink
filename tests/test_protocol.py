@@ -13,7 +13,7 @@ from pyneolink import (
 )
 from pyneolink.config import load_config
 from pyneolink.battery import Battery, BatteryInfoUpdates, parse_battery_xml
-from pyneolink.sd_card import DownloadSizeMismatch, SDFilePreview, SdCard
+from pyneolink.sd_card import DownloadProgress, DownloadSizeMismatch, SDFileCollection, SDFilePreview, SdCard
 from pyneolink.core.bc import (
     Header,
     InvalidMagicError,
@@ -59,11 +59,11 @@ from pyneolink.stream_server import (
 )
 from datetime import datetime
 from pyneolink.sd_card import (
+    _DownloadTransfer,
     _FileInfoQuery,
     _download_output_file_name,
     _download_queries,
     _download_raw,
-    _download_size_is_complete,
     _normalize_download_stream_type,
     _playback_download_payload,
     _replay_download_payload,
@@ -344,6 +344,12 @@ def test_udp_ack_state_reports_missing_packets():
     assert payload == b"\0\1\1\0\1"
     assert group_id == 0
 
+    snapshot = connection.debug_snapshot()
+    assert snapshot["udp_pending_send_chunks"] == 0
+    assert snapshot["udp_ack_packet_id"] == 9
+    assert snapshot["udp_ack_payload_bytes"] == 5
+    assert snapshot["udp_ack_missing_packets"] == 2
+
 
 def test_udp_heartbeat_reuses_connection_tid():
     class FakeSocket:
@@ -447,20 +453,43 @@ def test_udp_maintenance_repeats_ack_on_fixed_cadence():
     assert ack_packets[1] == first_packets[0]
 
 
-def test_udp_latency_uses_received_acks_not_data_packets():
+def test_udp_ack_metric_tracks_received_payload_rate():
     class FakeSocket:
         def __init__(self):
             self.sent = []
-            self.received = [
-                encode_udp_data(11, 0, b"data"),
-                encode_udp_ack(11, 0),
-            ]
 
         def settimeout(self, _timeout):
             pass
 
         def sendto(self, data, addr):
             self.sent.append((data, addr))
+
+    sock = FakeSocket()
+    connection = UdpBcConnection(sock, ("127.0.0.1", 1234), 11, 22, auto_maintenance=False)
+    connection._ack_receive_window_started_at = 10.0
+    connection._ack_receive_bytes = 600_000
+    connection._refresh_ack_receive_rate(now=11.0)
+
+    assert connection.ack_receive_rate == 600_000
+
+    connection._ack_receive_window_started_at = time.monotonic()
+    connection.next_recv_id = 1
+    connection._send_ack()
+
+    packet = decode_udp_packet(sock.sent[-1][0])
+    assert packet == ("ack", 22, 0, 0, 600_000, b"")
+
+
+def test_udp_received_data_feeds_ack_receive_rate():
+    class FakeSocket:
+        def __init__(self):
+            self.received = [encode_udp_data(11, 0, b"data")]
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendto(self, _data, _addr):
+            pass
 
         def recvfrom(self, _size):
             return self.received.pop(0), ("127.0.0.1", 1234)
@@ -472,14 +501,11 @@ def test_udp_latency_uses_received_acks_not_data_packets():
         22,
         auto_maintenance=False,
     )
-    connection.last_ack_at = time.monotonic()
-    connection.last_heartbeat_at = time.monotonic()
+    connection._ack_receive_window_started_at = time.monotonic()
 
     connection._recv_one()
-    assert connection._last_ack_latency_recv_at is None
 
-    connection._recv_one()
-    assert connection._last_ack_latency_recv_at is not None
+    assert connection._ack_receive_bytes == 4
 
 
 def test_udp_maintenance_runs_while_data_arrives():
@@ -555,6 +581,66 @@ def test_udp_recv_allows_large_message_to_arrive_in_slow_parts():
 
     assert message.header.msg_id == MSG.FILE_PLAYBACK
     assert message.payload == payload
+
+
+def test_udp_background_receiver_drains_and_reorders_packets():
+    class QueueSocket:
+        def __init__(self):
+            self.received = []
+            self.ready = threading.Condition()
+            self.closed = False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendto(self, _data, _addr):
+            pass
+
+        def recvfrom(self, _size):
+            with self.ready:
+                if not self.received and not self.closed:
+                    self.ready.wait(timeout=0.01)
+                if self.closed:
+                    raise OSError("closed")
+                if not self.received:
+                    raise TimeoutError("idle")
+                return self.received.pop(0), ("127.0.0.1", 1234)
+
+        def push(self, packet):
+            with self.ready:
+                self.received.append(packet)
+                self.ready.notify_all()
+
+        def close(self):
+            with self.ready:
+                self.closed = True
+                self.ready.notify_all()
+
+    sock = QueueSocket()
+    connection = UdpBcConnection(
+        sock,
+        ("127.0.0.1", 1234),
+        11,
+        22,
+        timeout=0.5,
+        auto_maintenance=False,
+        auto_receive=True,
+    )
+    try:
+        sock.push(encode_udp_data(11, 1, b"second"))
+        sock.push(encode_udp_data(11, 0, b"first"))
+
+        assert connection.recv(11) == b"firstsecond"
+        snapshot = connection.debug_snapshot()
+        assert snapshot["udp_data_packets"] == 2
+        assert snapshot["udp_receiver_alive"]
+    finally:
+        connection.close()
+
+    assert connection._receive_thread is None
 
 
 def test_media_info_packet():
@@ -1346,6 +1432,101 @@ def test_camera_context_manager_starts_dispatcher(monkeypatch):
         assert opened is camera
 
     assert calls == ["connect", "login", "dispatch"]
+
+
+def test_camera_login_waits_for_battery_list_on_solo_camera(monkeypatch):
+    legacy = Message(
+        Header(MSG.LOGIN, 0, 0, 0, 1, 0, MSG_CLASS.LEGACY),
+        payload=xml_document("<LoginUser><nonce>nonce</nonce></LoginUser>"),
+    )
+    modern = Message(
+        Header(MSG.LOGIN, 0, 0, 0, 1, 200, MSG_CLASS.MODERN),
+        payload=xml_document("<DeviceInfo><type>wifi_solo_ipc</type></DeviceInfo>"),
+    )
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = object()
+    replies = iter((legacy, modern))
+
+    monkeypatch.setattr(camera, "_send", lambda _data: None)
+    monkeypatch.setattr(camera, "_recv", lambda: next(replies))
+
+    camera.login()
+
+    assert camera._session_readiness_required is True
+    assert camera._session_ready.is_set() is False
+
+
+def test_camera_login_does_not_wait_for_non_battery_camera(monkeypatch):
+    legacy = Message(
+        Header(MSG.LOGIN, 0, 0, 0, 1, 0, MSG_CLASS.LEGACY),
+        payload=xml_document("<LoginUser><nonce>nonce</nonce></LoginUser>"),
+    )
+    modern = Message(
+        Header(MSG.LOGIN, 0, 0, 0, 1, 200, MSG_CLASS.MODERN),
+        payload=xml_document("<DeviceInfo><type>ipc</type></DeviceInfo>"),
+    )
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = object()
+    camera._session_ready.clear()
+    replies = iter((legacy, modern))
+
+    monkeypatch.setattr(camera, "_send", lambda _data: None)
+    monkeypatch.setattr(camera, "_recv", lambda: next(replies))
+
+    camera.login()
+
+    assert camera._session_readiness_required is False
+    assert camera._session_ready.is_set() is True
+
+
+def test_camera_battery_list_marks_session_ready():
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera._session_readiness_required = True
+    camera._session_ready.clear()
+    battery_list = Message(
+        Header(MSG.BATTERY_LIST, 0, 0, 0, 2, 0, MSG_CLASS.MODERN),
+    )
+
+    camera._dispatch_message(battery_list)
+
+    assert camera._session_ready.is_set() is True
+    assert camera._dispatch_unmatched[-1] is battery_list
+
+
+def test_camera_reconnect_waits_for_battery_session_readiness(monkeypatch):
+    class FakeSocket:
+        def close(self):
+            pass
+
+    camera = Camera(uuid="ABCDEF0123456789", password="secret", state_path=None)
+    camera.sock = FakeSocket()
+    camera.login_xml = "<logged-in />"
+    camera._dispatcher_requested = True
+    calls = []
+
+    def connect():
+        calls.append("connect")
+        camera.sock = FakeSocket()
+
+    def login():
+        calls.append("login")
+        camera.login_xml = "<DeviceInfo><type>wifi_solo_ipc</type></DeviceInfo>"
+        camera._session_readiness_required = True
+        camera._session_ready.clear()
+
+    def start_dispatcher():
+        calls.append("dispatch")
+        camera._dispatch_message(Message(Header(MSG.BATTERY_LIST, 0, 0, 0, 2, 0, MSG_CLASS.MODERN)))
+        return camera
+
+    monkeypatch.setattr(camera, "connect", connect)
+    monkeypatch.setattr(camera, "login", login)
+    monkeypatch.setattr(camera, "start_dispatcher", start_dispatcher)
+
+    camera.reconnect()
+
+    assert calls == ["connect", "login", "dispatch"]
+    assert camera._session_ready.is_set() is True
 
 
 def test_camera_reconnect_restarts_dead_dispatcher(monkeypatch):
@@ -2278,6 +2459,55 @@ def test_ptz_goto_preset_sends_topos_without_snapshot_side_effect():
     assert kwargs == {"retry_on_timeout": False, "reconnect_retries": 0}
 
 
+def test_ptz_goto_preset_resolves_name_in_same_camera_session():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.calls = []
+
+        def command(self, msg_id, payload=b"", *, extension=b"", **kwargs):
+            self.calls.append((msg_id, payload, extension, kwargs))
+            if msg_id == MSG.PTZ_PRESET_LIST:
+                xml = xml_document(
+                    '<PtzPreset version="1.1"><presetList>'
+                    "<preset><id>0</id><name>vorota</name></preset>"
+                    "<preset><id>1</id><name>garage</name></preset>"
+                    "</presetList></PtzPreset>"
+                )
+                return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+            return Message(Header(msg_id, 0, 0, 0, 2, 200, MSG_CLASS.MODERN), payload=b"")
+
+    camera = FakeCamera()
+    Ptz(camera).goto_preset("Garage")
+
+    assert [call[0] for call in camera.calls] == [MSG.PTZ_PRESET_LIST, MSG.PTZ_PRESET]
+    assert b"<id>1</id>" in camera.calls[1][1]
+
+
+def test_ptz_goto_preset_rejects_unknown_name_without_moving():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.calls = []
+
+        def command(self, msg_id, payload=b"", *, extension=b"", **kwargs):
+            self.calls.append(msg_id)
+            xml = xml_document('<PtzPreset version="1.1"><presetList></presetList></PtzPreset>')
+            return Message(Header(msg_id, len(xml), 0, 0, 1, 200, MSG_CLASS.MODERN), payload=xml)
+
+    camera = FakeCamera()
+    try:
+        Ptz(camera).goto_preset("missing")
+    except ValueError as exc:
+        assert "missing" in str(exc)
+    else:
+        raise AssertionError("unknown PTZ preset name was accepted")
+
+    assert camera.calls == [MSG.PTZ_PRESET_LIST]
+
+
 def test_ptz_goto_preset_rejects_invalid_id_before_command():
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
@@ -2338,6 +2568,13 @@ def test_cli_ptz_command_parses_preset_action_and_id():
     assert args.camera == "Camera name"
     assert args.action == "preset"
     assert args.preset_id == 3
+
+
+def test_cli_ptz_command_parses_preset_action_and_name():
+    args = CLI().parse_args(["ptz", "--config", "file.conf", "--camera", "Camera name", "preset", "garage"])
+
+    assert args.action == "preset"
+    assert args.preset_id == "garage"
 
 
 def test_cli_led_command_accepts_auto_alias():
@@ -2731,13 +2968,13 @@ def test_sd_card_download_skips_existing_file(tmp_path):
     assert messages == [f"  skipped existing file: {target}"]
 
 
-def test_sd_card_download_replaces_implausibly_small_existing_mp4(tmp_path, monkeypatch):
+def test_sd_card_download_replaces_existing_non_mp4_with_wrong_size(tmp_path, monkeypatch):
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
 
-    target = tmp_path / "clip.mp4"
+    target = tmp_path / "clip.bin"
     target.write_bytes(b"final-mp4")
-    stale_part = tmp_path / "clip.mp4.download8_full_high_class6482.part"
+    stale_part = tmp_path / "clip.bin.download8_full_high_class6482.part"
     stale_part.write_bytes(b"partial")
     messages = []
     sd_card = SdCard(FakeCamera())
@@ -2749,7 +2986,7 @@ def test_sd_card_download_replaces_implausibly_small_existing_mp4(tmp_path, monk
 
     monkeypatch.setattr(sd_card, "_download_once", fake_download_once)
 
-    result = sd_card.file({"file_name": "clip.mp4", "size": 999999}).download(
+    result = sd_card.file({"file_name": "clip.bin", "size": 999999}).download(
         tmp_path,
         rewrite_exists=False,
         progress=messages.append,
@@ -2758,12 +2995,10 @@ def test_sd_card_download_replaces_implausibly_small_existing_mp4(tmp_path, monk
     assert result == target
     assert target.stat().st_size == 999999
     assert stale_part.exists()
-    assert messages == [
-        f"  existing file size differs; downloading again: {target} local=9 bytes camera=999999 bytes"
-    ]
+    assert messages == [f"  existing file size differs; downloading again: {target} local=9 bytes camera=999999 bytes"]
 
 
-def test_sd_card_download_accepts_existing_converted_mp4_with_small_size_difference(tmp_path):
+def test_sd_card_download_accepts_existing_finalized_mp4(tmp_path):
     class FakeCamera:
         config = type("Config", (), {"channel_id": 0})()
 
@@ -2771,19 +3006,112 @@ def test_sd_card_download_accepts_existing_converted_mp4_with_small_size_differe
     target.write_bytes(b"x" * 950)
     messages = []
 
-    result = SdCard(FakeCamera()).file({"file_name": "clip.mp4", "size": 1000}).download(
-        tmp_path,
-        rewrite_exists=False,
-        progress=messages.append,
+    result = (
+        SdCard(FakeCamera())
+        .file({"file_name": "clip.mp4", "size": 1000})
+        .download(
+            tmp_path,
+            rewrite_exists=False,
+            progress=messages.append,
+        )
     )
 
     assert result == target
     assert messages == [f"  skipped existing file: {target}"]
 
 
-def test_playback_download_size_rejects_small_fragment_but_allows_container_difference():
-    assert not _download_size_is_complete(950_012, 9_860_640, allow_container_overhead=True)
-    assert _download_size_is_complete(11_929_024, 12_168_753, allow_container_overhead=True)
+def test_sd_card_download_rejects_partial_playback_without_terminal_marker(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def send(self, *_args, **_kwargs):
+            return 0
+
+    query = _FileInfoQuery(
+        "playback143/range-mainStream-nosub/bcmedia",
+        MSG.FILE_PLAYBACK,
+        b"request",
+        msg_class=MSG_CLASS.MODERN,
+    )
+    sd_card = SdCard(FakeCamera())
+    monkeypatch.setattr("pyneolink.sd_card._download_queries", lambda *_args: [query])
+
+    def partial_download(_query, output, **_kwargs):
+        output.write_bytes(b"x" * 95)
+        return _DownloadTransfer(written=95, completed=False)
+
+    monkeypatch.setattr(sd_card, "_download_with_query", partial_download)
+
+    try:
+        sd_card._download_once(
+            {},
+            {},
+            "clip",
+            tmp_path / "clip.bin",
+            expected_size=100,
+            chunk_limit=0,
+            progress=None,
+            max_attempts=1,
+            recv_timeout=0.1,
+            ignore_playback_terminal=False,
+        )
+    except DownloadSizeMismatch as exc:
+        assert "downloaded 95 bytes, expected 100 bytes" in str(exc)
+    else:
+        raise AssertionError("partial playback without response 300 must fail")
+
+
+def test_sd_card_download_reconnects_instead_of_trying_fallback_after_partial_data(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def send(self, *_args, **_kwargs):
+            return 0
+
+    queries = [
+        _FileInfoQuery(
+            "playback143/range-mainStream-nosub/bcmedia",
+            MSG.FILE_PLAYBACK,
+            b"primary",
+            msg_class=MSG_CLASS.MODERN,
+        ),
+        _FileInfoQuery(
+            "playback143/range-mainStream/bcmedia",
+            MSG.FILE_PLAYBACK,
+            b"fallback",
+            msg_class=MSG_CLASS.MODERN,
+        ),
+    ]
+    sd_card = SdCard(FakeCamera())
+    calls = []
+    monkeypatch.setattr("pyneolink.sd_card._download_queries", lambda *_args: queries)
+
+    def interrupted_download(query, output, **_kwargs):
+        calls.append(query.label)
+        output.write_bytes(b"partial")
+        return _DownloadTransfer(written=7, completed=False)
+
+    monkeypatch.setattr(sd_card, "_download_with_query", interrupted_download)
+
+    try:
+        sd_card._download_once(
+            {},
+            {},
+            "clip",
+            tmp_path / "clip.bin",
+            expected_size=100,
+            chunk_limit=0,
+            progress=None,
+            max_attempts=2,
+            recv_timeout=0.1,
+            ignore_playback_terminal=False,
+        )
+    except DownloadSizeMismatch:
+        pass
+    else:
+        raise AssertionError("interrupted transfer must request a fresh connection")
+
+    assert calls == ["playback143/range-mainStream-nosub/bcmedia"]
 
 
 def test_sd_card_download_reconnects_after_size_mismatch(tmp_path, monkeypatch):
@@ -2821,7 +3149,54 @@ def test_sd_card_download_reconnects_after_size_mismatch(tmp_path, monkeypatch):
     assert result == tmp_path / "clip.mp4"
     assert camera.reconnects == 1
     assert len(calls) == 2
-    assert any("reconnect attempt 1/1 after 5s" in message for message in messages)
+    assert any("reconnect attempt 1/1 after" in message for message in messages)
+
+
+def test_sd_card_download_uses_delayed_reconnect_after_regular_attempts_fail(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+        def __init__(self):
+            self.reconnects = 0
+
+        def reconnect(self):
+            self.reconnects += 1
+            if self.reconnects == 1:
+                raise TimeoutError("still offline")
+
+    camera = FakeCamera()
+    sd_card = SdCard(camera)
+    downloads = 0
+    sleeps = []
+    messages = []
+
+    def fake_download_once(*args, **kwargs):
+        nonlocal downloads
+        downloads += 1
+        if downloads == 1:
+            raise DownloadSizeMismatch("partial")
+        target = args[3]
+        target.write_bytes(b"complete")
+        return target
+
+    monkeypatch.setattr(sd_card, "_download_once", fake_download_once)
+    monkeypatch.setattr("pyneolink.sd_card.monotonic_clock.sleep", sleeps.append)
+
+    result = sd_card.file({"file_name": "clip.mp4"}).download(
+        tmp_path,
+        reconnect_retries=1,
+        reconnect_delay=5,
+        delayed_reconnect_retries=2,
+        delayed_reconnect_delay=120,
+        reconnect_jitter=0,
+        progress=messages.append,
+    )
+
+    assert result == tmp_path / "clip.mp4"
+    assert downloads == 2
+    assert camera.reconnects == 2
+    assert sleeps == [5, 120]
+    assert any("delayed reconnect attempt 1/2 after 120.0s" in message for message in messages)
 
 
 def test_sd_card_download_limits_successful_reconnect_retries(tmp_path, monkeypatch):
@@ -3003,10 +3378,10 @@ def test_sd_card_download_treats_400_after_partial_data_as_interrupted_download(
 
     try:
         sd_card.file(
-                {
-                    "file_name": "clip.mp4",
-                    "size": 8,
-                }
+            {
+                "file_name": "clip.mp4",
+                "size": 8,
+            }
         ).download(
             tmp_path,
             quality="high",
@@ -3051,7 +3426,7 @@ def test_direct_download_strips_bcmedia_setup_header(tmp_path):
 
     output = tmp_path / "download.part"
     sd_card = SdCard(FakeCamera())
-    written = sd_card._download_with_query(
+    transfer = sd_card._download_with_query(
         _FileInfoQuery(
             "download8/id/class6482",
             MSG.FILE_DOWNLOAD_VIDEO,
@@ -3066,7 +3441,8 @@ def test_direct_download_strips_bcmedia_setup_header(tmp_path):
         recv_timeout=0.1,
     )
 
-    assert written == len(mp4)
+    assert transfer.written == len(mp4)
+    assert transfer.completed
     assert output.read_bytes() == mp4
 
 
@@ -3097,7 +3473,7 @@ def test_playback_331_continues_to_normal_completion(tmp_path):
     output = tmp_path / "playback.bcmedia"
     camera = FakeCamera()
     sd_card = SdCard(camera)
-    written = sd_card._download_with_query(
+    transfer = sd_card._download_with_query(
         _FileInfoQuery(
             "playback143/range-subStream/bcmedia",
             MSG.FILE_PLAYBACK,
@@ -3114,13 +3490,14 @@ def test_playback_331_continues_to_normal_completion(tmp_path):
         recv_timeout=0.1,
     )
 
-    assert written == 11
+    assert transfer.written == 11
+    assert transfer.completed
     assert output.read_bytes() == b"firstsecond"
     assert camera.recv_scopes == [True, True, True, True]
     assert "playback finished response=300" in sd_card._last_download_detail
 
 
-def test_playback_early_terminal_keeps_receiving_until_expected_data_arrives(tmp_path):
+def test_playback_terminal_is_authoritative_even_when_list_size_differs(tmp_path):
     class FakeCamera:
         sock = None
         request_messages = _fake_request_messages
@@ -3145,7 +3522,7 @@ def test_playback_early_terminal_keeps_receiving_until_expected_data_arrives(tmp
     output = tmp_path / "playback.bcmedia"
     sd_card = SdCard(FakeCamera())
 
-    written = sd_card._download_with_query(
+    transfer = sd_card._download_with_query(
         _FileInfoQuery(
             "playback143/range-mainStream-nosub/bcmedia",
             MSG.FILE_PLAYBACK,
@@ -3162,8 +3539,9 @@ def test_playback_early_terminal_keeps_receiving_until_expected_data_arrives(tmp
         recv_timeout=0.1,
     )
 
-    assert written == 10
-    assert output.read_bytes() == b"abcdefghij"
+    assert transfer.written == 2
+    assert transfer.completed
+    assert output.read_bytes() == b"ab"
     assert "playback finished response=300" in sd_card._last_download_detail
 
 
@@ -3189,7 +3567,7 @@ def test_response_331_remains_terminal_for_non_playback_downloads(tmp_path):
 
     output = tmp_path / "download.part"
     sd_card = SdCard(FakeCamera())
-    written = sd_card._download_with_query(
+    transfer = sd_card._download_with_query(
         _FileInfoQuery("download13/id/class6482", MSG.FILE_DOWNLOAD, b"request", msg_class=MSG_CLASS.FILE_DOWNLOAD),
         output,
         expected_size=None,
@@ -3199,9 +3577,109 @@ def test_response_331_remains_terminal_for_non_playback_downloads(tmp_path):
         recv_timeout=0.1,
     )
 
-    assert written == 5
+    assert transfer.written == 5
+    assert not transfer.completed
     assert output.read_bytes() == b"first"
     assert "stopped after response 331" in sd_card._last_download_detail
+
+
+def test_response_300_completes_direct_download_without_size_match(tmp_path):
+    class FakeCamera:
+        sock = None
+        request_messages = _fake_request_messages
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.replies = [
+                Message(Header(MSG.FILE_DOWNLOAD, 3, 0, 0, 7, 200, MSG_CLASS.FILE_DOWNLOAD), payload=b"abc"),
+                Message(Header(MSG.FILE_DOWNLOAD, 0, 0, 0, 7, 300, MSG_CLASS.FILE_DOWNLOAD)),
+            ]
+
+        def send(self, msg_id, payload=b"", **kwargs):
+            if msg_id == MSG.UDP_KEEPALIVE:
+                return 0
+            return 7
+
+        def _recv(self, timeout=None, **_kwargs):
+            return self.replies.pop(0)
+
+    output = tmp_path / "download.part"
+    sd_card = SdCard(FakeCamera())
+    transfer = sd_card._download_with_query(
+        _FileInfoQuery(
+            "download13/id/class6482",
+            MSG.FILE_DOWNLOAD,
+            b"request",
+            msg_class=MSG_CLASS.FILE_DOWNLOAD,
+        ),
+        output,
+        expected_size=100,
+        chunk_limit=0,
+        idle_timeouts=2,
+        progress=None,
+        recv_timeout=0.1,
+    )
+
+    assert transfer.written == 3
+    assert transfer.completed
+    assert output.read_bytes() == b"abc"
+    assert "download finished response=300" in sd_card._last_download_detail
+
+
+def test_playback_probe_observes_response_300_until_transfer_is_idle(tmp_path, monkeypatch):
+    class FakeClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def monotonic(self):
+            self.value += 11.0
+            return self.value
+
+    class FakeCamera:
+        sock = None
+        request_messages = _fake_request_messages
+
+        def __init__(self):
+            self.binary_msg_nums = set()
+            self.replies = [
+                Message(Header(MSG.FILE_PLAYBACK, 4, 0, 0, 0, 200, MSG_CLASS.MODERN), payload=b"data"),
+                Message(Header(MSG.FILE_PLAYBACK, 0, 0, 0, 0, 300, MSG_CLASS.MODERN)),
+            ]
+
+        def send(self, _msg_id, payload=b"", **kwargs):
+            return 0
+
+        def _recv(self, timeout=None, **_kwargs):
+            if self.replies:
+                return self.replies.pop(0)
+            raise TimeoutError("probe idle")
+
+    monkeypatch.setattr("pyneolink.sd_card.monotonic_clock", FakeClock())
+    output = tmp_path / "playback.bcmedia"
+    sd_card = SdCard(FakeCamera())
+
+    transfer = sd_card._download_with_query(
+        _FileInfoQuery(
+            "playback143/range-mainStream-nosub/bcmedia",
+            MSG.FILE_PLAYBACK,
+            b"request",
+            msg_class=MSG_CLASS.MODERN,
+            msg_num=0,
+        ),
+        output,
+        expected_size=None,
+        chunk_limit=0,
+        idle_timeouts=10,
+        progress=None,
+        recv_timeout=2.0,
+        ignore_playback_terminal=True,
+    )
+
+    assert transfer.written == 4
+    assert transfer.completed
+    assert output.read_bytes() == b"data"
+    assert "playback probe ended" in sd_card._last_download_detail
+    assert "responses=300" in sd_card._last_download_detail
 
 
 def test_sd_card_preview_debug_returns_probe_responses():
@@ -3441,10 +3919,147 @@ def test_sd_card_files_filters_by_name_and_returns_file_objects():
     files = SdCard(FakeCamera()).files(start="2026-06-01", end="2026-06-01", name=".mp4")
 
     assert len(files) == 1
+    assert isinstance(files, list)
+    assert isinstance(files, SDFileCollection)
+    assert isinstance(files[:], SDFileCollection)
+    assert files.count() == 1
+    assert files.names() == ["clip.mp4"]
+    assert files.info()[0]["file_name"] == "clip.mp4"
     assert files[0].info()["file_name"] == "clip.mp4"
     assert hasattr(files[0], "info")
     assert hasattr(files[0], "download")
     assert hasattr(files[0], "preview")
+
+
+def test_sd_file_collection_size_sort_and_limit_use_loaded_metadata():
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0})()
+
+    sd_card = SdCard(FakeCamera())
+    files = SDFileCollection(
+        sd_card,
+        [
+            sd_card.file({"file_name": "small.mp4", "size": 4, "start_time": "2026-01-01T00:00:00"}),
+            sd_card.file({"file_name": "large.mp4", "size": 9, "start_time": "2026-01-03T00:00:00"}),
+            sd_card.file({"file_name": "medium.mp4", "size": 6, "start_time": "2026-01-02T00:00:00"}),
+        ],
+    )
+
+    assert files.size == 19
+    assert files.size_complete
+    files.sort(key="size", reverse=True)
+    assert files.names() == ["large.mp4", "medium.mp4", "small.mp4"]
+    limited = files.limit_size(13)
+    assert limited.names() == ["large.mp4", "small.mp4"]
+    assert limited.size == 13
+    assert files.names() == ["large.mp4", "medium.mp4", "small.mp4"]
+
+
+def test_sd_file_collection_download_returns_reusable_failed_collection(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0, "name": "Front"})()
+
+    sd_card = SdCard(FakeCamera())
+    files = SDFileCollection(
+        sd_card,
+        [
+            sd_card.file({"file_name": "skip.mp4"}),
+            sd_card.file({"file_name": "ok.mp4"}),
+            sd_card.file({"file_name": "failed.mp4"}),
+        ],
+    )
+    (tmp_path / "skip.mp4").write_bytes(b"existing")
+    progress_events = []
+    finished = []
+
+    def fake_download(self, output, **_kwargs):
+        name = self.info()["file_name"]
+        if name == "failed.mp4":
+            raise CameraConnectionError("offline")
+        path = Path(output) / name
+        path.write_bytes(path.read_bytes() if path.exists() else b"new")
+        return path
+
+    monkeypatch.setattr("pyneolink.sd_card.SDFile.download", fake_download)
+
+    result = files.download(
+        tmp_path,
+        rewrite_exists=False,
+        on_progress=progress_events.append,
+        on_finish=finished.append,
+    )
+
+    assert result.total == 3
+    assert result.completed == 1
+    assert result.skipped == 1
+    assert result.failed == 1
+    assert not result.ok
+    assert result.completed_list().names() == ["ok.mp4"]
+    assert result.skipped_list().names() == ["skip.mp4"]
+    assert isinstance(result.failed_list(), SDFileCollection)
+    assert result.failed_list().names() == ["failed.mp4"]
+    assert result.failure_for(files[-1]).error_type == "CameraConnectionError"
+    assert result.total_time().total_seconds() >= 0
+    assert result.to_dict()["items"][-1]["error_message"] == "offline"
+    assert finished == [result]
+    assert progress_events
+    assert all(isinstance(event, DownloadProgress) for event in progress_events)
+
+
+def test_sd_file_collection_download_can_notify_without_changing_result(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0, "name": "Front"})()
+
+    sd_card = SdCard(FakeCamera())
+    files = SDFileCollection(sd_card, [sd_card.file({"file_name": "ok.mp4"})])
+    notifications = []
+
+    def fake_download(self, output, **_kwargs):
+        path = Path(output) / self.info()["file_name"]
+        path.write_bytes(b"done")
+        return path
+
+    monkeypatch.setattr("pyneolink.sd_card.SDFile.download", fake_download)
+    monkeypatch.setattr(
+        "pyneolink.sd_card.send_notification",
+        lambda title, message: notifications.append((title, message)) or True,
+    )
+
+    result = files.download(tmp_path, notify_on_finish=True)
+
+    assert result.ok
+    assert result.notification_sent
+    assert notifications[0][0] == "PyNeolink download finished"
+    assert "Front: completed 1" in notifications[0][1]
+
+
+def test_sd_file_collection_stop_on_error_keeps_remaining_files_retryable(tmp_path, monkeypatch):
+    class FakeCamera:
+        config = type("Config", (), {"channel_id": 0, "name": "Front"})()
+
+    sd_card = SdCard(FakeCamera())
+    files = SDFileCollection(
+        sd_card,
+        [
+            sd_card.file({"file_name": "failed.mp4"}),
+            sd_card.file({"file_name": "not-attempted.mp4"}),
+        ],
+    )
+    calls = []
+
+    def fake_download(self, output, **_kwargs):
+        calls.append(self.info()["file_name"])
+        raise CameraConnectionError("offline")
+
+    monkeypatch.setattr("pyneolink.sd_card.SDFile.download", fake_download)
+
+    result = files.download(tmp_path, continue_on_error=False)
+
+    assert calls == ["failed.mp4"]
+    assert result.total == 2
+    assert result.failed == 2
+    assert result.failed_list().names() == ["failed.mp4", "not-attempted.mp4"]
+    assert result.failures[-1].error_type == "DownloadAborted"
 
 
 def test_sd_card_list_sorts_recordings_by_time():
