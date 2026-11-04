@@ -1,0 +1,4 @@
+{"pushVersion":"v2","UID":"TEST-CAMERA","channelId":"0","ALMTYPE":"PEOPLE","ALMTIME":"1793793600","SRVTIME":"2026-11-04T12:00:01.000"}
+{"pushVersion":"v2a","uid":"TEST-CAMERA","channelId":"0","type":"motion","deviceTime":"1793793600000","serverPushTime":"1793793601000","id":"example-1","dup":"0"}
+{"pushVersion":"v2a","uid":"TEST-CAMERA","channelId":"0","type":"motion","id":"example-1","dup":"1"}
+{"pushVersion":"system","type":"example-system-notice","id":"example-2"}
