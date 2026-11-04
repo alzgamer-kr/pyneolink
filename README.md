@@ -306,6 +306,66 @@ with Camera(uuid="ABCDEF0123456789", username="admin", password="password") as c
 iteration, indexing, and slicing continue to work. Its batch `download()`
 stores only result metadata, so completed media is never retained in RAM.
 
+### Download Timestamps and Filenames
+
+After a successful SD-card download, the output file's **modification time
+(`mtime`)** is set to the recording start time from the existing file metadata.
+No extra camera request is needed. This also applies to complete existing files
+skipped with `rewrite_exists=False`, without downloading them again. Missing or
+invalid recording dates leave `mtime` unchanged. Access time is preserved;
+filesystem creation time and embedded MP4 metadata are not modified.
+
+Camera timestamps without a UTC offset use the **local timezone of the computer
+performing the download**, including its daylight-saving rules for that date.
+Timestamps containing an offset retain that offset. Set the downloader host's
+timezone to match the camera's wall clock when the camera supplies no offset.
+
+Without `filename_template`, the existing naming behavior is unchanged: the
+recording name from metadata (`replay.info()["file_name"]`, with the existing raw
+name/ID fallback) is used. An explicit output filename still takes precedence.
+With a template, `output` is always a directory, created if necessary:
+
+```python
+# One recording: e.g. 2026-09-10_18-30-00.mp4
+replay.download(
+    output="downloads",
+    filename_template="{start_time:%Y-%m-%d_%H-%M-%S}",
+    rewrite_exists=False,
+)
+
+# Batch: retain the original stem to distinguish recordings in the same second.
+template = "{start_time:%Y-%m-%d_%H-%M-%S}_{stem}"
+result = files.download(
+    output="downloads",
+    filename_template=template,
+    quality="high",
+    rewrite_exists=False,
+)
+if not result.ok:
+    result.failed_list().download(
+        output="downloads",
+        filename_template=template,
+        quality="high",
+        rewrite_exists=False,
+    )
+```
+
+| Template field | Value |
+| --- | --- |
+| `{name}` | Original recording filename, including extension |
+| `{stem}` | Original filename without extension |
+| `{start_time:%Y-%m-%d_%H-%M-%S}` | Recording start, formatted with `strftime` |
+| `{end_time:%Y-%m-%d_%H-%M-%S}` | Recording end, formatted with `strftime` |
+| `{channel_id}` | Recording channel from metadata |
+
+The original extension is appended when omitted. Templates produce a single
+filename, not a directory tree; path separators and Windows-unsafe characters
+are rejected. Missing referenced fields and duplicate template names within a
+batch raise `ValueError` before transfers start, preventing accidental overwrites
+or false skips. Keep names unique across separate batches as well, use separate
+output directories for different cameras, and reuse the same template on retries.
+Changing templates does not rename or discover downloads saved under an old name.
+
 Motion:
 
 ```python

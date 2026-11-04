@@ -10,7 +10,16 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 
 from .config import CameraConfig
-from .core.bc import Message, ProtocolError, encode_legacy_login, encode_modern, find_text, recv_message
+from .core.bc import (
+    Message,
+    MessageQueueOverflow,
+    InterruptedMessageError,
+    ProtocolError,
+    encode_legacy_login,
+    encode_modern,
+    find_text,
+    recv_message,
+)
 from .core.const import MSG, MSG_CLASS, msg, payloads
 from .battery import Battery
 from .core.crypto import Cipher, make_aes_key, md5_hex
@@ -106,6 +115,7 @@ class Camera(AbstractContextManager["Camera"]):
         self.login_xml = ""
         self.debug = debug
         self._online_required = 0
+        self._close_generation = 0
         self._send_lock = threading.RLock()
         self._reconnect_lock = threading.RLock()
         self._dispatch_lock = threading.RLock()
@@ -122,10 +132,14 @@ class Camera(AbstractContextManager["Camera"]):
         self._session_ready.set()
 
     def __enter__(self) -> "Camera":
-        self.connect()
-        self.login()
-        self.start_dispatcher()
-        self._wait_for_session_ready()
+        try:
+            self.connect()
+            self.login()
+            self.start_dispatcher()
+            self._wait_for_session_ready()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -179,29 +193,45 @@ class Camera(AbstractContextManager["Camera"]):
     def close(self) -> None:
         """Close the current transport connection and clear login state."""
         with self._reconnect_lock:
+            self._close_generation += 1
+            self._close_transport()
             self.stop_dispatcher()
-            if self.sock:
-                self.sock.close()
-                self.sock = None
             self.login_xml = ""
             self._reset_session_readiness()
+
+    def _close_transport(self) -> None:
+        self._dispatch_stop.set()
+        sock, self.sock = self.sock, None
+        self.binary_msg_nums.clear()
+        self._playback_resync_requests = 0
+        if sock is None:
+            return
+        if isinstance(sock, socket.socket):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        sock.close()
 
     def reconnect(self) -> None:
         """Close, reconnect, and log in again."""
         with self._reconnect_lock:
             restart_dispatcher = self._dispatcher_requested or self._dispatch_thread is not None
+            self._close_transport()
             self.stop_dispatcher(clear_requested=not restart_dispatcher)
             self._dispatcher_requested = restart_dispatcher
-            if self.sock:
-                self.sock.close()
-                self.sock = None
             self.login_xml = ""
             self._reset_session_readiness()
-            self.connect()
-            self.login()
-            if restart_dispatcher:
-                self.start_dispatcher()
-                self._wait_for_session_ready()
+            try:
+                self.connect()
+                self.login()
+                if restart_dispatcher:
+                    self.start_dispatcher()
+                    self._wait_for_session_ready()
+            except BaseException:
+                self.close()
+                self._dispatcher_requested = restart_dispatcher
+                raise
 
     @property
     def dispatcher_active(self) -> bool:
@@ -212,11 +242,14 @@ class Camera(AbstractContextManager["Camera"]):
         """Start the single-session reply dispatcher for concurrent API use."""
         self._dispatcher_requested = True
         if self.dispatcher_active:
+            if self._dispatch_stop.is_set():
+                raise ProtocolError("Previous dispatcher is still stopping")
             return self
-        self._dispatch_stop.clear()
+        self._dispatch_stop = threading.Event()
         self._dispatch_error = None
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop,
+            args=(self._dispatch_stop,),
             name=f"pyneolink-dispatch-{self.config.name}",
             daemon=True,
         )
@@ -238,7 +271,7 @@ class Camera(AbstractContextManager["Camera"]):
         self._dispatch_stop.set()
         if thread is not threading.current_thread():
             thread.join(timeout=2.0)
-        self._dispatch_thread = None
+        self._dispatch_thread = thread if thread.is_alive() else None
         with self._dispatch_lock:
             subscriptions = [waiter for waiters in self._dispatch_waiters.values() for waiter in waiters]
             subscriptions.extend(self._dispatch_filters)
@@ -473,13 +506,14 @@ class Camera(AbstractContextManager["Camera"]):
             sessions. The default retries once.
         """
         attempts = max(0, reconnect_retries if retry_on_timeout else 0) + 1
-        last_error: TimeoutError | None = None
+        close_generation = self._close_generation
+        last_error: BaseException | None = None
         for attempt in range(attempts):
             try:
                 return self._snapshot_once(out=out)
-            except TimeoutError as exc:
+            except (TimeoutError, EOFError, ConnectionError, InterruptedMessageError, MessageQueueOverflow) as exc:
                 last_error = exc
-                if attempt >= attempts - 1:
+                if attempt >= attempts - 1 or self._close_generation != close_generation:
                     break
                 if self.debug:
                     print(msg.Log.Pyneolink.format(message="snapshot timed out; reconnecting camera session"))
@@ -638,6 +672,7 @@ class Camera(AbstractContextManager["Camera"]):
             closed session. The default retries once.
         """
         attempts = max(0, reconnect_retries if retry_on_timeout else 0) + 1
+        close_generation = self._close_generation
         last_error: BaseException | None = None
         for attempt in range(attempts):
             try:
@@ -648,9 +683,9 @@ class Camera(AbstractContextManager["Camera"]):
                     maxsize=10,
                 ) as replies:
                     return replies.recv(timeout=self.timeout)
-            except (TimeoutError, EOFError, OSError) as exc:
+            except (TimeoutError, EOFError, OSError, InterruptedMessageError, MessageQueueOverflow) as exc:
                 last_error = exc
-                if attempt >= attempts - 1:
+                if attempt >= attempts - 1 or self._close_generation != close_generation:
                     break
                 if self.debug:
                     print(msg.Log.Pyneolink.format(message=f"command {msg_id} timed out; reconnecting camera session"))
@@ -797,13 +832,16 @@ class Camera(AbstractContextManager["Camera"]):
         Recoverable failures replace the transport session and re-register the
         stream route without exposing session management to callers.
         """
+        close_generation = self._close_generation
         with self.require_online():
-            while True:
+            while self._close_generation == close_generation:
                 try:
                     self.ensure_connected()
                     yield from self._read_stream_payloads_dispatched(stream, stall_timeout=stall_timeout)
                     return
                 except RECOVERABLE_STREAM_ERRORS as exc:
+                    if self._close_generation != close_generation:
+                        return
                     if not reconnect:
                         raise
                     if self.debug:
@@ -827,6 +865,8 @@ class Camera(AbstractContextManager["Camera"]):
             maxsize=200,
         ) as replies:
             msg_num = replies.msg_num
+            transport = self.sock
+            close_generation = self._close_generation
             start_reply = replies.recv(timeout=self.timeout)
             if start_reply.header.response_code != 200:
                 raise ProtocolError(msg.Error.StreamStartFailed.format(response_code=start_reply.header.response_code))
@@ -834,7 +874,7 @@ class Camera(AbstractContextManager["Camera"]):
             next_keepalive_at = time.monotonic() + 0.75
             last_payload_at = time.monotonic()
             try:
-                while True:
+                while self._close_generation == close_generation:
                     now = time.monotonic()
                     if now >= next_keepalive_at:
                         self.send(MSG.UDP_KEEPALIVE, channel_id=0, msg_num=0)
@@ -842,6 +882,8 @@ class Camera(AbstractContextManager["Camera"]):
                     try:
                         message = replies.recv(timeout=1.0)
                     except TimeoutError:
+                        if self._close_generation != close_generation:
+                            return
                         self._raise_if_stream_stalled(last_payload_at, stall_timeout)
                         continue
                     if message.payload:
@@ -851,7 +893,8 @@ class Camera(AbstractContextManager["Camera"]):
                         self._raise_if_stream_stalled(last_payload_at, stall_timeout)
             finally:
                 try:
-                    self.stop_stream(stream, msg_num)
+                    if self.sock is transport and self._close_generation == close_generation:
+                        self.stop_stream(stream, msg_num)
                 except Exception as exc:
                     if self.debug:
                         print(msg.Log.StreamStopCloseFailed.format(exc_type=type(exc).__name__, exc=exc))
@@ -912,16 +955,25 @@ class Camera(AbstractContextManager["Camera"]):
 
     def _next_msg(self) -> int:
         with self._send_lock:
-            self.msg_num = (self.msg_num + 1) & 0xFFFF
-            if self.msg_num == 0:
-                self.msg_num = 1
-            return self.msg_num
+            with self._dispatch_lock:
+                reserved = {number for _, number in self._dispatch_waiters if number is not None}
+                reserved.update(self.binary_msg_nums)
+            for _ in range(0xFFFF):
+                self.msg_num = (self.msg_num % 0xFFFF) + 1
+                if self.msg_num not in reserved:
+                    return self.msg_num
+            raise ProtocolError("No free message correlation numbers")
 
     def _send(self, data: bytes) -> None:
         if self.sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
         with self._send_lock:
-            self.sock.sendall(data)
+            try:
+                self.sock.sendall(data)
+            except TimeoutError:
+                raise
+            except OSError as exc:
+                raise ConnectionError(str(exc)) from exc
 
     def _send_modern(
         self,
@@ -976,17 +1028,25 @@ class Camera(AbstractContextManager["Camera"]):
         *,
         binary_playback_331: bool = False,
     ) -> Message:
-        if self.sock is None:
+        sock = self.sock
+        if sock is None:
             raise RuntimeError(msg.Error.CameraNotConnected)
-        message = recv_message(
-            self.sock,
-            self.cipher,
-            timeout=self.timeout if timeout is None else timeout,
-            binary_msg_nums=self.binary_msg_nums,
-            binary_playback_331=binary_playback_331,
-            recover_invalid_magic=self._playback_resync_requests > 0,
-        )
-        if message.header.msg_id == MSG.UDP_KEEPALIVE:
+        cancel_event = self._dispatch_stop if threading.current_thread() is self._dispatch_thread else None
+        try:
+            message = recv_message(
+                sock,
+                self.cipher,
+                timeout=self.timeout if timeout is None else timeout,
+                binary_msg_nums=self.binary_msg_nums,
+                binary_playback_331=binary_playback_331,
+                recover_invalid_magic=self._playback_resync_requests > 0,
+                cancel_event=cancel_event,
+            )
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            raise ConnectionError(str(exc)) from exc
+        if message.header.msg_id == MSG.UDP_KEEPALIVE and sock is self.sock:
             self._reply_keepalive(message)
         return message
 
@@ -1006,14 +1066,16 @@ class Camera(AbstractContextManager["Camera"]):
             else:
                 time.sleep(0.01)
 
-    def _dispatch_loop(self) -> None:
-        while not self._dispatch_stop.is_set():
+    def _dispatch_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 message = self._recv_direct(timeout=0.5, binary_playback_331=True)
             except TimeoutError:
                 continue
             except BaseException as exc:
                 with self._dispatch_lock:
+                    if stop_event.is_set():
+                        return
                     self._dispatch_error = exc
                     subscriptions = [waiter for waiters in self._dispatch_waiters.values() for waiter in waiters]
                     subscriptions.extend(self._dispatch_filters)
@@ -1022,7 +1084,10 @@ class Camera(AbstractContextManager["Camera"]):
                 for subscription in subscriptions:
                     subscription.fail(exc)
                 return
-            self._dispatch_message(message)
+            with self._dispatch_lock:
+                if stop_event.is_set():
+                    return
+                self._dispatch_message(message)
 
     def _dispatch_message(self, message: Message) -> None:
         if message.header.msg_id == MSG.BATTERY_LIST:
@@ -1101,7 +1166,7 @@ class _MessageSubscription:
         self.predicate = predicate
         self.active = True
         self._error: BaseException | None = None
-        self._queue: queue.Queue[Message] = queue.Queue(maxsize=max(1, maxsize))
+        self._queue: queue.Queue[Message | None] = queue.Queue(maxsize=max(1, maxsize))
 
     def __enter__(self) -> "_MessageSubscription":
         return self
@@ -1112,15 +1177,10 @@ class _MessageSubscription:
     def put(self, message: Message) -> None:
         if not self.active:
             return
-        while True:
-            try:
-                self._queue.put_nowait(message)
-                return
-            except queue.Full:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    return
+        try:
+            self._queue.put_nowait(message)
+        except queue.Full:
+            self.fail(MessageQueueOverflow("Dispatcher subscription queue overflow; message stream is incomplete"))
 
     def matches(self, message: Message) -> bool:
         """Return whether this subscription accepts a message."""
@@ -1131,30 +1191,46 @@ class _MessageSubscription:
         return _message_matches(message, self.msg_id, self.msg_num)
 
     def recv(self, *, timeout: float | None = None) -> Message:
-        if not self._queue.empty():
-            return self._queue.get_nowait()
-        if self._error is not None:
+        if isinstance(self._error, MessageQueueOverflow):
             raise self._error
-        if not self.active and self._queue.empty():
-            raise TimeoutError(msg.Error.EventListenerClosed)
+        if self._queue.empty():
+            if self._error is not None:
+                raise self._error
+            if not self.active:
+                raise TimeoutError(msg.Error.EventListenerClosed)
         try:
-            return self._queue.get(timeout=timeout)
+            message = self._queue.get(timeout=timeout)
         except queue.Empty:
             if self._error is not None:
                 raise self._error
             if not self.active:
                 raise TimeoutError(msg.Error.EventListenerClosed) from None
             raise TimeoutError(msg.Error.UdpBaichuanTimeout) from None
+        if isinstance(self._error, MessageQueueOverflow):
+            raise self._error
+        if message is None:
+            if self._error is not None:
+                raise self._error
+            raise TimeoutError(msg.Error.EventListenerClosed)
+        return message
 
     def fail(self, error: BaseException) -> None:
         """Close the subscription and preserve the dispatcher error."""
         self._error = error
         self.active = False
+        self._wake_receiver()
+
+    def _wake_receiver(self) -> None:
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     def close(self) -> None:
         if self.active:
             self.active = False
-            self.camera._unsubscribe(self)
+            self._wake_receiver()
+        self.camera._unsubscribe(self)
 
 
 class _MessageExchange:
@@ -1190,9 +1266,12 @@ class _MessageExchange:
         self.maxsize = maxsize
         self._subscription: _MessageSubscription | None = None
         self._playback_resync_active = False
+        self._transport = None
+        self._owns_binary_route = False
 
     def __enter__(self) -> "_MessageExchange":
         self.camera.ensure_connected()
+        self._transport = self.camera.sock
         if self.msg_id == MSG.FILE_PLAYBACK:
             with self.camera._dispatch_lock:
                 self.camera._playback_resync_requests += 1
@@ -1200,6 +1279,7 @@ class _MessageExchange:
         if self.msg_num is None:
             self.msg_num = self.camera._next_msg()
         sent_msg_num = self.msg_num
+        self._owns_binary_route = self.binary_reply and sent_msg_num not in self.camera.binary_msg_nums
         if self.matcher is None:
             self._subscription = self.camera.subscribe_messages(
                 self.response_msg_id,
@@ -1226,6 +1306,7 @@ class _MessageExchange:
             self._subscription.close()
             self._subscription = None
             self._disable_playback_resync()
+            self._release_binary_route()
             raise
         return self
 
@@ -1234,12 +1315,19 @@ class _MessageExchange:
             self._subscription.close()
             self._subscription = None
         self._disable_playback_resync()
+        self._release_binary_route()
+
+    def _release_binary_route(self) -> None:
+        if self._owns_binary_route and self._transport is self.camera.sock:
+            self.camera.binary_msg_nums.discard(self.msg_num)
+        self._owns_binary_route = False
 
     def _disable_playback_resync(self) -> None:
         if not self._playback_resync_active:
             return
         with self.camera._dispatch_lock:
-            self.camera._playback_resync_requests = max(0, self.camera._playback_resync_requests - 1)
+            if self._transport is self.camera.sock:
+                self.camera._playback_resync_requests = max(0, self.camera._playback_resync_requests - 1)
         self._playback_resync_active = False
 
     def recv(self, *, timeout: float | None = None) -> Message:

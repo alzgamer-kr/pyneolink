@@ -183,7 +183,23 @@ This is not a new camera request when `files` is passed explicitly.
 9. writes to `*.part`;
 10. requires the camera's explicit successful transfer terminator before finalizing;
 11. on `DownloadSizeMismatch` or `TimeoutError`, reconnects and restarts the file download according to the configured retry policy;
-12. finalizes the file through `_finalize_download()`.
+12. finalizes the file through `_finalize_download()`;
+13. sets the finalized file's `mtime` to the recording start from metadata.
+
+`mtime` is also updated for skipped existing files, without downloading again.
+Missing or invalid recording dates leave it unchanged. Naive timestamps use the
+downloading computer's local timezone; timestamps with an offset retain it.
+This does not change filesystem creation time or embedded MP4 metadata. A local
+timestamp-write failure is reported without reconnecting or repeating a transfer.
+
+Both `SDFile.download()` and `SDFileCollection.download()` accept optional
+`filename_template`, for example `{start_time:%Y-%m-%d_%H-%M-%S}_{stem}`.
+Supported fields are `name`, `stem`, `start_time`, `end_time`, and `channel_id`.
+With a template, `output` denotes a directory and the original extension is
+appended if omitted. Without one, existing naming and explicit-path behavior
+remain unchanged. The batch validates names and rejects collisions before any
+transfer. Repeat the same template for failed-list retries and existing-file
+checks. See [examples and filename rules](../README.md#download-timestamps-and-filenames).
 
 Useful download options:
 

@@ -16,6 +16,14 @@ class ProtocolError(RuntimeError):
     pass
 
 
+class InterruptedMessageError(ProtocolError):
+    """The transport stopped inside a frame; reconnect before reading again."""
+
+
+class MessageQueueOverflow(ProtocolError):
+    """A subscriber could not keep up and its message stream is incomplete."""
+
+
 class InvalidMagicError(ProtocolError):
     """Raised when a Baichuan header has an unexpected magic value."""
 
@@ -185,17 +193,22 @@ def encode_legacy_login(msg_num: int, *, max_encryption: str = "aes", channel_id
     return Header(MSG.LOGIN, 0, channel_id, 0, msg_num, enc, MSG_CLASS.LEGACY).pack()
 
 
-def recv_exact(sock: socket.socket, size: int, *, idle_timeout: float | None = None) -> bytes:
+def recv_exact(sock: socket.socket, size: int, *, idle_timeout: float | None = None, cancel_event=None) -> bytes:
     """Receive exactly ``size`` bytes, tolerating short idle gaps when requested."""
 
     chunks = []
     remaining = size
     last_progress = time.monotonic()
     while remaining:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedMessageError("Message receive cancelled")
         try:
             chunk = sock.recv(remaining)
-        except TimeoutError:
-            if idle_timeout is None or time.monotonic() - last_progress >= idle_timeout:
+        except TimeoutError as exc:
+            allowed_idle = idle_timeout if idle_timeout is not None else (20.0 if chunks else 0.0)
+            if time.monotonic() - last_progress >= allowed_idle:
+                if chunks:
+                    raise InterruptedMessageError("Timed out inside a Baichuan message") from exc
                 raise
             continue
         if not chunk:
@@ -214,23 +227,34 @@ def recv_message(
     binary_msg_nums: set[int] | None = None,
     binary_playback_331: bool = False,
     recover_invalid_magic: bool = False,
+    cancel_event=None,
 ) -> Message:
     if timeout is not None:
         sock.settimeout(timeout)
-    first = recv_exact(sock, 20)
+    first = recv_exact(sock, 20, cancel_event=cancel_event)
     resync_data = b""
     try:
         partial = Header.unpack_from(first)
     except InvalidMagicError:
         if not recover_invalid_magic:
             raise
-        first, resync_data = _resync_header(sock, first)
+        try:
+            first, resync_data = _resync_header(sock, first, cancel_event=cancel_event)
+        except TimeoutError as exc:
+            raise InterruptedMessageError("Timed out while resynchronizing a Baichuan message") from exc
         partial = Header.unpack_from(first)
     message_idle_timeout = max(timeout or 0.0, 20.0)
-    if partial.has_payload_offset:
-        first += recv_exact(sock, 4, idle_timeout=message_idle_timeout)
-    header = Header.unpack_from(first)
-    body = recv_exact(sock, header.body_len, idle_timeout=message_idle_timeout) if header.body_len else b""
+    try:
+        if partial.has_payload_offset:
+            first += recv_exact(sock, 4, idle_timeout=message_idle_timeout, cancel_event=cancel_event)
+        header = Header.unpack_from(first)
+        body = (
+            recv_exact(sock, header.body_len, idle_timeout=message_idle_timeout, cancel_event=cancel_event)
+            if header.body_len
+            else b""
+        )
+    except TimeoutError as exc:
+        raise InterruptedMessageError("Timed out after a Baichuan message header") from exc
     ext_len = header.payload_offset or 0
     ext_raw = body[:ext_len]
     payload_raw = body[ext_len:]
@@ -265,7 +289,9 @@ def recv_message(
     )
 
 
-def _resync_header(sock: socket.socket, initial: bytes, *, max_skip: int = 1024 * 1024) -> tuple[bytes, bytes]:
+def _resync_header(
+    sock: socket.socket, initial: bytes, *, max_skip: int = 1024 * 1024, cancel_event=None
+) -> tuple[bytes, bytes]:
     """Find the next Baichuan header without replacing the transport session."""
     magics = {
         struct.pack("<I", MAGIC.BAICHUAN),
@@ -279,11 +305,11 @@ def _resync_header(sock: socket.socket, initial: bytes, *, max_skip: int = 1024 
             return header, bytes(buffered[:offset])
 
     while len(buffered) < max_skip + 20:
-        buffered.extend(recv_exact(sock, 1))
+        buffered.extend(recv_exact(sock, 1, cancel_event=cancel_event))
         if bytes(buffered[-4:]) not in magics:
             continue
         offset = len(buffered) - 4
-        header = bytes(buffered[offset:]) + recv_exact(sock, 16)
+        header = bytes(buffered[offset:]) + recv_exact(sock, 16, cancel_event=cancel_event)
         return header, bytes(buffered[:offset])
 
     magic = struct.unpack("<I", initial[:4])[0]

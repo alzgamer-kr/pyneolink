@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Optional `filename_template` for single and batch SD-card downloads, with
+  recording timestamps, original name/stem, and channel fields. Preserve the
+  original extension, validate portable filenames, and reject duplicate names
+  within a batch before transfers start. Existing-file checks use the template.
+
+### Changed
+
+- Set finalized and skipped SD-download files' `mtime` to the recording start
+  from existing metadata. Offset-free camera times use the downloading host's
+  local timezone; missing dates leave timestamps unchanged. Preserve access time
+  without changing filesystem creation time or embedded media metadata.
+
+### Fixed
+
+- Preserve the single-session dispatcher architecture while preventing stopped
+  readers from affecting new subscriptions after reconnect. Close transports
+  on failed context entry and wake blocked subscribers when they are closed.
+- Treat an interrupted Baichuan frame as a recoverable protocol failure instead
+  of continuing from the middle of its header. Brief gaps inside a frame remain
+  tolerated; overflowing subscriber queues now fail explicitly instead of
+  silently dropping download data.
+- Retry SD downloads after EOF, connection reset, interrupted frames, or queue
+  overflow using the existing regular/delayed reconnect settings. Local file
+  system errors do not trigger camera reconnects.
+- Reject incomplete paginated SD-card listings rather than returning a partial
+  result as a successful complete list.
+- Release transfer-owned binary message routes and clear session-owned routes
+  on close, preventing stale binary classification after message-number reuse.
+- Emit correctly sized MPEG-TS packets for all payload tail lengths and avoid
+  misidentifying H.264 P frames as H.265 during recording conversion.
+- Stop HLS camera workers with the HTTP server and after inactive viewing
+  (60 seconds, or three segment durations for longer segments). Explicit camera
+  close no longer causes an active stream iterator to reopen that camera.
+- Build HLS segment durations from video timestamps rather than network waiting
+  time. After SDK reconnect, discard partial parser state, restart at a keyframe,
+  signal playlist discontinuities, and include restored transports in HLS logs.
+- Signal new HLS transport timelines inside MPEG-TS packets as well as in the
+  playlist, so demuxers accept reset continuity counters after reconnect instead
+  of marking the boundary packet as corrupt.
+- Wait a randomized 2-5 minutes before retrying HLS camera registration when
+  the Reolink register stage times out or returns no usable session details.
+  Ordinary stream failures retain the short retry; shutdown interrupts the wait.
+- Serialize connection-state updates across threads and processes. The cache
+  uses a persistent adjacent `.lock` file in addition to atomic JSON replacement.
+
+Existing public camera/helper calls remain compatible; default download names
+are unchanged. The new download `mtime` behavior is described above. No new
+physical-camera validation is claimed for these changes.
+
 ## 0.5.0
 
 Reliable SD-card downloads and batch download API.

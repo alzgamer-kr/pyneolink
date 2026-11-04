@@ -3,8 +3,53 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+_LOCKS_GUARD = threading.Lock()
+_LOCKS = weakref.WeakValueDictionary()
+
+
+def _path_lock(path: Path):
+    with _LOCKS_GUARD:
+        key = os.path.normcase(str(path.resolve()))
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _file_lock(path: Path):
+    """Lock a stable sidecar, since atomic replacement changes the state inode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_file.seek(0, os.SEEK_END) == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class ConnectionState:
@@ -16,6 +61,7 @@ class ConnectionState:
         :param path: State file path.
         """
         self.path = Path(path)
+        self._lock = _path_lock(self.path)
         self.data = self._load()
         self._dirty: set[str] = set()
 
@@ -39,15 +85,16 @@ class ConnectionState:
         :param transport: Transport label such as `tcp`, `udp-local`, or
             `udp-relay`.
         """
-        cameras = self.data.setdefault("cameras", {})
-        item = cameras.setdefault(camera_name, {})
-        item["address"] = address
-        item["transport"] = transport
-        if uid:
-            item["uid"] = uid
-        item["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._dirty.add(camera_name)
-        self.save()
+        with self._lock:
+            cameras = self.data.setdefault("cameras", {})
+            item = cameras.setdefault(camera_name, {})
+            item["address"] = address
+            item["transport"] = transport
+            if uid:
+                item["uid"] = uid
+            item["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._dirty.add(camera_name)
+            self.save()
 
     def _load(self) -> dict:
         if not self.path.exists():
@@ -64,6 +111,10 @@ class ConnectionState:
 
     def save(self) -> None:
         """Merge changed cameras into the on-disk state and write atomically."""
+        with self._lock, _file_lock(self.path):
+            self._save_locked()
+
+    def _save_locked(self) -> None:
         current = self._load()
         own = self.data.get("cameras", {})
         if isinstance(own, dict):

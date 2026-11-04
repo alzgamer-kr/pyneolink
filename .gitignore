@@ -51,6 +51,7 @@ nbproject/
 config.json
 config.local.json
 .pyneolink_state.json
+.pyneolink_state.json.lock
 TODO.md
 
 # Captured media/output files
