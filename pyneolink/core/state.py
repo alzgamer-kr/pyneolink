@@ -1,93 +1,71 @@
+"""Connection cache backed by per-camera SQLite, with legacy JSON import."""
+
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy.dialects.sqlite import insert
+
+from .storage import DEFAULT_STORAGE_DIR, STATE, CameraStore, camera_database
+
 
 class ConnectionState:
-    """Small JSON cache for last working camera addresses."""
+    """SQLite connection cache. Legacy .json paths import into a sibling .db."""
 
-    def __init__(self, path: str | Path = ".pyneolink_state.json") -> None:
-        """Create a JSON connection-state cache.
-
-        :param path: State file path.
-        """
-        self.path = Path(path)
-        self.data = self._load()
+    def __init__(self, path: str | Path = DEFAULT_STORAGE_DIR) -> None:
+        self.path = Path(path).expanduser()
+        self._legacy = self.path if self.path.suffix.lower() == ".json" else Path(".pyneolink_state.json")
+        self._stores: dict[str, CameraStore] = {}
+        self.data: dict = {"cameras": {}}
         self._dirty: set[str] = set()
 
-    def get_address(self, camera_name: str, *, transport: str | None = None) -> str | None:
-        """Return a cached camera address.
+    def _store(self, name: str) -> CameraStore:
+        if name in self._stores:
+            return self._stores[name]
+        suffix = self.path.suffix.lower()
+        explicit = suffix in (".json", ".db", ".sqlite", ".sqlite3")
+        database = self.path.with_suffix(".db") if suffix == ".json" else self.path
+        if not explicit:
+            database = camera_database(name, self.path)
+        store = CameraStore(database)
+        if not explicit:
+            store.bind_camera(name)
+        key = f"connection:{name}"
+        if self._legacy.is_file() and store.get(key) is None:
+            try:
+                legacy = json.loads(self._legacy.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                legacy = {}
+            cameras = legacy.get("cameras", {}) if isinstance(legacy, dict) else {}
+            item = cameras.get(name) if isinstance(cameras, dict) else None
+            if isinstance(item, dict):
+                with store.transaction() as connection:
+                    connection.execute(insert(STATE).values(key=key, value=item).on_conflict_do_nothing())
+        self._stores[name] = store
+        return store
 
-        :param camera_name: Camera name used as the cache key.
-        :param transport: Optional transport filter, for example `tcp`.
-        """
-        item = self.data.get("cameras", {}).get(camera_name, {})
+    def get_address(self, camera_name: str, *, transport: str | None = None) -> str | None:
+        """Read the current endpoint, including updates from another process."""
+        item = self._store(camera_name).get(f"connection:{camera_name}", {})
+        self.data["cameras"][camera_name] = item
         if transport is not None and item.get("transport", "tcp") != transport:
             return None
         return item.get("address")
 
     def update_address(self, camera_name: str, address: str, *, uid: str | None = None, transport: str = "tcp") -> None:
-        """Store the last working camera address.
-
-        :param camera_name: Camera name used as the cache key.
-        :param address: Address to store, usually `host:port`.
-        :param uid: Optional camera UID.
-        :param transport: Transport label such as `tcp`, `udp-local`, or
-            `udp-relay`.
-        """
-        cameras = self.data.setdefault("cameras", {})
-        item = cameras.setdefault(camera_name, {})
-        item["address"] = address
-        item["transport"] = transport
+        """Commit one camera's last working endpoint atomically."""
+        item = self._store(camera_name).get(f"connection:{camera_name}", {})
+        item.update(address=address, transport=transport, updated_at=datetime.now(timezone.utc).isoformat())
         if uid:
             item["uid"] = uid
-        item["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.data["cameras"][camera_name] = item
         self._dirty.add(camera_name)
         self.save()
 
-    def _load(self) -> dict:
-        if not self.path.exists():
-            return {"cameras": {}}
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {"cameras": {}}
-        if not isinstance(data, dict):
-            return {"cameras": {}}
-        if not isinstance(data.get("cameras"), dict):
-            data["cameras"] = {}
-        return data
-
     def save(self) -> None:
-        """Merge changed cameras into the on-disk state and write atomically."""
-        current = self._load()
-        own = self.data.get("cameras", {})
-        if isinstance(own, dict):
-            for name in self._dirty or own.keys():
-                if name in own:
-                    current["cameras"][name] = own[name]
-        for key, value in self.data.items():
-            if key != "cameras":
-                current[key] = value
-        self._write_atomic(current)
-        self.data = current
-        self._dirty = set()
-
-    def _write_atomic(self, data: dict) -> None:
-        text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            os.replace(tmp_name, self.path)
-        except BaseException:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+        """Save only modified cameras, avoiding stale cross-camera overwrites."""
+        for name in self._dirty or self.data["cameras"].keys():
+            self._store(name).put(f"connection:{name}", self.data["cameras"][name])
+        self._dirty.clear()

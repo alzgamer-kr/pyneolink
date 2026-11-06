@@ -7,7 +7,7 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
-from examples.push_protocol_probe import (
+from pyneolink.internal.push_protocol import (
     APPROVED_CAMERA,
     MAX_EVENT_LINE,
     PUSH_INFO_ID,

@@ -5,6 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote, unquote, urlparse
 
@@ -12,6 +13,7 @@ from .camera import Camera
 from .config import Config, config_from_dict, load_config
 from .core.const import msg
 from .core.media import MediaParser, MediaPacket
+from .core.storage import DEFAULT_STORAGE_DIR, connection_state_path
 
 
 _STREAM_END = object()
@@ -30,7 +32,8 @@ class StreamServer:
         *,
         host: str | None = None,
         port: int | None = None,
-        state_path: str | None = ".pyneolink_state.json",
+        state_path: str | Path | None = str(DEFAULT_STORAGE_DIR),
+        storage_dir: str | Path | None = None,
         debug: bool = False,
         buffer_seconds: float = 1.0,
         hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
@@ -42,6 +45,8 @@ class StreamServer:
         :param host: Bind host override. Defaults to config `bind`.
         :param port: Bind port override. Defaults to config `bind_port`.
         :param state_path: Camera state cache path, or `None` to disable cache.
+        :param storage_dir: Shared SQLite directory for every served camera;
+            defaults to ~/pyneolink. Explicit state_path overrides it.
         :param debug: Print protocol/debug output.
         :param buffer_seconds: Startup buffer for direct MPEG-TS streams.
         :param hls_buffer_mb: Maximum in-memory HLS timeshift buffer size.
@@ -51,6 +56,7 @@ class StreamServer:
         self.host = host if host is not None else self.config.bind
         self.port = port if port is not None else self.config.bind_port
         self.state_path = state_path
+        self.storage_dir = Path(storage_dir).expanduser().absolute() if storage_dir is not None else None
         self.debug = debug
         self.buffer_seconds = max(buffer_seconds, 0.0)
         self.hls_buffer_bytes = max(int(hls_buffer_mb), 1) * 1024 * 1024
@@ -115,6 +121,7 @@ class StreamServer:
         server = _StreamServer((self.host, self.port), _StreamHandler)
         server.config = self.config
         server.state_path = self.state_path
+        server.storage_dir = self.storage_dir
         server.debug = self.debug
         server.buffer_seconds = self.buffer_seconds
         server.hls_buffer_bytes = self.hls_buffer_bytes
@@ -138,7 +145,8 @@ def serve_streams(
     *,
     host: str | None = None,
     port: int | None = None,
-    state_path: str | None = ".pyneolink_state.json",
+    state_path: str | Path | None = str(DEFAULT_STORAGE_DIR),
+    storage_dir: str | Path | None = None,
     debug: bool = False,
     buffer_seconds: float = 1.0,
     hls_buffer_mb: int = _DEFAULT_HLS_BUFFER_MB,
@@ -150,6 +158,7 @@ def serve_streams(
     :param host: Bind host override.
     :param port: Bind port override.
     :param state_path: Camera state cache path, or `None` to disable cache.
+    :param storage_dir: Shared per-camera SQLite directory; defaults to ~/pyneolink.
     :param debug: Print protocol/debug output.
     :param buffer_seconds: Startup buffer for direct MPEG-TS streams.
     :param hls_buffer_mb: Maximum in-memory HLS timeshift buffer size.
@@ -160,6 +169,7 @@ def serve_streams(
         host=host,
         port=port,
         state_path=state_path,
+        storage_dir=storage_dir,
         debug=debug,
         buffer_seconds=buffer_seconds,
         hls_buffer_mb=hls_buffer_mb,
@@ -178,7 +188,8 @@ def _coerce_config(config: str | dict | Config) -> Config:
 class _StreamServer(ThreadingHTTPServer):
     daemon_threads = True
     config: Config
-    state_path: str | None
+    state_path: str | Path | None
+    storage_dir: Path | None = None
     debug: bool
     buffer_seconds: float
     hls_buffer_bytes: int
@@ -224,7 +235,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self._serve_hls_segment(camera_config, stream, sequence)
             return
 
-        camera = Camera(camera_config, state_path=self.server.state_path, debug=self.server.debug)
+        state_path = connection_state_path(camera_config.name, self.server.state_path, self.server.storage_dir)
+        camera = Camera(camera_config, state_path=state_path, debug=self.server.debug)
         parser = MediaParser()
         try:
             _open_stream_camera(camera)
@@ -307,7 +319,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 session = HlsSession(
                     camera_config,
                     stream,
-                    state_path=self.server.state_path,
+                    state_path=connection_state_path(
+                        camera_config.name, self.server.state_path, self.server.storage_dir
+                    ),
                     debug=self.server.debug,
                     buffer_bytes=self.server.hls_buffer_bytes,
                     segment_seconds=self.server.hls_segment_seconds,
@@ -499,7 +513,7 @@ class HlsSession:
         camera_config,
         stream: str,
         *,
-        state_path: str | None,
+        state_path: str | Path | None,
         debug: bool,
         buffer_bytes: int,
         segment_seconds: float,

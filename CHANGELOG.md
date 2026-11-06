@@ -1,5 +1,80 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Shared `storage_dir` in Camera, StreamServer, serve_streams, and PushClient,
+  plus global CLI `--storage-dir` / `--storage_dir`. Connection and push state
+  share the per-camera SQLite file; explicit legacy state overrides still work.
+- Typed `PushEvent` classification helpers and properties for notification text,
+  camera metadata, language, UTC server time, and decoded options/customConfig.
+  Full-response getters return independent copies and preserve unknown fields.
+- Notification `title` in SDK events and default CLI push read/watch output,
+  without requiring `--full-response`.
+- Documented `LPC` as a physically confirmed low-battery push warning on
+  Reolink Argus Eco; the exact charge threshold remains unverified.
+- Full decrypted SDK event responses persisted in SQLite, opt-in CLI
+  `push read/watch --full-response`, and raw JSONL capture during `push read`
+  synchronization. Summary output excludes full notification bodies and URLs.
+- Opt-in `push watch --raw-output PATH.jsonl` / `PushClient.watch(raw_output=...)`
+  for full decrypted notification diagnostics before filtering. Appends flushed
+  records across reconnects without an in-memory archive; disabled by default.
+- Optional cloud push API: `PushClient`, `PushWatch`, `PushEvent`, `PushResult`,
+  and sanitized push exceptions. FCM reception requires the `[push]` extra;
+  ordinary SDK imports and camera commands do not.
+- Main CLI `push init/subscribe/status/unsubscribe/watch/read`,
+  with compact output, optional JSON, and sanitized debug diagnostics.
+- Reusable PC receiver identities, command 524 registration, command 526 status,
+  HTTP unsubscribe scoped to the PC client, and verification/reconciliation of
+  timed-out registration and completed removal.
+- Unlimited watch by default, optional `duration`, configurable reconnect delay
+  with bounded exponential backoff, and `skip_previous=True` based on server time.
+- Context-managed reception with a bounded 128-event queue, bounded 2048-ID
+  deduplication history, and cancellation that retains the cloud subscription.
+- Finite `read` of unread events with bounded FCM synchronization, an offline
+  SQLite-only option, atomic batch claiming, and a configurable result limit.
+- Per-camera `~/pyneolink/{camera}.db` storage via SQLAlchemy Core, automatic
+  transactional schema migrations, identity checks, and receiver leases.
+- Bundled public Firebase application profile: `push init` / `PushClient.initialize()`
+  no longer require an APK export or external config file. Explicit overrides
+  and saved settings take priority; existing receiver identities are preserved.
+
+### Changed
+
+- Unified push read/watch formatting: identical text event lines and JSONL
+  (one object per event) in JSON/full-response mode. Empty reads emit no JSON
+  lines; lifecycle notices use stderr. SDK read still returns a list.
+- Push watch shutdown waits for SQLite lease release before returning, deferring
+  repeated Ctrl+C during bounded cleanup so an immediate restart is not blocked.
+- Increased the optional receiver's GCM registration budget from two to five
+  attempts within the same upstream call/check-in/subtype, still bounded by the
+  existing 60-second registration timeout. No automatic new-identity loop.
+- Push initialization errors include allowlisted registration stages and Google
+  error codes without requiring debug logs or exposing raw response bodies.
+- Clarified failed-initialization errors: an existing receiver is not replaced;
+  this does not imply that a first registration saved usable credentials.
+- Consolidated push research examples into `examples/push.py`; protocol logic
+  now lives in the SDK, without imports from examples or changes to the existing
+  camera dispatcher/session architecture.
+- Moved SDK-managed connection and push state from JSON to SQLite. Matching
+  legacy files are imported once and retained; user configs, logs and media are
+  unchanged. Existing receiver identities are reused, not registered again.
+- Push events are persisted before filtering/delivery. Watch consumes live
+  events; repeated read returns only unread events from the current subscription.
+- One-time initialization persists application configuration so deployed
+  receivers need no JADX export. SQLAlchemy is now a core dependency; the FCM
+  dependency remains optional.
+
+### Validation
+
+- User-run physical tests confirmed subscription lifecycle, independent receivers
+  on multiple cameras, unread-only read, prolonged watch, and reconnect after
+  network loss. Full queued LPC payload confirmed the low-battery meaning.
+  The final typed helpers and unified CLI formatting have offline regression
+  coverage; a final manual smoke check is still recommended before release.
+- Version remains `0.5.0`; these changes are not yet released.
+
 ## 0.5.0
 
 Reliable SD-card downloads and batch download API.

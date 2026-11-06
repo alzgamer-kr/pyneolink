@@ -6,6 +6,7 @@ include requirements.txt
 recursive-include docs *.md
 recursive-include examples *.py *.md
 recursive-include tests *.py
+include tests/fixtures/push/events.jsonl
 global-exclude __pycache__
 global-exclude *.py[cod]
 global-exclude .DS_Store

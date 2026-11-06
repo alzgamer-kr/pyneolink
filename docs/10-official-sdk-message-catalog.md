@@ -174,6 +174,7 @@ Cataloged values: **194**. Unresolved values: **0**.
 | 521 | `aiSnapTlps` | `SetAISnaptlpsCfg` | `0x97b` | XML serializer, named SDK export |
 | 524 | `PushCreateListener` | `CreatePushListener` | `0x97e` | XML serializer, named SDK export |
 | 525 | `SyncPushClientList` | `SyncPushClientList` | `0x97f` | named SDK export, no-body SDK export |
+| 526 | `PushClientState` | `GetPushClientState` | `0x984` | handler FUN_180158cb0 selects 0x20e; serializer FUN_1801300d0; parser FUN_1801b8750; physical test pending |
 | 528 | `CrosslineDetect` | `SetSmartAICrosslineDetectCfg` | `0x98d` | XML serializer, named SDK export |
 | 530 | `IntrusionDetect` | `SetSmartAIIntrusionDetectCfg` | `0x98f` | XML serializer, named SDK export |
 | 532 | `LoiteringDetect` | `SetSmartAILoiteringDetectCfg` | `0x991` | XML serializer, named SDK export |

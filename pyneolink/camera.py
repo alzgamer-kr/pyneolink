@@ -16,6 +16,7 @@ from .battery import Battery
 from .core.crypto import Cipher, make_aes_key, md5_hex
 from .core.discovery import local_discover, remote_uid_lookup
 from .core.state import ConnectionState
+from .core.storage import DEFAULT_STORAGE_DIR, connection_state_path
 from .core.udp_transport import UdpBcConnection, connect_local_direct, connect_relay
 from .motion import Motion
 from .ptz import Ptz
@@ -57,7 +58,8 @@ class Camera(AbstractContextManager["Camera"]):
         channel_id: int = 0,
         stream: str = "both",
         timeout: float = 10.0,
-        state_path: str | Path | None = ".pyneolink_state.json",
+        state_path: str | Path | None = DEFAULT_STORAGE_DIR,
+        storage_dir: str | Path | None = None,
         debug: bool = False,
     ) -> None:
         """Create a camera client.
@@ -79,7 +81,11 @@ class Camera(AbstractContextManager["Camera"]):
         :param stream: Preferred stream selection for config consumers. Use
             method-level `stream`/`quality` parameters for explicit operations.
         :param timeout: Socket/protocol timeout in seconds.
-        :param state_path: JSON state cache path, or `None` to disable cache.
+        :param state_path: Legacy SQLite file/storage directory override, or
+            `None` to disable cache. An explicit nondefault value takes precedence.
+        :param storage_dir: Shared per-camera SQLite directory, such as ./storage.
+            Defaults to ~/pyneolink. Relative paths use the working directory.
+            Use the same directory in PushClient to share one database per camera.
         :param debug: Print protocol/debug messages when enabled.
         """
         if config is None:
@@ -101,7 +107,8 @@ class Camera(AbstractContextManager["Camera"]):
         self.cipher = Cipher("bc")
         self.msg_num = 0
         self.binary_msg_nums: set[int] = set()
-        self.state = ConnectionState(state_path) if state_path else None
+        resolved_state = connection_state_path(config.name, state_path, storage_dir)
+        self.state = ConnectionState(resolved_state) if resolved_state else None
         self.connected_address: tuple[str, int] | None = None
         self.login_xml = ""
         self.debug = debug

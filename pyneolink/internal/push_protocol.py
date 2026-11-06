@@ -1,4 +1,4 @@
-"""Experimental push protocol checks, not a cloud push receiver or public API."""
+"""Push envelope normalization and retained legacy protocol research utilities."""
 
 from __future__ import annotations
 
@@ -10,11 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from pyneolink import Camera
+from pyneolink.camera import Camera
 from pyneolink.config import CameraConfig, load_config
 
 PUSH_INFO_ID = 124  # Neolink's legacy PushInfo, not the unverified v2 commands.
@@ -125,6 +121,7 @@ def replay(path: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Replay offline fixtures or explicitly register the approved research camera."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     offline = commands.add_parser("replay", help="Offline JSONL parsing only")

@@ -7,6 +7,10 @@ from pathlib import Path
 import sys
 import time
 import traceback
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pyneolink.push import PushEvent
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,6 +36,23 @@ def _parse_preset_selector(value: str) -> int | str:
         return int(value)
     except ValueError:
         return value
+
+
+def _print_push_event(event: PushEvent, *, json_output: bool, full_response: bool) -> None:
+    """Print the same event representation for read and watch, flushing each line.
+
+    JSON mode uses one object per line (JSONL). Text mode prefers server time
+    and folds title whitespace so one notification occupies one console line.
+    """
+    if json_output or full_response:
+        print(json.dumps(event.info(full_response=full_response), ensure_ascii=False), flush=True)
+        return
+    title = f" | {' '.join(event.title.split())}" if event.title else ""
+    print(
+        f"{event.server_time_raw or event.received_at} "
+        f"{event.event_type or 'UNKNOWN'} {event.camera_uid or '-'}{title}",
+        flush=True,
+    )
 
 
 class CLI:
@@ -64,6 +85,7 @@ class CLI:
             "pir": self.run_camera_command,
             "ir": self.run_camera_command,
             "ptz": self.run_camera_command,
+            "push": self.run_push,
         }
         self.camera_handlers: dict[str, CameraCommandHandler] = {
             "status": self.camera_status,
@@ -125,13 +147,55 @@ class CLI:
 
         parser = argparse.ArgumentParser(prog="pyneolink")
         parser.add_argument("--config", default="config.json")
-        parser.add_argument("--state", default=".pyneolink_state.json")
+        parser.add_argument("--state", default=str(Path.home() / "pyneolink"))
+        self.add_storage_option(parser, default=Path.home() / "pyneolink")
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--camera")
         parser.add_argument(
             "--info", action="store_true", help="Connect to the camera and print camera information as JSON"
         )
         subparsers = parser.add_subparsers(dest="command")
+
+        push = subparsers.add_parser("push", help="Cloud push subscriptions and camera-independent reception")
+        self.add_common_options(push)
+        self.add_camera_option(push)
+        push_actions = push.add_subparsers(dest="push_action", required=True)
+        for action in ("init", "subscribe", "status", "unsubscribe", "watch", "read"):
+            command = push_actions.add_parser(action)
+            self.add_common_options(command)
+            self.add_camera_option(command)
+            command.add_argument("--database", type=Path, help="Override the camera SQLite path")
+            command.add_argument("--legacy-state-dir", "--push-state-dir", type=Path, dest="legacy_state_dir")
+            command.add_argument("--json", action="store_true", help="Print structured results/events")
+            if action == "init":
+                source = command.add_mutually_exclusive_group()
+                source.add_argument("--firebase-config", type=Path)
+                source.add_argument("--android-strings", type=Path)
+            if action == "unsubscribe":
+                command.add_argument("--verify", action=argparse.BooleanOptionalAction, default=True)
+                command.add_argument("--retry-rejected", action="store_true")
+            if action in ("watch", "read"):
+                command.add_argument(
+                    "--full-response", action="store_true", help="Include private decrypted response in JSON output"
+                )
+                command.add_argument(
+                    "--raw-output",
+                    type=Path,
+                    help="Append full decrypted push messages to .jsonl (sensitive; testing only)",
+                )
+            if action == "watch":
+                command.add_argument("--duration", type=float, help="Seconds to listen; default: until Ctrl+C")
+                command.add_argument("--skip-previous", action=argparse.BooleanOptionalAction, default=True)
+                command.add_argument(
+                    "--reconnect-delay", type=float, default=30, help="Initial retry delay in seconds (1-300)"
+                )
+            if action == "read":
+                command.add_argument("--sync", action=argparse.BooleanOptionalAction, default=True)
+                command.add_argument("--sync-timeout", type=float, default=10, help="Maximum catch-up time in seconds")
+                command.add_argument(
+                    "--idle-timeout", type=float, default=2, help="Finish catch-up after this idle period"
+                )
+                command.add_argument("--limit", type=int, default=1000, help="Maximum unread events to return")
 
         for name in ("status", "info", "uid", "reboot"):
             command_parser = subparsers.add_parser(name)
@@ -240,7 +304,19 @@ class CLI:
 
         parser.add_argument("--config", default=argparse.SUPPRESS)
         parser.add_argument("--state", default=argparse.SUPPRESS)
+        CLI.add_storage_option(parser)
         parser.add_argument("--debug", action="store_true", default=argparse.SUPPRESS)
+
+    @staticmethod
+    def add_storage_option(parser: argparse.ArgumentParser, *, default: object = argparse.SUPPRESS) -> None:
+        """Expose the shared SQLite directory without overriding parent options."""
+        parser.add_argument(
+            "--storage-dir",
+            "--storage_dir",
+            type=Path,
+            default=default,
+            help="Shared SQLite state directory (default: ~/pyneolink); relative to the working directory",
+        )
 
     @staticmethod
     def add_camera_option(parser: argparse.ArgumentParser) -> None:
@@ -275,7 +351,8 @@ class CLI:
             args.config,
             host=args.host,
             port=args.port,
-            state_path=getattr(args, "state", ".pyneolink_state.json"),
+            state_path=getattr(args, "state", str(Path.home() / "pyneolink")),
+            storage_dir=args.storage_dir,
             debug=getattr(args, "debug", False),
             buffer_seconds=args.buffer_seconds,
             hls_buffer_mb=args.hls_buffer_mb,
@@ -301,6 +378,84 @@ class CLI:
             print(msg.Log.DiscoveryHit.format(host=hit.address[0], port=hit.address[1], uid=uid, source=hit.source))
         return 0
 
+    def run_push(self, args: argparse.Namespace) -> int:
+        """Run cloud operations without opening the CLI's normal camera context."""
+        from pyneolink.push import PushClient
+
+        def diagnostic(record: dict) -> None:
+            if args.debug:
+                print(json.dumps(record, ensure_ascii=False), file=sys.stderr, flush=True)
+            elif record.get("status") == "reconnecting":
+                print(f"Push disconnected; retry in {record['delay']:g}s.", file=sys.stderr, flush=True)
+
+        camera_config = None
+        if args.push_action in ("subscribe", "status", "unsubscribe"):
+            camera_config = load_config(args.config).camera(args.camera)
+        client = PushClient(
+            camera_config,
+            camera_name=args.camera,
+            storage_dir=args.storage_dir,
+            database=args.database,
+            legacy_state_dir=args.legacy_state_dir,
+            diagnostic_callback=diagnostic,
+        )
+        if args.push_action in ("watch", "read") and args.raw_output is not None:
+            print("Raw push capture enabled: the file may contain private text and URLs.", file=sys.stderr)
+        if args.push_action == "read":
+            events = client.read(
+                sync=args.sync,
+                sync_timeout=args.sync_timeout,
+                idle_timeout=args.idle_timeout,
+                limit=args.limit,
+                raw_output=args.raw_output,
+            )
+            for event in events:
+                _print_push_event(event, json_output=args.json, full_response=args.full_response)
+            if not (args.json or args.full_response):
+                print(f"Read {len(events)} unread push event(s).", file=sys.stderr)
+            return 0
+        if args.push_action == "watch":
+            if not (args.json or args.full_response):
+                print("Listening for push events. Ctrl+C to stop.", file=sys.stderr, flush=True)
+            with client.watch(
+                skip_previous=args.skip_previous,
+                duration=args.duration,
+                reconnect_delay=args.reconnect_delay,
+                raw_output=args.raw_output,
+            ) as events:
+                for event in events:
+                    _print_push_event(event, json_output=args.json, full_response=args.full_response)
+            if not (args.json or args.full_response):
+                print("Push watch finished.", file=sys.stderr)
+            return 0
+        if args.push_action == "init":
+            firebase = None
+            if args.firebase_config is not None:
+                firebase = json.loads(args.firebase_config.read_text(encoding="utf-8"))
+            result = client.initialize(firebase, android_strings=args.android_strings)
+        elif args.push_action == "unsubscribe":
+            result = client.unsubscribe(verify=args.verify, retry_rejected=args.retry_rejected)
+        else:
+            result = getattr(client, args.push_action)()
+        if args.json:
+            print(json.dumps(result.info(), ensure_ascii=False))
+        else:
+            messages = {
+                "receiver-ready": "Push receiver ready.",
+                "subscribed": "Subscribed.",
+                "already-subscribed": "Already subscribed (verified).",
+                "subscription-accepted": "Subscription accepted.",
+                "subscribed-after-timeout": "Subscribed (verified after timeout).",
+                "unsubscribed": "Unsubscribed (verified).",
+                "removal-accepted": "Removal accepted; not yet verified.",
+                "verification-unavailable": "Could not verify subscription; no create request sent.",
+                "creation-unconfirmed": "Creation result is unknown; no automatic retry.",
+            }
+            print(messages.get(result.status, f"Push: {result.status}."))
+        if args.debug:
+            diagnostic(result.info())
+        return 0 if result.ok else 1
+
     def run_camera_command(self, args: argparse.Namespace) -> int:
         """
         Load camera configuration, open a camera connection, and dispatch a camera command.
@@ -312,7 +467,9 @@ class CLI:
         cam_cfg = cfg.camera(getattr(args, "camera", None))
         handler = self.camera_handlers[args.command]
 
-        with Camera(cam_cfg, state_path=args.state, debug=getattr(args, "debug", False)) as cam:
+        with Camera(
+            cam_cfg, state_path=args.state, storage_dir=args.storage_dir, debug=getattr(args, "debug", False)
+        ) as cam:
             return handler(args, cam, cam_cfg)
 
     def camera_status(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:

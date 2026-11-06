@@ -42,10 +42,12 @@ classifiers = [
 ]
 dependencies = [
     "cryptography>=42",
+    "SQLAlchemy>=2.0,<3",
 ]
 
 [project.optional-dependencies]
 voice = ["sounddevice>=0.4"]
+push = ["firebase-messaging==0.4.5"]
 dev = [
     "build>=1.2",
     "pytest>=8",
