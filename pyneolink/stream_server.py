@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from .config import Config, config_from_dict, load_config
 from .core.const import msg
 from .core.media import MediaParser, MediaPacket
 from .core.storage import DEFAULT_STORAGE_DIR, connection_state_path
+from .core.udp_transport import RegistrationUnavailableError
 
 
 _STREAM_END = object()
@@ -21,6 +23,8 @@ _STREAM_QUEUE_TIMEOUT = 0.25
 _DEFAULT_HLS_BUFFER_MB = 100
 _DEFAULT_HLS_SEGMENT_SECONDS = 2.0
 _DEFAULT_HLS_RECONNECT_SECONDS = 5.0
+_HLS_REGISTRATION_RETRY_SECONDS = (120.0, 300.0)
+_HLS_IDLE_SECONDS = 60.0
 
 
 class StreamServer:
@@ -93,6 +97,7 @@ class StreamServer:
         try:
             server.serve_forever()
         finally:
+            _stop_hls_sessions(server)
             server.server_close()
 
     def start(self) -> "StreamServer":
@@ -112,6 +117,7 @@ class StreamServer:
         server = self._server
         self._server = None
         server.shutdown()
+        _stop_hls_sessions(server)
         server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
@@ -196,6 +202,20 @@ class _StreamServer(ThreadingHTTPServer):
     hls_segment_seconds: float
     hls_sessions: dict[tuple[str, str], "HlsSession"]
     hls_sessions_lock: threading.Lock
+
+    def service_actions(self) -> None:
+        with self.hls_sessions_lock:
+            idle = [session for session in self.hls_sessions.values() if session.idle_expired()]
+        for session in idle:
+            session.stop_if_idle()
+
+
+def _stop_hls_sessions(server: _StreamServer) -> None:
+    with server.hls_sessions_lock:
+        sessions = list(server.hls_sessions.values())
+        server.hls_sessions.clear()
+    for session in sessions:
+        session.stop()
 
 
 class _StreamHandler(BaseHTTPRequestHandler):
@@ -421,6 +441,7 @@ class MpegTsMuxer:
         self.codec = codec
         self.fps = max(fps, 1)
         self.continuity: dict[int, int] = {}
+        self._discontinuity_pids: set[int] = set()
         self.tables_written = False
         self.video_pts = 0
         self.audio_pts = 0
@@ -464,15 +485,18 @@ class MpegTsMuxer:
         first = True
         while offset < len(payload):
             include_pcr = pcr is not None and first
-            max_payload = 176 if include_pcr else 184
+            discontinuity = pid in self._discontinuity_pids
+            max_payload = 176 if include_pcr else (182 if discontinuity else 184)
             chunk = payload[offset : offset + min(len(payload) - offset, max_payload)]
             offset += len(chunk)
 
             adaptation = b""
-            if include_pcr or len(chunk) < 184:
+            if include_pcr or discontinuity or len(chunk) < 184:
                 total_adaptation = 184 - len(chunk)
-                if total_adaptation > 0:
-                    flags = 0x10 if include_pcr else 0x00
+                if total_adaptation == 1:
+                    adaptation = b"\x00"
+                elif total_adaptation > 1:
+                    flags = (0x10 if include_pcr else 0x00) | (0x80 if discontinuity else 0x00)
                     body = bytes([flags])
                     if include_pcr:
                         body += _encode_pcr(pcr or 0)
@@ -491,6 +515,7 @@ class MpegTsMuxer:
                 ]
             )
             packet = header + adaptation + chunk
+            self._discontinuity_pids.discard(pid)
             yield packet + (b"\xff" * (188 - len(packet)))
             first = False
 
@@ -503,6 +528,8 @@ class HlsSegment:
     duration: float
     data: bytes
     created_at: float
+    discontinuity: bool = False
+    discontinuity_sequence: int = 0
 
 
 class HlsSession:
@@ -541,14 +568,59 @@ class HlsSession:
         self.started = False
         self.error: BaseException | None = None
         self.reconnects = 0
+        self._discontinuity_sequence = 0
+        self._pending_discontinuity = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._camera: Camera | None = None
+        self._last_access = time.monotonic()
 
     def start(self) -> None:
         with self.lock:
+            self._last_access = time.monotonic()
             if self.started:
                 return
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop = threading.Event()
+            if self.next_sequence and not self._pending_discontinuity:
+                self._discontinuity_sequence += 1
+                self._pending_discontinuity = True
+            self.segments.clear()
+            self.total_bytes = 0
+            self.error = None
             self.started = True
-            thread = threading.Thread(target=self._run, daemon=True)
-            thread.start()
+            self._thread = threading.Thread(target=self._run, name="pyneolink-hls", daemon=True)
+            self._thread.start()
+
+    def idle_expired(self) -> bool:
+        with self.lock:
+            return self.started and time.monotonic() - self._last_access >= max(
+                _HLS_IDLE_SECONDS, self.segment_seconds * 3
+            )
+
+    def stop_if_idle(self) -> None:
+        with self.lock:
+            if time.monotonic() - self._last_access < max(_HLS_IDLE_SECONDS, self.segment_seconds * 3):
+                return
+            self._stop.set()
+        self.stop()
+
+    def stop(self) -> None:
+        """Stop reconnects, close the camera, and release buffered segments."""
+        with self.condition:
+            self._stop.set()
+            camera = self._camera
+            thread = self._thread
+            self.condition.notify_all()
+        if camera is not None:
+            camera.close()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self.condition:
+            self.segments.clear()
+            self.total_bytes = 0
+            self.condition.notify_all()
 
     def playlist(self, *, timeout: float = 15.0) -> str:
         """
@@ -560,7 +632,7 @@ class HlsSession:
         self.start()
         deadline = time.monotonic() + timeout
         with self.condition:
-            while not self.segments and self.error is None and time.monotonic() < deadline:
+            while not self.segments and self.error is None and not self._stop.is_set() and time.monotonic() < deadline:
                 self.condition.wait(timeout=0.25)
             if self.error and not self.segments:
                 raise self.error
@@ -582,72 +654,97 @@ class HlsSession:
         return None
 
     def _run(self) -> None:
-        while True:
-            try:
-                self._run_stream()
-            except Exception as exc:
-                with self.condition:
-                    self.reconnects += 1
-                    self.error = exc if not self.segments else None
-                    self.condition.notify_all()
-                if self.debug:
-                    print(
-                        "[pyneolink] HLS stream "
-                        f"{self.camera_config.name}/{self.stream} stopped with {type(exc).__name__}: {exc}; "
-                        f"reconnecting in {_DEFAULT_HLS_RECONNECT_SECONDS:g}s"
-                    )
-                time.sleep(_DEFAULT_HLS_RECONNECT_SECONDS)
+        try:
+            while not self._stop.is_set():
+                try:
+                    self._run_stream()
+                    if not self._stop.is_set():
+                        self._mark_discontinuity()
+                except Exception as exc:
+                    if self._stop.is_set():
+                        return
+                    self._mark_discontinuity()
+                    with self.condition:
+                        self.reconnects += 1
+                        self.error = exc if not self.segments else None
+                        self.condition.notify_all()
+                    retry_delay = _DEFAULT_HLS_RECONNECT_SECONDS
+                    if isinstance(exc, RegistrationUnavailableError):
+                        retry_delay = random.uniform(*_HLS_REGISTRATION_RETRY_SECONDS)
+                    if self.debug:
+                        print(
+                            "[pyneolink] HLS stream "
+                            f"{self.camera_config.name}/{self.stream} stopped with {type(exc).__name__}: {exc}; "
+                            f"reconnecting in {retry_delay:.1f}s"
+                        )
+                    self._stop.wait(retry_delay)
+        finally:
+            with self.condition:
+                self.started = False
+                self.condition.notify_all()
 
     def _run_stream(self) -> None:
         camera = Camera(self.camera_config, state_path=self.state_path, debug=self.debug)
-        parser = MediaParser()
+        builder = _HlsSegmentBuilder(self, camera)
+        payloads = None
         try:
             with self.condition:
+                if self._stop.is_set():
+                    return
+                self._camera = camera
                 self.error = None
                 self.condition.notify_all()
             _open_stream_camera(camera)
+            if self._stop.is_set():
+                return
             payloads = camera.read_stream_payloads(self.stream)
-            first_packets, codec, fps = _read_until_keyframe(payloads, parser)
-            if codec not in ("H264", "H265"):
-                raise RuntimeError(msg.Error.HlsRequiresH264OrH265)
-            first_packets = _packets_from_first_keyframe(first_packets)
-            muxer = MpegTsMuxer(codec, fps=fps)
-            current = bytearray()
-            started_at = time.monotonic()
-            saw_video = False
-
-            def add_packet(packet: MediaPacket) -> None:
-                nonlocal current, started_at, saw_video
-                now = time.monotonic()
-                if packet.kind == "iframe" and saw_video and current and now - started_at >= self.segment_seconds:
-                    self._append_segment(
-                        bytes(current),
-                        now - started_at,
-                        socket_stats=_socket_debug_snapshot(camera),
-                    )
-                    current = bytearray()
-                    started_at = now
-                if not current:
-                    for table_chunk in muxer.table_packets():
-                        current.extend(table_chunk)
-                for chunk in muxer.feed(packet):
-                    current.extend(chunk)
-                if packet.kind in ("iframe", "pframe"):
-                    saw_video = True
-
-            for packet in first_packets:
-                add_packet(packet)
+            transport = camera.sock
             for payload in payloads:
-                for packet in parser.feed(payload):
-                    add_packet(packet)
+                if self._stop.is_set():
+                    break
+                if camera.sock is not transport:
+                    builder.finish()
+                    self._mark_discontinuity()
+                    with self.condition:
+                        self.reconnects += 1
+                    if self.debug:
+                        print(
+                            f"[pyneolink] HLS stream {self.camera_config.name}/{self.stream} "
+                            f"transport restored; waiting for keyframe; reconnects={self.reconnects}"
+                        )
+                    builder = _HlsSegmentBuilder(self, camera)
+                    transport = camera.sock
+                builder.feed(payload)
         finally:
+            builder.finish()
+            if payloads is not None:
+                payloads.close()
             camera.close()
+            with self.lock:
+                if self._camera is camera:
+                    self._camera = None
+
+    def _mark_discontinuity(self) -> None:
+        with self.condition:
+            if not self._pending_discontinuity:
+                self._discontinuity_sequence += 1
+                self._pending_discontinuity = True
 
     def _append_segment(self, data: bytes, duration: float, *, socket_stats: dict | None = None) -> None:
         if not data:
             return
         with self.condition:
-            segment = HlsSegment(self.next_sequence, max(duration, 0.001), data, time.monotonic())
+            if self._stop.is_set():
+                return
+            segment = HlsSegment(
+                self.next_sequence,
+                max(duration, 0.001),
+                data,
+                time.monotonic(),
+                self._pending_discontinuity,
+                self._discontinuity_sequence,
+            )
+            self._pending_discontinuity = False
             self.next_sequence += 1
             self.segments.append(segment)
             self.total_bytes += len(data)
@@ -662,9 +759,87 @@ class HlsSession:
                     f"seq={segment.sequence} duration={segment.duration:.3f}s "
                     f"bytes={len(segment.data)} buffered={len(self.segments)} "
                     f"buffer_mb={self.total_bytes / 1024 / 1024:.1f} "
-                    f"reconnects={self.reconnects}{udp_detail}"
+                    f"reconnects={self.reconnects} discontinuity={int(segment.discontinuity)}{udp_detail}"
                 )
             self.condition.notify_all()
+
+
+class _HlsSegmentBuilder:
+    """Parse one transport's media and segment on its video timeline."""
+
+    def __init__(self, session: HlsSession, camera: Camera) -> None:
+        self.session = session
+        self.camera = camera
+        self.parser = MediaParser()
+        self.muxer: MpegTsMuxer | None = None
+        self.fps = 15
+        self.data = bytearray()
+        self.first_pts: int | None = None
+        self.last_pts: int | None = None
+
+    def feed(self, payload: bytes) -> None:
+        for packet in self.parser.feed(payload):
+            self._add_packet(packet)
+
+    def _add_packet(self, packet: MediaPacket) -> None:
+        if packet.kind == "info":
+            if packet.fps and self.muxer is None:
+                self.fps = packet.fps
+            return
+        video = packet.kind in ("iframe", "pframe")
+        pts = None
+        if video:
+            pts = (
+                int(packet.timestamp_us * 90_000 / 1_000_000)
+                if packet.timestamp_us is not None
+                else (self.last_pts or 0) + 90_000 // self.fps
+            )
+            if self.last_pts is not None and (
+                pts < self.last_pts or (self.muxer is not None and packet.codec != self.muxer.codec)
+            ):
+                self.finish()
+                self.session._mark_discontinuity()
+                self.muxer = None
+                self.last_pts = None
+        if self.muxer is None:
+            if packet.kind != "iframe":
+                return
+            if packet.codec not in ("H264", "H265"):
+                raise RuntimeError(msg.Error.HlsRequiresH264OrH265)
+            self.muxer = MpegTsMuxer(packet.codec, fps=self.fps)
+            # HLS starts a new TS timeline here; demuxers also need the in-band
+            # flag before accepting reset continuity counters and PCR values.
+            self.muxer._discontinuity_pids.update(
+                (self.muxer.PAT_PID, self.muxer.PMT_PID, self.muxer.VIDEO_PID, self.muxer.AUDIO_PID)
+            )
+        if video:
+            if (
+                packet.kind == "iframe"
+                and self.first_pts is not None
+                and (pts - self.first_pts) / 90_000 >= self.session.segment_seconds
+            ):
+                self.finish(end_pts=pts)
+            if self.first_pts is None:
+                self.first_pts = pts
+            self.last_pts = pts
+        if not self.data:
+            for chunk in self.muxer.table_packets():
+                self.data.extend(chunk)
+        for chunk in self.muxer.feed(packet):
+            self.data.extend(chunk)
+
+    def finish(self, *, end_pts: int | None = None) -> None:
+        if self.first_pts is None or self.last_pts is None:
+            return
+        # A reconnect's wall-clock pause is not media in the previous segment.
+        end_pts = end_pts if end_pts is not None else self.last_pts + 90_000 // self.fps
+        self.session._append_segment(
+            bytes(self.data),
+            (end_pts - self.first_pts) / 90_000,
+            socket_stats=_socket_debug_snapshot(self.camera),
+        )
+        self.data.clear()
+        self.first_pts = None
 
 
 def _packets_from_first_keyframe(packets: list[MediaPacket]) -> list[MediaPacket]:
@@ -677,14 +852,18 @@ def _packets_from_first_keyframe(packets: list[MediaPacket]) -> list[MediaPacket
 def _hls_playlist(segments: list[HlsSegment], segment_seconds: float) -> str:
     target = max(1, int(max([segment.duration for segment in segments], default=segment_seconds) + 0.999))
     media_sequence = segments[0].sequence if segments else 0
+    discontinuity_sequence = segments[0].discontinuity_sequence - int(segments[0].discontinuity) if segments else 0
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
         f"#EXT-X-TARGETDURATION:{target}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}",
+        f"#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
     ]
     for segment in segments:
+        if segment.discontinuity:
+            lines.append("#EXT-X-DISCONTINUITY")
         lines.append(f"#EXTINF:{segment.duration:.3f},")
         lines.append(f"segments/{segment.sequence}.ts")
     return "\n".join(lines) + "\n"

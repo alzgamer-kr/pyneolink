@@ -22,6 +22,10 @@ UDP_RESEND_INTERVAL_SECONDS = 0.5
 UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
 
 
+class RegistrationUnavailableError(TimeoutError):
+    """The Reolink registration stage could not provide a usable session."""
+
+
 class UdpBcConnection:
     """Socket-like reliable UDP channel for Baichuan bytes."""
 
@@ -586,9 +590,13 @@ def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, 
         "</C2R_C></P2P>"
     )
     _debug(debug, "Registering client address with Reolink register server")
-    reply_xml = _retry_discovery(
-        sock, reg_xml, reg, lambda xml: "<R2C_C_R>" in xml, timeout=timeout, debug=debug, label="C2R_C"
-    )
+    try:
+        reply_xml = _retry_discovery(
+            sock, reg_xml, reg, lambda xml: "<R2C_C_R>" in xml, timeout=timeout, debug=debug, label="C2R_C"
+        )
+    except TimeoutError as exc:
+        sock.close()
+        raise RegistrationUnavailableError(str(exc)) from exc
     sid = _find_int(reply_xml, "sid")
     relay = _find_in_xml(reply_xml, "relay") or _find_in_xml(reply_xml, "relayt") or relay_lookup
     candidates = [
@@ -599,7 +607,7 @@ def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, 
     candidates = [(conn, addr) for conn, addr in candidates if addr]
     if sid is None or not candidates:
         sock.close()
-        raise TimeoutError(msg.Error.RegisterNoConnectionDetails)
+        raise RegistrationUnavailableError(msg.Error.RegisterNoConnectionDetails)
 
     _debug(
         debug,

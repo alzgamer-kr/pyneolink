@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,11 +16,13 @@ class ConnectionState:
     """SQLite connection cache. Legacy .json paths import into a sibling .db."""
 
     def __init__(self, path: str | Path = DEFAULT_STORAGE_DIR) -> None:
+        """Create a cache with serialized access to its in-memory bookkeeping."""
         self.path = Path(path).expanduser()
         self._legacy = self.path if self.path.suffix.lower() == ".json" else Path(".pyneolink_state.json")
         self._stores: dict[str, CameraStore] = {}
         self.data: dict = {"cameras": {}}
         self._dirty: set[str] = set()
+        self._lock = threading.RLock()
 
     def _store(self, name: str) -> CameraStore:
         if name in self._stores:
@@ -48,24 +51,27 @@ class ConnectionState:
 
     def get_address(self, camera_name: str, *, transport: str | None = None) -> str | None:
         """Read the current endpoint, including updates from another process."""
-        item = self._store(camera_name).get(f"connection:{camera_name}", {})
-        self.data["cameras"][camera_name] = item
-        if transport is not None and item.get("transport", "tcp") != transport:
-            return None
-        return item.get("address")
+        with self._lock:
+            item = self._store(camera_name).get(f"connection:{camera_name}", {})
+            self.data["cameras"][camera_name] = item
+            if transport is not None and item.get("transport", "tcp") != transport:
+                return None
+            return item.get("address")
 
     def update_address(self, camera_name: str, address: str, *, uid: str | None = None, transport: str = "tcp") -> None:
         """Commit one camera's last working endpoint atomically."""
-        item = self._store(camera_name).get(f"connection:{camera_name}", {})
-        item.update(address=address, transport=transport, updated_at=datetime.now(timezone.utc).isoformat())
-        if uid:
-            item["uid"] = uid
-        self.data["cameras"][camera_name] = item
-        self._dirty.add(camera_name)
-        self.save()
+        with self._lock:
+            item = self._store(camera_name).get(f"connection:{camera_name}", {})
+            item.update(address=address, transport=transport, updated_at=datetime.now(timezone.utc).isoformat())
+            if uid:
+                item["uid"] = uid
+            self.data["cameras"][camera_name] = item
+            self._dirty.add(camera_name)
+            self.save()
 
     def save(self) -> None:
         """Save only modified cameras, avoiding stale cross-camera overwrites."""
-        for name in self._dirty or self.data["cameras"].keys():
-            self._store(name).put(f"connection:{name}", self.data["cameras"][name])
-        self._dirty.clear()
+        with self._lock:
+            for name in self._dirty or self.data["cameras"].keys():
+                self._store(name).put(f"connection:{name}", self.data["cameras"][name])
+            self._dirty.clear()

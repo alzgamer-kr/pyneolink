@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
 import random
+from string import Formatter
 import threading
 import time as monotonic_clock
 from typing import TYPE_CHECKING
@@ -14,6 +16,8 @@ import xml.etree.ElementTree as ET
 
 from .core.bc import (
     InvalidMagicError,
+    InterruptedMessageError,
+    MessageQueueOverflow,
     ProtocolError,
 )
 from .core.const import MSG, MSG_CLASS, msg as const_msg, payloads
@@ -90,6 +94,7 @@ class SDFile:
         self,
         output: str | Path,
         *,
+        filename_template: str | None = None,
         stream_type: str | None = None,
         quality: str | None = None,
         chunk_limit: int = 0,
@@ -107,6 +112,11 @@ class SDFile:
         """Download this SD-card file.
 
         :param output: Output directory or complete output file path.
+        :param filename_template: Optional filename format, for example
+            `{start_time:%Y-%m-%d_%H-%M-%S}_{stem}`. With a template, `output`
+            is a directory. The original extension is appended when omitted.
+            Successful and skipped files receive the recording start as mtime;
+            timestamps without an offset use the downloading computer's zone.
         :param stream_type: Explicit stream type, for example `mainStream` or
             `subStream`. Mutually exclusive with `quality`.
         :param quality: Quality alias such as `high`/`main` or `low`/`sub`.
@@ -140,6 +150,7 @@ class SDFile:
             return self.sd_card._download_file(
                 self._file,
                 output,
+                filename_template=filename_template,
                 stream_type=stream_type,
                 quality=quality,
                 chunk_limit=chunk_limit,
@@ -155,11 +166,11 @@ class SDFile:
                 ignore_playback_terminal=ignore_playback_terminal,
             )
 
-    def _existing_download_matches(self, output: str | Path) -> bool:
+    def _existing_download_matches(self, output: str | Path, filename_template: str | None = None) -> bool:
         item = self.info()
         raw = _download_raw(item)
         file_id = raw.get("Id") or item.get("path") or item.get("file_name") or str(self._file)
-        path = _resolve_download_output_path(item, raw, str(file_id), str(self._file), output)
+        path = _resolve_download_output_path(item, raw, str(file_id), str(self._file), output, filename_template)
         expected_size = _int_or_none(item.get("size")) or _file_size(raw)
         return _existing_download_matches(path, expected_size)
 
@@ -434,6 +445,7 @@ class SDFileCollection(list[SDFile]):
         on_progress: Callable[[DownloadProgress], None] | None = None,
         on_finish: Callable[[DownloadBatchResult], None] | None = None,
         notify_on_finish: bool = False,
+        filename_template: str | None = None,
         max_attempts: int = 3,
         reconnect_retries: int = 3,
         reconnect_delay: float = 5.0,
@@ -444,15 +456,33 @@ class SDFileCollection(list[SDFile]):
         recv_timeout: float = 2.0,
         continue_on_error: bool = True,
     ) -> DownloadBatchResult:
-        """Download every file and return a reusable batch result."""
+        """Download every file and return a reusable batch result.
+
+        `filename_template` accepts `name`, `stem`, `start_time`, `end_time`,
+        and `channel_id`. Datetime fields support strftime format specifications.
+        Missing fields, unsafe names, and duplicate template names in a batch
+        raise ValueError before downloads start. Reuse the same template when
+        retrying failed files. Output mtime follows the recording start time.
+        """
         started_at = datetime.now().astimezone()
         results = []
         total = len(self)
+        if filename_template is not None:
+            names = set()
+            for file in self:
+                item = file.info()
+                raw = _download_raw(item)
+                file_id = raw.get("Id") or item.get("path") or item.get("file_name") or str(file._file)
+                name = _download_output_file_name(item, raw, str(file_id), str(file._file))
+                name = _format_download_filename(filename_template, name, item, raw)
+                if name.casefold() in names:
+                    raise ValueError(f"Duplicate filename_template result: {name!r}; include {{stem}} for uniqueness")
+                names.add(name.casefold())
         Path(output).mkdir(parents=True, exist_ok=True)
         camera_name = getattr(getattr(self.sd_card.camera, "config", None), "name", "camera")
         for index, file in enumerate(self, start=1):
             item_started_at = datetime.now().astimezone()
-            skipped = not rewrite_exists and file._existing_download_matches(output)
+            skipped = not rewrite_exists and file._existing_download_matches(output, filename_template)
             reporter = _BatchProgressReporter(
                 file,
                 index=index,
@@ -465,6 +495,7 @@ class SDFileCollection(list[SDFile]):
             try:
                 path = file.download(
                     output,
+                    filename_template=filename_template,
                     stream_type=stream_type,
                     quality=quality,
                     chunk_limit=chunk_limit,
@@ -918,7 +949,7 @@ class SdCard:
                 if not detail or detail.header.response_code != 200:
                     if page == 1:
                         break
-                    return got_response
+                    raise ProtocolError(f"Incomplete SD-card listing: failed to read page {page} for {handle}")
                 got_response = True
                 self.last_xml = detail.xml_text
                 success = _success(detail_query, detail.xml_text)
@@ -930,7 +961,7 @@ class SdCard:
                 if not page_files or added == 0:
                     return True
             if got_response:
-                return True
+                raise ProtocolError(f"Incomplete SD-card listing: exceeded {max_pages} pages for {handle}")
         return False
 
     def filter(
@@ -985,6 +1016,7 @@ class SdCard:
         file: dict | SdCardFile | str,
         output: str | Path,
         *,
+        filename_template: str | None = None,
         stream_type: str | None = None,
         quality: str | None = None,
         chunk_limit: int = 0,
@@ -1034,12 +1066,13 @@ class SdCard:
             raw["_streamTypeForced"] = True
         file_id = raw.get("Id") or item.get("path") or item.get("file_name") or str(file)
         file_name = _download_output_file_name(item, raw, file_id, str(file))
-        output_path = _resolve_download_output_path(item, raw, str(file_id), str(file), output)
+        output_path = _resolve_download_output_path(item, raw, str(file_id), str(file), output, filename_template)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         expected_size = _int_or_none(item.get("size")) or _file_size(raw)
         if not rewrite_exists and _existing_download_matches(output_path, expected_size):
             _remove_stale_part_files(output_path)
+            _set_download_mtime(output_path, item, raw)
             _emit_progress_message(progress, f"  skipped existing file: {output_path}")
             return output_path
         if not rewrite_exists and output_path.exists():
@@ -1050,7 +1083,7 @@ class SdCard:
         next_delayed_reconnect_attempt = 1
         while True:
             try:
-                return self._download_once(
+                downloaded_path = self._download_once(
                     item,
                     dict(raw),
                     str(file_id),
@@ -1078,7 +1111,7 @@ class SdCard:
                 )
                 next_reconnect_attempt = used_attempt + 1
                 next_delayed_reconnect_attempt = used_delayed_attempt + 1
-            except TimeoutError as exc:
+            except (TimeoutError, EOFError, ConnectionError, InterruptedMessageError, MessageQueueOverflow) as exc:
                 _emit_progress_message(progress, f"  download failed: {type(exc).__name__}: {exc}")
                 used_attempt, used_delayed_attempt = self._reconnect_for_download(
                     file_name,
@@ -1094,6 +1127,9 @@ class SdCard:
                 )
                 next_reconnect_attempt = used_attempt + 1
                 next_delayed_reconnect_attempt = used_delayed_attempt + 1
+            else:
+                _set_download_mtime(downloaded_path, item, raw)
+                return downloaded_path
 
     def _reconnect_for_download(
         self,
@@ -1195,6 +1231,9 @@ class SdCard:
                     self._stop_replay_download(raw)
                 if query.label.startswith("playback143/") and not ignore_playback_terminal:
                     self._stop_playback_download()
+            except (EOFError, ConnectionError, InterruptedMessageError, MessageQueueOverflow):
+                _remove_empty_file(part_path)
+                raise
             except TimeoutError as exc:
                 if query.label.startswith("replay5/"):
                     self._stop_replay_download(raw)
@@ -1336,6 +1375,7 @@ class SdCard:
                 matcher=matches_download,
                 maxsize=1024,
             ) as replies,
+            _download_binary_scope(self.camera) as mark_binary,
             output_path.open("wb") as fh,
         ):
             accepted_msg_nums.add(replies.msg_num)
@@ -1500,8 +1540,8 @@ class SdCard:
                         _response_detail(msg, const_msg.Error.Response.format(response_code=msg.header.response_code))
                     )
                 if b"<binaryData>1</binaryData>" in msg.extension:
-                    _mark_binary_message(self.camera, replies.msg_num)
-                    _mark_binary_message(self.camera, msg.header.msg_num)
+                    mark_binary(replies.msg_num)
+                    mark_binary(msg.header.msg_num)
                 xml_text = msg.xml_text
                 if xml_text and _looks_like_xml(xml_text):
                     self.last_xml = xml_text
@@ -1517,8 +1557,8 @@ class SdCard:
                             f"msg_nums={len(accepted_msg_nums)}, xml={_one_line_preview(xml_text)}"
                         )
                         break
-                    _mark_binary_message(self.camera, replies.msg_num)
-                    _mark_binary_message(self.camera, msg.header.msg_num)
+                    mark_binary(replies.msg_num)
+                    mark_binary(msg.header.msg_num)
                     continue
                 if msg.payload:
                     payload = msg.payload
@@ -2385,6 +2425,8 @@ def _flat_time_fragment(prefix: str, value: datetime) -> payloads.Raw:
 
 def _parse_time(raw: dict, *keys: str) -> datetime | None:
     value = _first(raw, *keys)
+    if isinstance(value, datetime):
+        return value
     if isinstance(value, dict):
         try:
             return datetime(
@@ -2560,7 +2602,7 @@ def _download_raw(item: dict) -> dict:
 
 
 def _download_output_file_name(item: dict, raw: dict, file_id: str, fallback: str) -> str:
-    base = str(item.get("file_name") or raw.get("fileName") or raw.get("name") or "").strip()
+    base = str(item.get("file_name") or item.get("name") or raw.get("fileName") or raw.get("name") or "").strip()
     if not base:
         base = Path(str(file_id)).name or Path(fallback).name or "download"
     suffix = Path(base).suffix
@@ -2578,12 +2620,71 @@ def _resolve_download_output_path(
     file_id: str,
     fallback: str,
     output: str | Path,
+    filename_template: str | None = None,
 ) -> Path:
     file_name = _download_output_file_name(item, raw, file_id, fallback)
     output_path = Path(output)
+    if filename_template is not None:
+        if output_path.exists() and not output_path.is_dir():
+            raise ValueError("output must be a directory when filename_template is provided")
+        return output_path / _format_download_filename(filename_template, file_name, item, raw)
     if output_path.is_dir() or str(output).endswith(("/", "\\")):
         return output_path / Path(file_name).name
     return output_path
+
+
+def _download_time(item: dict, raw: dict, field: str, *keys: str) -> datetime | None:
+    for value in (item.get(field), *(raw.get(key) for key in keys)):
+        if isinstance(value, dict) and not all(key in value for key in ("year", "month", "day")):
+            continue
+        parsed = _parse_time({"value": value}, "value")
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _set_download_mtime(path: Path, item: dict, raw: dict) -> None:
+    started = _download_time(item, raw, "start_time", "beginTime", "startTime", "start", "begin", "time")
+    if started is None:
+        return
+    # Naive camera times intentionally use the host's local timezone, including
+    # its historical DST rules. Keep atime and touch only the finalized output.
+    modified_ns = round(started.timestamp() * 1_000_000_000)
+    os.utime(path, ns=(path.stat().st_atime_ns, modified_ns))
+
+
+def _format_download_filename(template: str, original: str, item: dict, raw: dict) -> str:
+    if not isinstance(template, str) or not template:
+        raise ValueError("filename_template must be a non-empty string")
+    values = {
+        "name": original,
+        "stem": Path(original).stem,
+        "start_time": _download_time(item, raw, "start_time", "beginTime", "startTime", "start", "begin", "time"),
+        "end_time": _download_time(item, raw, "end_time", "endTime", "end"),
+        "channel_id": item.get("channel_id") if item.get("channel_id") is not None else raw.get("channelId"),
+    }
+    for _, field, spec, conversion in Formatter().parse(template):
+        if field is None:
+            continue
+        if field not in values or conversion is not None or "{" in spec or "}" in spec:
+            raise ValueError(f"Unsupported filename_template field: {field!r}")
+        if values[field] is None:
+            raise ValueError(f"Recording metadata is missing filename_template field: {field}")
+    name = template.format_map(values)
+    invalid_base = not name or name in (".", "..") or name.endswith((".", " "))
+    suffix = Path(original).suffix
+    if suffix and not name.lower().endswith(suffix.lower()):
+        name += suffix
+    reserved = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    reserved.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in "123456789\u00b9\u00b2\u00b3")
+    if (
+        invalid_base
+        or name.endswith((".", " "))
+        or any(char in '<>:"/\\|?*' or ord(char) < 32 for char in name)
+        or name.split(".", 1)[0].rstrip(" ").upper() in reserved
+    ):
+        raise ValueError(f"filename_template produced an unsafe filename: {name!r}")
+    return name
 
 
 def _display_file_name(file: SDFile) -> str:
@@ -3525,6 +3626,27 @@ def _remove_file(path: Path) -> None:
             path.unlink()
     except OSError:
         pass
+
+
+@contextmanager
+def _download_binary_scope(camera: Camera):
+    """Release only this transfer's binary routes on its original transport."""
+    transport = getattr(camera, "sock", None)
+    owned: set[int] = set()
+
+    def mark(msg_num: int | None) -> None:
+        numbers = getattr(camera, "binary_msg_nums", None)
+        if msg_num and numbers is not None and msg_num not in numbers:
+            owned.add(msg_num)
+            _mark_binary_message(camera, msg_num)
+
+    try:
+        yield mark
+    finally:
+        if transport is getattr(camera, "sock", None):
+            numbers = getattr(camera, "binary_msg_nums", None)
+            if numbers is not None:
+                numbers.difference_update(owned)
 
 
 def _mark_binary_message(camera: Camera, msg_num: int | None) -> None:

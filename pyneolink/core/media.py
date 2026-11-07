@@ -239,10 +239,14 @@ def _extract_media_streams(
 
 def _payload_video_codec(data: bytes) -> str | None:
     for offset in _annex_b_nal_offsets(data):
+        if offset >= len(data):
+            continue
         nal_header = data[offset]
         h264_type = nal_header & 0x1F
         h265_type = (nal_header >> 1) & 0x3F
-        if h265_type in (19, 20, 21, 32, 33, 34):
+        # HEVC has a two-byte header. A H.264 P slice (0x41) is not a VPS.
+        hevc_header = offset + 1 < len(data) and nal_header & 1 == 0 and 1 <= data[offset + 1] <= 7
+        if hevc_header and h265_type in (19, 20, 21, 32, 33, 34):
             return "H265"
         if h264_type in (5, 7, 8):
             return "H264"
