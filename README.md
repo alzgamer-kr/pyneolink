@@ -805,7 +805,7 @@ This Python implementation was developed with OpenAI Codex. Human testing agains
 
 ## Reference
 
-The Rust `neolink/` checkout can be kept locally as a protocol reference, but it is ignored by Git in this workspace. The Python code here is intended to be understandable and hackable for people who want to experiment with Reolink cameras from Python.
+The Python code here is intended to be understandable and hackable for people who want to experiment with Reolink cameras from Python.
 
 ## Tested Cameras
 
