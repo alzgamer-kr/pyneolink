@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.1
+
+README and documentation privacy fix. Release notes prepared on 2026-11-14.
+
+### Fixed
+
+- Replace private camera aliases with `Home-Front` / `Home-Back` in the README,
+  push testing documentation, and the retained legacy research probe.
+- Update release metadata and instructions for the corrected distribution.
+  Public SDK behavior is unchanged; this release does not include the pending
+  push watch duration fix.
+
 ## 0.6.0
 
 Cloud push notifications, shared SQLite state, download metadata, and reliability

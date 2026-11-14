@@ -6,10 +6,10 @@ branch push or tag push alone does not publish to PyPI.
 1. Review the release changes and merge them into `main`. Keep camera configs,
    credentials, databases, captures, and `.tmp` artifacts out of the commit.
 2. Keep `pyproject.toml`, `pyneolink.__version__`, README, and the finalized
-   CHANGELOG heading on the same version. Version 0.6.0 uses `## 0.6.0`.
+   CHANGELOG heading on the same version. Version 0.6.1 uses `## 0.6.1`.
 3. Run the local checks below, then push `main` and wait for the Tests workflow.
-4. Create tag `v0.6.0` at the validated main commit and push that tag. Publish a
-   GitHub Release for that exact tag, using the 0.6.0 changelog section as notes.
+4. Create tag `v0.6.1` at the validated main commit and push that tag. Publish a
+   GitHub Release for that exact tag, using the 0.6.1 changelog section as notes.
 5. Confirm the Publish workflow completes: version validation, the full test
    matrix, both CLI assets, and finally PyPI publication.
 

@@ -124,7 +124,7 @@ No physical camera or cloud registration was exercised.
 
 Approved physical target: **Home-Back**, using its exact config alias.
 The owner reports mains power and can trigger motion manually. Do not use
-Front, Remote or Friend for these tests. Stop on rejection or timeout; no
+Home-Front or any other camera for these tests. Stop on rejection or timeout; no
 automatic registration loop, subscription deletion or changes to camera settings.
 
 ## Offline checks (ready now)

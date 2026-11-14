@@ -7,7 +7,10 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.6.0` alpha.
+Version: `0.6.1` alpha.
+
+Version 0.6.1 replaces private camera aliases in documentation and retained
+research examples with generic names. Public SDK behavior is unchanged.
 
 Version 0.6.0 adds cloud push, SQLite state storage, download filename/timestamp
 options, and connection, download, and HLS reliability fixes. Existing camera
