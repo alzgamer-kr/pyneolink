@@ -64,7 +64,6 @@ class CLI:
 
         :param argv: Optional argument list. Defaults to ``sys.argv[1:]`` when parsed by argparse.
         """
-
         self.argv = argv
         self.parser = self.build_parser()
         self.handlers: dict[str, CommandHandler] = {
@@ -106,7 +105,6 @@ class CLI:
 
     def run(self) -> int:
         """Parse arguments and run the selected command."""
-
         args = self.parse_args(self.argv)
         if not args.command:
             self.parser.print_help()
@@ -133,7 +131,6 @@ class CLI:
 
         :param argv: Optional argument list to parse.
         """
-
         args = self.parser.parse_args(argv)
         if args.info:
             if args.command:
@@ -144,7 +141,6 @@ class CLI:
 
     def build_parser(self) -> argparse.ArgumentParser:
         """Build and return the argparse command tree."""
-
         parser = argparse.ArgumentParser(prog="pyneolink")
         parser.add_argument("--config", default="config.json")
         parser.add_argument("--state", default=str(Path.home() / "pyneolink"))
@@ -301,7 +297,6 @@ class CLI:
 
         :param parser: Subcommand parser to update.
         """
-
         parser.add_argument("--config", default=argparse.SUPPRESS)
         parser.add_argument("--state", default=argparse.SUPPRESS)
         CLI.add_storage_option(parser)
@@ -325,7 +320,6 @@ class CLI:
 
         :param parser: Subcommand parser to update.
         """
-
         parser.add_argument("--camera", default=argparse.SUPPRESS)
 
     def run_convert_config(self, args: argparse.Namespace) -> int:
@@ -334,7 +328,6 @@ class CLI:
 
         :param args: Parsed CLI arguments.
         """
-
         cfg = load_config(args.source)
         write_json_config(cfg, args.target)
         print(msg.Log.ConfigWritten.format(path=args.target))
@@ -346,7 +339,6 @@ class CLI:
 
         :param args: Parsed CLI arguments.
         """
-
         serve_streams(
             args.config,
             host=args.host,
@@ -366,7 +358,6 @@ class CLI:
 
         :param args: Parsed CLI arguments.
         """
-
         hits = local_discover(args.uid, timeout=args.timeout)
         if args.uid is not None and (args.remote or not hits):
             hits.extend(remote_uid_lookup(args.uid, timeout=args.timeout))
@@ -462,7 +453,6 @@ class CLI:
 
         :param args: Parsed CLI arguments.
         """
-
         cfg = load_config(args.config)
         cam_cfg = cfg.camera(getattr(args, "camera", None))
         handler = self.camera_handlers[args.command]
@@ -480,7 +470,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         print(msg.Log.CameraConnected.format(name=cam_cfg.name))
         return 0
 
@@ -492,7 +481,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         print(json.dumps(cam.info(include_sensitive=getattr(args, "debug", False)), indent=2, ensure_ascii=False))
         return 0
 
@@ -504,7 +492,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         print(cam.get_uid() or "")
         return 0
 
@@ -516,7 +503,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         battery_handlers: list[tuple[bool, Callable[[], int]]] = [
             (args.raw, lambda: self.camera_battery_raw(args, cam)),
             (args.watch, lambda: self.camera_battery_watch(args, cam)),
@@ -533,7 +519,6 @@ class CLI:
         :param args: Parsed CLI arguments.
         :param cam: Connected camera instance.
         """
-
         print(cam.battery().raw(mode=args.mode) or "")
         return 0
 
@@ -544,7 +529,6 @@ class CLI:
         :param args: Parsed CLI arguments.
         :param cam: Connected camera instance.
         """
-
         print(json.dumps(cam.battery().info(mode=args.mode), indent=2, ensure_ascii=False))
         return 0
 
@@ -555,7 +539,6 @@ class CLI:
         :param args: Parsed CLI arguments.
         :param cam: Connected camera instance.
         """
-
         with cam.battery().info(interval=args.interval, count=args.count, mode=args.mode) as updates:
             for item in updates:
                 print(json.dumps(item, indent=2, ensure_ascii=False), flush=True)
@@ -569,7 +552,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         cam.reboot()
         print(msg.Log.RebootSent.format(name=cam_cfg.name))
         return 0
@@ -582,7 +564,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         print(json.dumps(cam.led(args.value), indent=2, ensure_ascii=False))
         return 0
 
@@ -594,7 +575,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         path = cam.snapshot(out=args.out)
         print(msg.Log.SnapshotSaved.format(output=path))
         return 0
@@ -607,7 +587,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         stream = "mainStream" if args.quality == "high" else "subStream"
         if args.duration is not None:
             path = cam.record(out=args.out, duration=args.duration, stream=stream)
@@ -632,7 +611,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         return self.camera_motion_watch(args, cam)
 
     def camera_motion(self, args: argparse.Namespace, cam: Camera, cam_cfg: CameraConfig) -> int:
@@ -643,7 +621,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         if args.watch:
             return self.camera_motion_watch(args, cam)
         print(json.dumps(cam.motion().status(timeout=args.timeout), indent=2, ensure_ascii=False))
@@ -656,7 +633,6 @@ class CLI:
         :param args: Parsed CLI arguments.
         :param cam: Connected camera instance.
         """
-
         printed = 0
         with cam.motion().watch(duration=getattr(args, "duration", None)) as events:
             for event in events:
@@ -680,7 +656,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         enabled_sources = sum(
             1 for enabled in (args.file, args.microphone, args.tone is not None, args.siren) if enabled
         )
@@ -730,7 +705,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         pir = cam.settings().pir
         actions: dict[str, Callable[[], dict]] = {
             "status": pir.status,
@@ -748,7 +722,6 @@ class CLI:
         :param cam: Connected camera instance.
         :param cam_cfg: Selected camera configuration.
         """
-
         ir = cam.settings().ir
         actions: dict[str, Callable[[], dict]] = {
             "status": ir.status,
@@ -782,6 +755,7 @@ class CLI:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the CLI with explicit arguments or the process command line."""
     return CLI(argv).run()
 
 

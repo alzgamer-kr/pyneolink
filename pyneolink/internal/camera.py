@@ -4,6 +4,7 @@ from pyneolink.core.const import msg
 
 
 def split_address(address: str) -> tuple[str, int]:
+    """Split a host and optional port, defaulting to Baichuan TCP port 9000."""
     if ":" in address:
         host, port = address.rsplit(":", 1)
         return host, int(port)
@@ -34,6 +35,7 @@ class CameraOnlineLease:
 
 
 def stream_params(stream: str) -> tuple[str, int, int]:
+    """Resolve a stream alias to its protocol name, stream ID, and handle."""
     normalized = stream.strip()
     aliases = {
         "high": "mainStream",
@@ -58,6 +60,7 @@ def stream_params(stream: str) -> tuple[str, int, int]:
 
 
 def redact_sensitive(value: object) -> None:
+    """Mask known camera secrets in nested dictionaries and lists in place."""
     if isinstance(value, dict):
         for key in list(value.keys()):
             if key.lower() in {"secretcode", "bootsecret", "password"}:

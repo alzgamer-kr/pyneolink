@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+Cloud push notifications, shared SQLite state, download metadata, and reliability
+improvements. Release notes prepared on 2026-11-14.
 
 ### Added
 
@@ -73,9 +76,15 @@
 - One-time initialization persists application configuration so deployed
   receivers need no JADX export. SQLAlchemy is now a core dependency; the FCM
   dependency remains optional.
+- Standalone release CLI assets include both voice and push dependencies.
+  Publication now validates the release tag and waits for the Windows/Linux
+  Python 3.11-3.14 regression matrix and both CLI asset builds before PyPI upload.
 
 ### Fixed
 
+- Apply the camera timeout to dispatcher-backed reads when no explicit timeout
+  is given, matching direct reads. Login during reconnect can no longer wait
+  indefinitely for a missing nonce or authentication reply.
 - Preserve the single-session dispatcher architecture while preventing stopped
   readers from affecting new subscriptions after reconnect. Close transports
   on failed context entry and wake blocked subscribers when they are closed.
@@ -113,13 +122,26 @@
 - User-run physical tests confirmed subscription lifecycle, independent receivers
   on multiple cameras, unread-only read, prolonged watch, and reconnect after
   network loss. Full queued LPC payload confirmed the low-battery meaning.
-  The final typed helpers and unified CLI formatting have offline regression
-  coverage; a final manual smoke check is still recommended before release.
-- Version remains `0.5.0`; these changes are not yet released.
+  Typed helpers and unified CLI formatting have offline regression coverage.
+- User-run Linux downloader checks confirmed that a stalled recording completed
+  after installing the bounded login-wait fix, and subsequent files continued.
+  After a network-related battery-query failure, a remote camera reopened its
+  session and resumed scanning after the downloader's configured 30-minute
+  pause; subsequent logs also confirmed successful remote downloads.
+- User-run Linux testing on November 12-14 confirmed more than two days of
+  unattended multi-camera operation. A failed third SD-list page recovered to
+  a complete 380-recording scan in about 83 seconds without a service restart;
+  other cameras continued working.
+- After more than 53 hours, the downloader process used about 104 MiB RSS.
+  The service's multi-gigabyte memory reading was predominantly reclaimable
+  filesystem cache, not Python heap. This observation is not proof that every
+  workload is free of leaks; an earlier isolated high-RSS run remains unexplained.
+- The downloader's scheduling and battery pauses belong to the separate
+  ReolinkDownloader application, not to the SDK's reconnect timeout.
 
 Existing public camera/helper calls remain compatible; default download names
-are unchanged. The new download `mtime` behavior is described above. No new
-physical-camera validation is claimed for these changes.
+are unchanged. The new download `mtime` behavior is described above. Physical
+validation is limited to the scenarios listed here, not every camera model.
 
 ## 0.5.0
 

@@ -114,7 +114,6 @@ class UdpBcConnection:
 
         :param timeout: Timeout in seconds, or ``None`` to keep the current value.
         """
-
         if timeout is not None:
             self.timeout = timeout
 
@@ -124,7 +123,6 @@ class UdpBcConnection:
 
         :param data: Bytes to send.
         """
-
         packets = []
         with self._state_lock:
             for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
@@ -142,7 +140,6 @@ class UdpBcConnection:
 
         :param data: Bytes to send.
         """
-
         packets = []
         with self._state_lock:
             for chunk in _chunks(data, MTU - UDP_DATA_HEADER_SIZE):
@@ -162,7 +159,6 @@ class UdpBcConnection:
 
         :param size: Number of bytes to return.
         """
-
         if size <= 0:
             return b""
         return self._recv_buffered(size)
@@ -173,7 +169,6 @@ class UdpBcConnection:
 
         :param size: Maximum number of bytes to return.
         """
-
         return self._recv_buffered(size)
 
     def _recv_buffered(self, size: int) -> bytes:
@@ -196,6 +191,7 @@ class UdpBcConnection:
             self._recv_one()
 
     def close(self) -> None:
+        """Stop transport workers and close the UDP socket; safe to repeat."""
         if self.closed:
             return
         with self._data_ready:
@@ -207,11 +203,11 @@ class UdpBcConnection:
             self.sock.close()
 
     def maintain(self) -> None:
+        """Run one maintenance pass for retransmissions and heartbeat traffic."""
         self._maintenance()
 
     def start_receiver(self) -> None:
         """Start the worker that drains and reorders incoming UDP packets."""
-
         if self.closed:
             return
         thread = self._receive_thread
@@ -229,7 +225,6 @@ class UdpBcConnection:
 
     def stop_receiver(self) -> None:
         """Stop the background UDP receive worker."""
-
         self._receive_stop.set()
         with self._data_ready:
             self._data_ready.notify_all()
@@ -240,7 +235,6 @@ class UdpBcConnection:
 
     def start_maintenance(self) -> None:
         """Start independent UDP ACK/heartbeat maintenance."""
-
         if self.closed:
             return
         thread = self._maintenance_thread
@@ -256,7 +250,6 @@ class UdpBcConnection:
 
     def stop_maintenance(self) -> None:
         """Stop independent UDP ACK/heartbeat maintenance."""
-
         self._maintenance_stop.set()
         thread = self._maintenance_thread
         if thread is not None and thread is not threading.current_thread():
@@ -264,6 +257,7 @@ class UdpBcConnection:
         self._maintenance_thread = None
 
     def discard_sent(self) -> None:
+        """Clear queued outgoing chunks so obsolete data is not retransmitted."""
         with self._state_lock:
             self.sent_chunks.clear()
 
@@ -273,7 +267,6 @@ class UdpBcConnection:
 
         :param limit: Maximum pending chunk count, or ``None`` for no limit.
         """
-
         with self._state_lock:
             self.max_pending_chunks = limit
 
@@ -385,7 +378,6 @@ class UdpBcConnection:
 
     def _refresh_ack_receive_rate(self, now: float | None = None) -> None:
         """Update the receive-rate value carried in outgoing UDP ACK packets."""
-
         current = time.monotonic() if now is None else now
         elapsed = current - self._ack_receive_window_started_at
         if elapsed < 1.0:
@@ -446,6 +438,7 @@ class UdpBcConnection:
                 self.sock.sendto(packet, self.addr)
 
     def debug_snapshot(self) -> dict:
+        """Return transport counters and buffer sizes without copying payloads."""
         now = time.monotonic()
         with self._state_lock:
             max_id = self.max_data_packet_id
@@ -487,6 +480,11 @@ class UdpBcConnection:
 def connect_local_direct(
     uid: str, *, timeout: float = 8.0, listen_port: int = 0, debug: bool = False
 ) -> UdpBcConnection:
+    """Discover a local UID by broadcast and return an open UDP transport.
+
+    This does not perform Baichuan login. Raise TimeoutError when no accepted
+    local reply arrives within the discovery window.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     try:
@@ -557,6 +555,12 @@ def connect_local_direct(
 
 
 def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, debug: bool = False) -> UdpBcConnection:
+    """Look up a UID and open a registered local, mapped, or relay transport.
+
+    The timeout applies to individual discovery stages, not the complete call.
+    Baichuan login remains the caller's responsibility. Registration-stage
+    failures raise RegistrationUnavailableError for caller-controlled backoff.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.bind(("", listen_port))
@@ -635,12 +639,14 @@ def connect_relay(uid: str, *, timeout: float = 20.0, listen_port: int = 16577, 
 
 
 def encode_udp_data(connection_id: int, packet_id: int, payload: bytes) -> bytes:
+    """Encode a reliable UDP data datagram with its sequence and body length."""
     return struct.pack("<IiII", MAGIC.UDP_DATA, connection_id, 0, packet_id) + struct.pack("<I", len(payload)) + payload
 
 
 def encode_udp_ack(
     connection_id: int, packet_id: int, payload: bytes = b"", group_id: int = 0, maybe_latency: int = 0
 ) -> bytes:
+    """Encode an ACK datagram with the supplied bitmap and metadata fields."""
     return (
         struct.pack("<IiIIII", MAGIC.UDP_ACK, connection_id, 0, group_id, packet_id, maybe_latency)
         + struct.pack("<I", len(payload))
@@ -649,6 +655,7 @@ def encode_udp_ack(
 
 
 def decode_udp_packet(data: bytes):
+    """Return a tagged data/ACK/discovery tuple, or None for invalid packets."""
     if len(data) < 4:
         return None
     magic = struct.unpack("<I", data[:4])[0]

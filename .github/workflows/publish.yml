@@ -5,8 +5,43 @@ on:
     types: [published]
 
 jobs:
+  validate-release:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Match tag and changelog to package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path.cwd()
+          version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+          if os.environ["RELEASE_TAG"] != f"v{version}":
+              raise SystemExit(f"Release tag must be v{version}")
+          if f"## {version}" not in (root / "CHANGELOG.md").read_text().splitlines():
+              raise SystemExit(f"Missing finalized changelog section for {version}")
+          PY
+
+  tests:
+    name: Release regression matrix
+    needs: validate-release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+
   build-cli-assets:
     name: Build CLI assets (${{ matrix.name }})
+    needs: tests
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -41,7 +76,7 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller ".[voice]"
+          python -m pip install pyinstaller ".[voice,push]"
 
       - name: Resolve asset name
         shell: bash
@@ -55,13 +90,19 @@ jobs:
 
       - name: Build CLI asset
         run: |
-          python -m PyInstaller --clean --onefile --name "${{ env.ASSET_STEM }}" --distpath dist-cli --workpath build-cli --specpath build-cli-spec pyneolink/cli.py
+          python -m PyInstaller --clean --onefile --collect-all firebase_messaging --hidden-import sqlalchemy.dialects.sqlite.pysqlite --name "${{ env.ASSET_STEM }}" --distpath dist-cli --workpath build-cli --specpath build-cli-spec pyneolink/cli.py
 
       - name: Verify CLI asset on Windows
         if: runner.os == 'Windows'
         run: |
           & "${env:ASSET_PATH}" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "${env:ASSET_PATH}" voice --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "${env:ASSET_PATH}" push watch --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "${env:ASSET_PATH}" --config config.example.json --camera Home-Front --storage-dir .tmp/cli-smoke push read --no-sync --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify CLI asset on Linux
         if: runner.os == 'Linux'
@@ -69,6 +110,8 @@ jobs:
           chmod +x "${ASSET_PATH}"
           "${ASSET_PATH}" --help
           "${ASSET_PATH}" voice --help
+          "${ASSET_PATH}" push watch --help
+          "${ASSET_PATH}" --config config.example.json --camera Home-Front --storage-dir .tmp/cli-smoke push read --no-sync --json
 
       - name: Upload CLI asset to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -78,6 +121,7 @@ jobs:
 
   publish:
     name: Build and publish to PyPI
+    needs: build-cli-assets
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

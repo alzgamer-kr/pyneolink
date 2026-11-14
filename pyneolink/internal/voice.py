@@ -54,10 +54,12 @@ class TalkConfig:
 
     @property
     def block_align(self) -> int:
+        """Return the encoded ADPCM block size in bytes, including its header."""
         return self.length_per_encoder // 2 + 4
 
     @property
     def samples_per_block(self) -> int:
+        """Return the number of mono PCM samples represented by one block."""
         return (self.block_align - 4) * 2 + 1
 
 
@@ -96,6 +98,7 @@ class _PcmStats:
 
 
 def parse_talk_config(root, *, channel_id: int) -> TalkConfig:  # noqa: ANN001
+    """Read talk capabilities from XML and reject missing or invalid audio settings."""
     if root is None:
         raise ProtocolError(msg.Error.VoiceNotSupported)
     audio_config = root.find(".//audioConfigList/audioConfig")
@@ -126,6 +129,7 @@ def parse_talk_config(root, *, channel_id: int) -> TalkConfig:  # noqa: ANN001
 
 
 def serialize_bcmedia_adpcm(block: bytes) -> bytes:
+    """Wrap an ADPCM block in a BC media header with eight-byte payload alignment."""
     block_payload_size = len(block) + 4
     header = struct.pack(
         "<IHHHH",
@@ -140,6 +144,7 @@ def serialize_bcmedia_adpcm(block: bytes) -> bytes:
 
 
 def talk_config_payload(config: TalkConfig) -> bytes:
+    """Serialize negotiated talk parameters as an escaped XML request."""
     return payloads.talk_config.format(
         channel_id=config.channel_id,
         duplex=config.duplex,
@@ -160,6 +165,7 @@ def adpcm_blocks_from_file(
     codec: str = "python",
     on_debug: Callable[[str], None] | None = None,
 ) -> Iterator[bytes]:
+    """Convert a validated audio file to mono ADPCM using FFmpeg and the chosen encoder."""
     source = validate_audio_file(file, on_debug=on_debug)
     if on_debug is not None:
         on_debug(
@@ -222,6 +228,7 @@ def adpcm_blocks_from_file_ffmpeg(
     volume: float = 1.0,
     on_debug: Callable[[str], None] | None = None,
 ) -> Iterator[bytes]:
+    """Yield camera-sized ADPCM blocks from FFmpeg's streamed WAV output."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError(msg.Error.VoiceFfmpegRequired)
@@ -258,6 +265,7 @@ def adpcm_blocks_from_file_ffmpeg(
 
 
 def validate_audio_file(file: str | Path, *, on_debug: Callable[[str], None] | None = None) -> AudioFileInfo:
+    """Check file existence and inspect audio metadata when FFprobe is available."""
     path = Path(file)
     if not path.is_file():
         raise FileNotFoundError(msg.Error.VoiceFileNotFound.format(path=path))
@@ -295,6 +303,7 @@ def validate_audio_file(file: str | Path, *, on_debug: Callable[[str], None] | N
 
 
 def audio_info_from_ffprobe(path: Path, data: dict) -> AudioFileInfo:
+    """Extract the first audio stream's metadata or raise if none is present."""
     audio_stream = next((stream for stream in data.get("streams", []) if stream.get("codec_type") == "audio"), None)
     if audio_stream is None:
         raise ValueError(msg.Error.VoiceNoAudioStream.format(path=path))
@@ -315,6 +324,7 @@ def audio_info_from_ffprobe(path: Path, data: dict) -> AudioFileInfo:
 def adpcm_blocks_from_microphone(
     config: TalkConfig, *, volume: float = 1.0, seconds: float | None = None
 ) -> Iterator[bytes]:
+    """Capture mono microphone samples with a bounded queue and yield ADPCM blocks."""
     try:
         import sounddevice as sd
     except ImportError as exc:
@@ -353,6 +363,7 @@ def adpcm_blocks_from_tone(
     seconds: float,
     volume: float,
 ) -> Iterator[bytes]:
+    """Generate a finite sine tone and encode it as camera talk blocks."""
     encoder = ImaAdpcmEncoder()
     total_samples = max(0, int(config.sample_rate * seconds))
     amplitude = int(32767 * max(0.0, min(1.0, volume)))
@@ -369,12 +380,14 @@ def adpcm_blocks_from_tone(
 
 
 def observe_pcm_blocks(blocks: Iterable[bytes], stats: _PcmStats) -> Iterator[bytes]:
+    """Pass through PCM blocks while updating aggregate diagnostic counters."""
     for block in blocks:
         stats.observe(block)
         yield block
 
 
 def iter_pcm_blocks(stream, samples_per_block: int) -> Iterator[bytes]:  # noqa: ANN001
+    """Read signed 16-bit PCM blocks, yielding any final partial block at EOF."""
     block_bytes = samples_per_block * 2
     pending = bytearray()
     while True:
@@ -390,6 +403,7 @@ def iter_pcm_blocks(stream, samples_per_block: int) -> Iterator[bytes]:  # noqa:
 
 
 def iter_wav_data_blocks(stream, block_align: int) -> Iterator[bytes]:  # noqa: ANN001
+    """Locate streamed WAV data and yield only complete codec-aligned blocks."""
     header = read_exact(stream, 12)
     if header[:4] not in (b"RIFF", b"RF64") or header[8:12] != b"WAVE":
         raise RuntimeError(msg.Error.VoiceFfmpegFailed.format(detail="ffmpeg did not produce a WAV stream"))
@@ -422,6 +436,7 @@ def iter_wav_data_blocks(stream, block_align: int) -> Iterator[bytes]:  # noqa: 
 
 
 def read_exact(stream, size: int) -> bytes:  # noqa: ANN001
+    """Read a fixed-size FFmpeg field or raise on a short read."""
     data = stream.read(size)
     if len(data) != size:
         raise RuntimeError(msg.Error.VoiceFfmpegFailed.format(detail="unexpected end of ffmpeg output"))
@@ -429,6 +444,7 @@ def read_exact(stream, size: int) -> bytes:  # noqa: ANN001
 
 
 def adpcm_blocks_from_pcm_bytes(chunks: Iterable[bytes], encoder: "ImaAdpcmEncoder") -> Iterator[bytes]:
+    """Encode each PCM chunk, ignoring an unmatched trailing byte."""
     for chunk in chunks:
         samples = list(struct.unpack("<" + "h" * (len(chunk) // 2), chunk[: len(chunk) - len(chunk) % 2]))
         if samples:
@@ -436,27 +452,32 @@ def adpcm_blocks_from_pcm_bytes(chunks: Iterable[bytes], encoder: "ImaAdpcmEncod
 
 
 def adpcm_block_duration(block: bytes, sample_rate: int) -> float:
+    """Return an ADPCM block's playback duration in seconds."""
     samples = max(1, (len(block) - 4) * 2 + 1)
     return samples / sample_rate
 
 
 def adpcm_level_hint(block: bytes) -> int:
+    """Return a rough diagnostic magnitude from the leading ADPCM codes."""
     return sum(((byte >> 4) & 0x07) + (byte & 0x07) for byte in block[4 : min(len(block), 68)])
 
 
 def optional_int(value: object) -> int | None:
+    """Convert a present metadata value to int; return None for empty values."""
     if value in (None, ""):
         return None
     return int(value)
 
 
 def optional_float(value: object) -> float | None:
+    """Convert a present metadata value to float; return None for empty values."""
     if value in (None, ""):
         return None
     return float(value)
 
 
 def scale_pcm16(data: bytes, volume: float) -> bytes:
+    """Scale signed little-endian PCM samples with saturation to 16-bit range."""
     samples = struct.unpack("<" + "h" * (len(data) // 2), data[: len(data) - len(data) % 2])
     scaled = [max(-32768, min(32767, int(sample * volume))) for sample in samples]
     return struct.pack("<" + "h" * len(scaled), *scaled)
@@ -484,7 +505,6 @@ class ImaAdpcmEncoder:
 
         :param samples: Signed 16-bit mono PCM samples.
         """
-
         if not samples:
             return b""
         if not self.initialized:

@@ -115,6 +115,64 @@ def test_camera_context_failure_closes_transport(monkeypatch):
     assert camera.sock is None
 
 
+@pytest.fixture
+def receive_clock(monkeypatch):
+    """Advance receive deadlines without sleeping or hanging on regressions."""
+    elapsed = [0.0]
+
+    def sleep(seconds):
+        elapsed[0] += seconds
+        assert elapsed[0] <= 1, "Receive exceeded its timeout budget"
+
+    monkeypatch.setattr("pyneolink.camera.time.monotonic", lambda: elapsed[0])
+    monkeypatch.setattr("pyneolink.camera.time.sleep", sleep)
+    return elapsed
+
+
+@pytest.mark.parametrize("timeout, expected", [(None, 0.05), (0.02, 0.02), (0, 0)])
+def test_dispatched_receive_has_bounded_default_timeout(receive_clock, timeout, expected):
+    camera = Camera(uid="test", state_path=None, timeout=0.05)
+    with pytest.raises(TimeoutError):
+        camera._recv_dispatched(timeout=timeout)
+    assert receive_clock[0] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("nonce_received", [False, True])
+def test_reconnect_login_timeout_closes_transport(monkeypatch, receive_clock, nonce_received):
+    camera = Camera(uid="test", state_path=None, timeout=0.05)
+    camera._dispatcher_requested = True
+    transport = SimpleNamespace(sendall=Mock(), close=Mock())
+
+    def connect():
+        camera.sock = transport
+        if nonce_received:
+            camera._dispatch_unmatched.append(
+                Message(
+                    Header(MSG.LOGIN, 0, 0, 0, 1, 0xDC00, MSG_CLASS.MODERN),
+                    payload=b"<body><nonce>test-nonce</nonce></body>",
+                )
+            )
+
+    monkeypatch.setattr(camera, "connect", connect)
+    # Keep the real login and dispatcher wait; simulate a reader with no replies.
+    monkeypatch.setattr(camera, "_ensure_dispatcher_active", lambda: None)
+    with pytest.raises(TimeoutError):
+        camera.reconnect()
+    assert receive_clock[0] == pytest.approx(0.05)
+    assert transport.sendall.call_count == (2 if nonce_received else 1)
+    transport.close.assert_called_once()
+    assert camera.sock is None
+    assert camera.login_xml == ""
+    assert camera._dispatcher_requested
+
+
+def test_dispatched_receive_returns_queued_reply_before_zero_timeout():
+    camera = Camera(uid="test", state_path=None)
+    reply = Message(Header(MSG.BATTERY, 0, 0, 0, 1, 200, MSG_CLASS.MODERN))
+    camera._dispatch_unmatched.append(reply)
+    assert camera._recv_dispatched(timeout=0) is reply
+
+
 @pytest.mark.parametrize("error", [EOFError("closed"), ConnectionResetError("reset")])
 def test_download_retries_disconnection(tmp_path, monkeypatch, error):
     camera = SimpleNamespace(config=SimpleNamespace(channel_id=0), reconnect=Mock(), sock=None)

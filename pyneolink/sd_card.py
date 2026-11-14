@@ -67,6 +67,7 @@ class SdCardFile:
     raw: dict | None = None
 
     def to_dict(self) -> dict:
+        """Return recording metadata with ISO-formatted start/end timestamps."""
         data = asdict(self)
         if self.start_time:
             data["start_time"] = self.start_time.isoformat()
@@ -83,6 +84,7 @@ class SDFile:
     """
 
     def __init__(self, sd_card: SdCard, file: dict | SdCardFile | str) -> None:
+        """Bind recording metadata or a filename to its owning SD-card helper."""
         self.sd_card = sd_card
         self._file = file
 
@@ -142,7 +144,6 @@ class SDFile:
             after playback response `300` until interrupted or another
             protocol/transport failure occurs.
         """
-
         lease = (
             self.sd_card.camera.require_online() if hasattr(self.sd_card.camera, "require_online") else nullcontext()
         )
@@ -201,7 +202,6 @@ class SDFile:
         :param idle_timeouts: Number of idle read timeouts before stopping.
         :param cleanup: Remove temporary cache file when the context exits.
         """
-
         return SDFilePreview(
             self.sd_card,
             self._file,
@@ -269,6 +269,7 @@ class DownloadBatchError(RuntimeError):
     """Raised by `DownloadBatchResult.raise_for_failures()`."""
 
     def __init__(self, result: DownloadBatchResult) -> None:
+        """Keep the batch result available for inspecting or retrying failures."""
         self.result = result
         super().__init__(f"{result.failed} of {result.total} download(s) failed")
 
@@ -290,18 +291,22 @@ class DownloadBatchResult:
 
     @property
     def total(self) -> int:
+        """Number of item results, including completed, skipped, and failed."""
         return len(self.items)
 
     @property
     def completed(self) -> int:
+        """Number of files successfully downloaded in this batch."""
         return sum(item.status == "completed" for item in self.items)
 
     @property
     def skipped(self) -> int:
+        """Number of existing files reused without downloading again."""
         return sum(item.status == "skipped" for item in self.items)
 
     @property
     def failed(self) -> int:
+        """Number of files whose download attempts did not complete."""
         return sum(item.status == "failed" for item in self.items)
 
     @property
@@ -316,6 +321,7 @@ class DownloadBatchResult:
 
     @property
     def elapsed(self) -> timedelta:
+        """Wall-clock duration from batch start to completion, including retries."""
         return self.finished_at - self.started_at
 
     def total_time(self) -> timedelta:
@@ -323,9 +329,11 @@ class DownloadBatchResult:
         return self.elapsed
 
     def completed_list(self) -> SDFileCollection:
+        """Return successfully downloaded recordings as a reusable collection."""
         return self._collection_for_status("completed")
 
     def skipped_list(self) -> SDFileCollection:
+        """Return reused recordings as a collection bound to the same camera."""
         return self._collection_for_status("skipped")
 
     def failed_list(self) -> SDFileCollection:
@@ -367,6 +375,7 @@ class SDFileCollection(list[SDFile]):
     """List-compatible SD-file collection with batch actions."""
 
     def __init__(self, sd_card: SdCard, files: Iterable[SDFile] = ()) -> None:
+        """Collect recording handles without making additional camera requests."""
         super().__init__(files)
         self.sd_card = sd_card
 
@@ -581,6 +590,12 @@ class SDFilePreview:
         idle_timeouts: int,
         cleanup: bool,
     ) -> None:
+        """Configure a disk-backed preview; caching starts on context entry.
+
+        ``max_bytes`` optionally limits the cache, ``recv_timeout`` controls
+        each receive wait, and ``idle_timeouts`` bounds consecutive idle waits.
+        ``cleanup`` removes the cache when closed; no media is fetched here.
+        """
         self.sd_card = sd_card
         self.file = file
         self.stream_type = stream_type
@@ -636,7 +651,6 @@ class SDFilePreview:
         :param cleanup_on_disconnect: Stop caching and remove the cache file
             after the last connected player disconnects.
         """
-
         return SDFilePreviewServer(
             self,
             host=host,
@@ -686,6 +700,11 @@ class SDFilePreviewServer:
         path: str,
         cleanup_on_disconnect: bool,
     ) -> None:
+        """Configure the preview HTTP endpoint without binding a socket yet.
+
+        Context entry starts serving. ``cleanup_on_disconnect`` stops the
+        preview and removes its cache after the last player disconnects.
+        """
         self.preview = preview
         self.host = host
         self.port = port
@@ -874,7 +893,6 @@ class SdCard:
         :param channel_id: Optional channel override.
         :param sort: `asc`, `desc`, or `None`.
         """
-
         items = self.list(
             start=start,
             end=end,
@@ -1800,7 +1818,6 @@ class SdCard:
         :param binary_probe_idle: Idle timeout while collecting debug binary
             continuation payloads.
         """
-
         item = _file_to_dict(file)
         raw = _download_raw(item)
         raw.setdefault("streamType", stream_type)
@@ -1926,7 +1943,6 @@ class SdCard:
         :param idle_timeouts: Number of idle read timeouts before stopping.
         :param max_bytes: Optional maximum raw bytes to collect.
         """
-
         item = _file_to_dict(file)
         raw_item = _download_raw(item)
         raw_item.setdefault("streamType", stream_type)

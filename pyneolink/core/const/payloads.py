@@ -18,6 +18,7 @@ class XmlTemplate:
     binary: bool = True
 
     def format(self, *args, **kwargs):
+        """Escape substitutions and return the configured XML text or bytes."""
         text = self.template.format(
             *(_XmlValue(arg) for arg in args),
             **{key: _XmlValue(value) for key, value in kwargs.items()},

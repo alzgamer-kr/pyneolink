@@ -21,27 +21,32 @@ AES_IV = b"0123456789abcdef"
 
 
 def md5_hex(value: str, *, truncate: bool = True) -> str:
+    """Return the protocol's uppercase MD5 text, optionally limited to 31 characters."""
     text = hashlib.md5(value.encode("utf-8")).hexdigest().upper()
     return text[:31] if truncate else text
 
 
 def make_aes_key(nonce: str, password: str) -> bytes:
+    """Derive the camera's 16-byte AES key from its login nonce and password."""
     phrase = f"{nonce}-{password}"
     return (hashlib.md5(phrase.encode("utf-8")).hexdigest().upper() + "\0").encode("ascii")[:16]
 
 
 def bc_xor(offset: int, data: bytes) -> bytes:
+    """Apply the symmetric Baichuan XML XOR transform at the supplied offset."""
     skip = offset % len(BC_XML_KEY)
     key = BC_XML_KEY[skip:] + BC_XML_KEY[:skip]
     return bytes(byte ^ key[i % len(key)] ^ (offset & 0xFF) for i, byte in enumerate(data))
 
 
 def udp_xor(offset: int, data: bytes) -> bytes:
+    """Apply the symmetric discovery XML transform using the transaction offset."""
     stream = b"".join(((key + offset) & 0xFFFFFFFF).to_bytes(4, "little") for key in UDP_XML_KEY)
     return bytes(byte ^ stream[i % len(stream)] for i, byte in enumerate(data))
 
 
 def neolink_crc32(data: bytes) -> int:
+    """Return the CRC32 variant used by UDP discovery packets."""
     return binascii.crc32(data, 0xFFFFFFFF) ^ 0xFFFFFFFF
 
 
@@ -66,7 +71,6 @@ class Cipher:
         :param data: Plain payload bytes.
         :param media: Whether the payload contains media data.
         """
-
         if self.name == "none":
             return data
         if self.name == "bc" or (media and not self.full_media):
@@ -81,7 +85,6 @@ class Cipher:
         :param data: Encrypted payload bytes.
         :param media: Whether the payload contains media data.
         """
-
         if self.name == "none":
             return data
         if self.name == "bc" or (media and not self.full_media):

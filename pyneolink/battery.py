@@ -150,6 +150,7 @@ class BatteryInfoUpdates:
         return self.battery.refresh(mode=self.mode)
 
     def close(self) -> None:
+        """Stop polling and release this iterator's online session lease."""
         lease = getattr(self, "_online_lease", None)
         if lease is not None:
             lease.__exit__(None, None, None)

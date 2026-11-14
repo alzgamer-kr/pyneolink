@@ -104,6 +104,7 @@ class MediaParser:
 
 
 def looks_like_bcmedia(path: str | Path) -> bool:
+    """Check the first MiB for a BCMedia marker without validating the file."""
     with Path(path).open("rb") as fh:
         head = fh.read(1024 * 1024)
     return _find_media_magic(head) is not None
@@ -120,6 +121,11 @@ def _find_media_magic(data: bytes) -> int | None:
 
 
 def extract_video_stream(source: str | Path, destination: str | Path) -> tuple[str, int, int]:
+    """Extract video frames and return codec, FPS, and frame count.
+
+    Audio is ignored and destination is overwritten. FPS defaults to 15 when
+    absent from stream info. Raise ValueError if no readable video is found.
+    """
     parser = MediaParser()
     codec: str | None = None
     fps = 15
@@ -142,6 +148,12 @@ def extract_video_stream(source: str | Path, destination: str | Path) -> tuple[s
 
 
 def bcmedia_to_mp4(source: str | Path, destination: str | Path) -> None:
+    """Remux BCMedia video and available AAC audio to MP4 using FFmpeg.
+
+    Overwrite destination and remove temporary elementary streams on exit.
+    Missing FFmpeg raises FileNotFoundError; conversion failures raise
+    RuntimeError, and unreadable media raises ValueError.
+    """
     source_path = Path(source)
     destination_path = Path(destination)
     raw_path = destination_path.with_suffix(destination_path.suffix + ".video")
@@ -185,6 +197,11 @@ def bcmedia_to_mp4(source: str | Path, destination: str | Path) -> None:
 
 
 def extract_embedded_mp4(source: str | Path, destination: str | Path) -> bool:
+    """Copy an embedded MP4 starting at an ftyp box found in the first 4096 bytes.
+
+    Return False if no plausible header exists, leaving destination untouched.
+    A True result confirms a nonempty copy, not complete media validation.
+    """
     source_path = Path(source)
     destination_path = Path(destination)
     with source_path.open("rb") as fh:

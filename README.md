@@ -7,10 +7,11 @@
 
 PyNeolink is a Python client for Reolink/Neolink-style Baichuan cameras. It focuses on UID/P2P access, camera information, SD-card recordings, live viewing, snapshots, local recording, motion events, battery status, voice/talk, and siren control.
 
-Version: `0.5.0` alpha.
+Version: `0.6.0` alpha.
 
-Cloud push support described below is **Unreleased**, available from this checkout,
-not the published `0.5.0` package.
+Version 0.6.0 adds cloud push, SQLite state storage, download filename/timestamp
+options, and connection, download, and HLS reliability fixes. Existing camera
+calls and the single-session dispatcher architecture are preserved.
 
 This project was developed with OpenAI Codex as an AI-assisted implementation effort. It is a Python port inspired by and based on protocol knowledge from the Rust `neolink` project, especially `QuantumEntangledAndy/neolink` and `surfzoid/neolink`. The reverse-engineering foundation belongs to the Neolink contributors. The goal is not to replace Neolink, but to make a working Python implementation available for people who want to study, adapt, or extend this protocol without working in Rust.
 
@@ -20,7 +21,14 @@ Neolink and Reolink protocol support are reverse engineered. This project is not
 
 PyNeolink is experimental alpha software. It works against a limited set of real cameras, but Reolink firmware and model behavior can differ. APIs may change before `1.0.0`.
 
-The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.13.15, and 3.14.7.
+The CI matrix covers CPython 3.11 through 3.14 on Windows and Linux. Local
+pre-release regression checks cover Python 3.11 and 3.14. User-run Linux testing
+confirmed more than two days of unattended multi-camera downloader operation,
+including successful downloads and recovery from an incomplete SD listing.
+This does not establish support for every camera model or failure scenario.
+
+Maintainer release steps and workflow prerequisites are documented in
+[the release checklist](docs/releasing.md).
 
 ## What Works
 
@@ -49,6 +57,8 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 - PIR status and PIR on/off settings
 - IR light status and IR on/off/auto settings
 - Stored PTZ preset listing and recall by ID or exact preset name
+- Optional cloud push subscriptions and typed events without a persistent camera
+  connection, with unread-event storage and automatic receiver reconnection
 
 ## Current Limits
 
@@ -65,16 +75,16 @@ The test suite is currently verified with Conda on CPython 3.11.15, 3.12.13, 3.1
 
 ## Install
 
-From PyPI:
+Latest published version from PyPI:
 
 ```powershell
-python -m pip install pyneolink==0.5.0
+python -m pip install --upgrade pyneolink
 ```
 
 With microphone voice input support:
 
 ```powershell
-python -m pip install "pyneolink[voice]==0.5.0"
+python -m pip install --upgrade "pyneolink[voice]"
 ```
 
 For local development from a checkout:
@@ -98,20 +108,20 @@ python -m pytest
 
 The `cryptography` package is required for AES-encrypted cameras. It is installed automatically when installing the package.
 
-## Cloud Push (Unreleased)
+## Cloud Push
 
 Cloud push is separate from `Camera.motion()`: the receiver listens to FCM, not
 the camera stream. Subscribe/status use brief camera sessions; unsubscribe uses
 the cloud and, by default, a brief verification session. Watch/read never opens
 a camera connection and does not enable or disable subscriptions implicitly.
-This is reverse-engineered support, physically tested on one standalone camera.
+This is reverse-engineered support, physically tested on several standalone cameras.
 Other firmware, NVR channels and multi-lens devices are not yet validated;
 nonzero channels are currently rejected.
 
-Install optional receiver dependencies from the checkout:
+Install optional receiver dependencies:
 
 ```powershell
-python -m pip install -e ".[push]"
+python -m pip install --upgrade "pyneolink[push]"
 ```
 
 Normal camera features and push status/subscription operations do not require

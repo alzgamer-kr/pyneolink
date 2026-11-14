@@ -52,11 +52,13 @@ class DiscoveryHit:
 
 
 def encode_discovery_xml(tid: int, xml: str) -> bytes:
+    """Frame encrypted discovery XML with a transaction ID and checksum."""
     payload = udp_xor(tid, xml.encode("utf-8"))
     return struct.pack("<IIIII", MAGIC.DISCOVERY, len(payload), 1, tid, neolink_crc32(payload)) + payload
 
 
 def decode_discovery_packet(data: bytes) -> tuple[int, str] | None:
+    """Return the transaction ID and XML, or None for invalid framing/checksum."""
     if len(data) < 20:
         return None
     magic, size, _one, tid, checksum = struct.unpack("<IIIII", data[:20])
@@ -69,6 +71,11 @@ def decode_discovery_packet(data: bytes) -> tuple[int, str] | None:
 
 
 def local_discover(uid: str | None = None, *, timeout: float = 5.0, listen_port: int = 0) -> list[DiscoveryHit]:
+    """Broadcast discovery requests and collect optionally UID-filtered replies.
+
+    :param timeout: Discovery window in seconds.
+    :param listen_port: Local UDP port, or zero for an ephemeral port.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind(("", listen_port))
@@ -117,6 +124,11 @@ def local_discover(uid: str | None = None, *, timeout: float = 5.0, listen_port:
 
 
 def remote_uid_lookup(uid: str, *, timeout: float = 8.0, listen_port: int = 16577) -> list[DiscoveryHit]:
+    """Query Reolink discovery servers for deduplicated UID connection candidates.
+
+    :param timeout: Lookup budget in seconds, including hostname resolution time.
+    :param listen_port: Preferred local UDP port; fall back to an ephemeral port.
+    """
     hits: list[DiscoveryHit] = []
     query = f"<P2P><C2M_Q><uid>{uid}</uid><p>MAC</p></C2M_Q></P2P>"
     tid = random.randint(0, 255)

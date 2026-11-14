@@ -7,6 +7,7 @@ from pyneolink.core.const import msg
 
 
 def parse_battery_xml(xml: str | bytes | ET.Element | None) -> dict:
+    """Normalize the first battery record while retaining its original fields."""
     root = root_element(xml)
     info = first_battery_info(root)
     if info is None:
@@ -37,6 +38,7 @@ def parse_battery_xml(xml: str | bytes | ET.Element | None) -> dict:
 
 
 def normalize_mode(mode: str) -> str:
+    """Validate and normalize the reconnect or online polling mode."""
     normalized = mode.strip().lower()
     if normalized not in ("reconnect", "online"):
         raise ValueError(msg.Error.BatteryMode)
@@ -44,6 +46,7 @@ def normalize_mode(mode: str) -> str:
 
 
 def root_element(xml: str | bytes | ET.Element | None) -> ET.Element | None:
+    """Parse nonempty XML or pass through an existing element."""
     if xml is None:
         return None
     if isinstance(xml, ET.Element):
@@ -56,6 +59,7 @@ def root_element(xml: str | bytes | ET.Element | None) -> ET.Element | None:
 
 
 def first_battery_info(root: ET.Element | None) -> ET.Element | None:
+    """Locate BatteryInfo at the root or anywhere inside the document."""
     if root is None:
         return None
     if root.tag == "BatteryInfo":
@@ -64,6 +68,7 @@ def first_battery_info(root: ET.Element | None) -> ET.Element | None:
 
 
 def int_or_none(value: str | None) -> int | None:
+    """Parse an integer, returning None for absent or malformed values."""
     if value in (None, ""):
         return None
     try:
@@ -73,6 +78,7 @@ def int_or_none(value: str | None) -> int | None:
 
 
 def bool_int(value: str | None) -> bool | None:
+    """Interpret numeric flags without treating missing values as false."""
     parsed = int_or_none(value)
     if parsed is None:
         return None
@@ -80,6 +86,7 @@ def bool_int(value: str | None) -> bool | None:
 
 
 def charge_type_from_adapter(adapter_status: str) -> str:
+    """Classify adapter text as solar_panel, mains, none, or unknown."""
     normalized = adapter_status.strip().lower()
     if not normalized or normalized in ("none", "no", "0", "battery"):
         return "none"
@@ -91,6 +98,7 @@ def charge_type_from_adapter(adapter_status: str) -> str:
 
 
 def charge_type_label(charge_type: str) -> str:
+    """Return the display label for a normalized charging source."""
     return {
         "solar_panel": "Solar panel",
         "mains": "Mains",

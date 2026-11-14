@@ -1,6 +1,63 @@
 # Push research and tests
 
-## Current Commit Preparation (2026-11-06)
+## 0.6.0 Release Validation (2026-11-14)
+
+Local preflight passed on Windows with Python 3.11 and 3.14: 686 tests passed
+and two optional-dependency tests were skipped in the base environments.
+The full Python 3.14 push environment passed all 688 tests without skips.
+Ruff E/F/W, formatting, and public class/method/function docstring checks passed
+across the SDK. Wheel/sdist metadata and the Windows standalone CLI were checked;
+the CLI performed an offline SQLite read with a synthetic camera configuration.
+Actionlint validated the release workflows. The hosted Linux/Windows matrix and
+PyPI trusted-publisher authorization are checked only when GitHub runs them.
+
+The user-run Linux downloader stayed on the same PID for more than 53 hours
+on November 12-14. Local and remote downloads completed. An incomplete SD scan
+at 16:15:07 on November 14 triggered a retry, reopened the session at 16:16:18,
+and returned all 380 recordings at 16:16:30 while other camera workers continued.
+One unavailable camera retained its bounded 900-second application retry delay.
+
+At that point RSS was about 104 MiB and cgroup anonymous memory was 85.5 MiB.
+Most of the cgroup's 4.6 GiB was filesystem cache. A user-run one-time cache-drop
+diagnostic reduced the service reading to 119.1 MiB without restarting its PID.
+Routine cache dropping is not recommended. An earlier isolated ~499 MiB RSS
+observation remains unexplained; the later run did not reproduce it.
+
+These observations validate the exercised deployment, not every camera model,
+network outage, or memory workload. Historical notes below retain their original
+test counts and pending items; README describes the released API contract.
+
+## Earlier 0.6.0 Preparation (2026-11-08)
+
+The current integration branch combines push/SQLite support with the previously
+separate reliability changes. Version metadata is 0.6.0, still unreleased.
+Historical branch boundaries, probe commands, and test counts below describe
+earlier research stages, not the current SDK contract.
+
+Preparation checks: 685 passed and 2 skipped on both Python 3.11 and 3.14.
+Both skipped optional-dependency tests passed separately in the push environment:
+the encrypted notification round-trip and the five-attempt GCM registration
+test with mocked HTTP. Ruff E/F/W, formatting, and docstring checks on the
+push/storage and updated reliability modules passed. Wheel and sdist builds
+and Twine metadata checks passed. No real camera/cloud calls were made by
+these automated checks.
+
+Physical Linux downloader observations on November 7:
+
+- The previously stalled Back recording completed after the bounded
+  dispatcher login-wait fix was installed; subsequent downloads continued.
+- The remote Front camera closed its session after a network-related battery
+  query failure at 23:23:07, then reopened at 23:53:13 and scanned at 23:53:26.
+  This confirms scheduled recovery without a service restart, not a subsequent
+  remote file transfer. The 1800-second pause is downloader policy, not an SDK
+  login timeout, and does not imply a low battery.
+- Overnight testing remains pending. These results do not establish that every
+  reconnect/login failure or all camera models have been physically tested.
+
+Before release, review the overnight logs and complete the Windows/Linux CI
+matrix. No tag or release has been created as part of this preparation.
+
+## Earlier Commit Preparation (2026-11-06)
 
 The sections below are a chronological research log, including superseded
 commands and restrictions. README describes the current SDK/CLI. Physical tests

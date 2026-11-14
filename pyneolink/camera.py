@@ -291,6 +291,7 @@ class Camera(AbstractContextManager["Camera"]):
 
     @property
     def online_required(self) -> bool:
+        """Return whether an active helper requires the shared session online."""
         return self._online_required > 0
 
     def require_online(self) -> CameraOnlineLease:
@@ -1058,20 +1059,26 @@ class Camera(AbstractContextManager["Camera"]):
         return message
 
     def _recv_dispatched(self, timeout: float | None = None) -> Message:
-        deadline = None if timeout is None else time.monotonic() + timeout
+        """Wait for an unmatched reply without competing with the socket reader.
+
+        None uses the camera timeout, including during reconnect login. A queued
+        reply is returned immediately even when timeout is zero. This deadline
+        bounds this wait, not the total duration of all reconnect attempts.
+
+        :raises TimeoutError: No reply arrives before the deadline.
+        :raises Exception: The dispatcher reports a transport/protocol failure.
+        """
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while True:
             with self._dispatch_lock:
                 if self._dispatch_error is not None:
                     raise self._dispatch_error
                 if self._dispatch_unmatched:
                     return self._dispatch_unmatched.popleft()
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(msg.Error.UdpBaichuanTimeout)
-                time.sleep(min(0.01, remaining))
-            else:
-                time.sleep(0.01)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(msg.Error.UdpBaichuanTimeout)
+            time.sleep(min(0.01, remaining))
 
     def _dispatch_loop(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():

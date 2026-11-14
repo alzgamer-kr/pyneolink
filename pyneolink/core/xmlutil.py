@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 
 
 def xml_to_dict(text: str | bytes | None) -> dict:
+    """Convert XML to nested values, retaining attributes and repeated elements."""
     if not text:
         return {}
     if isinstance(text, bytes):

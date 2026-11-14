@@ -47,6 +47,7 @@ class StreamRecorder:
 
     @property
     def running(self) -> bool:
+        """Return whether the background recording thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> "StreamRecorder":

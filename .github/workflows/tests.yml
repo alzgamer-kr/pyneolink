@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   tests:
@@ -36,9 +40,16 @@ jobs:
         run: |
           python -m ruff check pyneolink tests examples
           python -m ruff format pyneolink tests examples --check
+          python -m ruff check pyneolink --select D101,D102,D103,D107,D201,D202,D204,D205,D209,D210,D211,D300,D400,D403,D419
 
       - name: Run tests
         run: python -m pytest
+
+      - name: Test optional push dependencies without network access
+        run: |
+          python -m pip install ".[push]"
+          python -c "import firebase_messaging, http_ece"
+          python -m pytest tests/test_push_fcm_crypto_roundtrip.py tests/test_push_gcm_retry.py
 
   build:
     name: Build package

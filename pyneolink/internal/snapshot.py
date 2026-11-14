@@ -6,12 +6,14 @@ from pyneolink.core.bc import find_text
 
 
 def parse_snapshot_info(root) -> tuple[str | None, int | None]:
+    """Extract the optional camera filename and expected picture byte count."""
     file_name = find_text(root, "fileName")
     picture_size = int_or_none(find_text(root, "pictureSize"))
     return file_name, picture_size
 
 
 def int_or_none(value: str | None) -> int | None:
+    """Parse an optional integer, returning None when it is invalid."""
     if value in (None, ""):
         return None
     try:
@@ -21,6 +23,7 @@ def int_or_none(value: str | None) -> int | None:
 
 
 def snapshot_output_path(out: str | Path, file_name: str | None = None) -> Path:
+    """Resolve a snapshot destination using only the camera filename's basename."""
     path = Path(out)
     safe_name = Path(file_name).name if file_name else ""
     if path.exists() and path.is_dir():

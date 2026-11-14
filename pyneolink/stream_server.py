@@ -452,7 +452,6 @@ class MpegTsMuxer:
 
         :param packet: Parsed video or audio packet.
         """
-
         if not self.tables_written:
             yield from self.table_packets()
 
@@ -470,6 +469,7 @@ class MpegTsMuxer:
             yield from self._packetize(self.AUDIO_PID, pes, start=True)
 
     def table_packets(self) -> list[bytes]:
+        """Return MPEG-TS PAT/PMT packets for the current codec configuration."""
         packets: list[bytes] = []
         packets.extend(self._packetize(self.PAT_PID, b"\x00" + _pat_section(self.PMT_PID), start=True))
         packets.extend(
@@ -576,6 +576,7 @@ class HlsSession:
         self._last_access = time.monotonic()
 
     def start(self) -> None:
+        """Refresh viewer activity and start at most one HLS camera worker."""
         with self.lock:
             self._last_access = time.monotonic()
             if self.started:
@@ -594,12 +595,14 @@ class HlsSession:
             self._thread.start()
 
     def idle_expired(self) -> bool:
+        """Check whether an active session has exceeded its viewer-idle window."""
         with self.lock:
             return self.started and time.monotonic() - self._last_access >= max(
                 _HLS_IDLE_SECONDS, self.segment_seconds * 3
             )
 
     def stop_if_idle(self) -> None:
+        """Stop the session only if no viewer refreshed its activity deadline."""
         with self.lock:
             if time.monotonic() - self._last_access < max(_HLS_IDLE_SECONDS, self.segment_seconds * 3):
                 return
@@ -628,7 +631,6 @@ class HlsSession:
 
         :param timeout: Seconds to wait for the first segment.
         """
-
         self.start()
         deadline = time.monotonic() + timeout
         with self.condition:
@@ -645,7 +647,6 @@ class HlsSession:
 
         :param sequence: HLS media sequence number.
         """
-
         self.start()
         with self.lock:
             for segment in self.segments:

@@ -63,6 +63,7 @@ class Header:
 
     @property
     def has_payload_offset(self) -> bool:
+        """Return whether this header carries an extension-length field."""
         return (
             self.msg_class in (MSG_CLASS.MODERN, MSG_CLASS.FILE_DOWNLOAD, MSG_CLASS.MODERN_ZERO)
             or self.msg_id == MSG.FILE_REPLAY
@@ -70,9 +71,11 @@ class Header:
 
     @property
     def is_modern(self) -> bool:
+        """Return whether the message uses a non-legacy class."""
         return self.msg_class != MSG_CLASS.LEGACY
 
     def pack(self) -> bytes:
+        """Serialize the header in little-endian wire format, without its body."""
         header = struct.pack(
             "<III BB HH",
             MAGIC.BAICHUAN,
@@ -95,7 +98,6 @@ class Header:
 
         :param data: Header bytes, optionally followed by payload data.
         """
-
         if len(data) < 20:
             raise ProtocolError(msg.Error.ShortBaichuanHeader)
         magic, msg_id, body_len, channel_id, stream_type, msg_num, response_code, msg_class = struct.unpack(
@@ -134,6 +136,7 @@ class Message:
 
     @property
     def xml_text(self) -> str | None:
+        """Decode UTF-8 payload text, or return None for empty/non-UTF-8 data."""
         if not self.payload:
             return None
         try:
@@ -143,6 +146,7 @@ class Message:
 
     @property
     def xml_root(self) -> ET.Element | None:
+        """Parse payload XML; malformed text raises ElementTree.ParseError."""
         text = self.xml_text
         if not text:
             return None
@@ -150,10 +154,12 @@ class Message:
 
 
 def xml_document(inner: str) -> bytes:
+    """Wrap already serialized XML in a UTF-8 Baichuan body document."""
     return f'<?xml version="1.0" encoding="UTF-8" ?>\n<body>\n{inner}\n</body>'.encode("utf-8")
 
 
 def extension_xml(binary: bool = False, channel_id: int | None = None) -> bytes:
+    """Build an extension declaring optional channel routing and binary data."""
     bits = ['<?xml version="1.0" encoding="UTF-8" ?>', '<Extension version="1.1">']
     if channel_id is not None:
         bits.append(f"<channelId>{channel_id}</channelId>")
@@ -175,6 +181,11 @@ def encode_modern(
     msg_class: int = MSG_CLASS.MODERN,
     cipher: Cipher | None = None,
 ) -> bytes:
+    """Encode a modern header and body using the negotiated cipher.
+
+    Binary payloads remain raw; the extension is encrypted separately. Login
+    messages use BC encryption even when the session cipher is AES.
+    """
     cipher = cipher or Cipher("bc")
     wire_cipher = Cipher("bc") if msg_id == MSG.LOGIN and cipher.name == "aes" else cipher
     binary_payload = b"<binaryData>1</binaryData>" in extension
@@ -189,13 +200,13 @@ def encode_modern(
 
 
 def encode_legacy_login(msg_num: int, *, max_encryption: str = "aes", channel_id: int = 0) -> bytes:
+    """Build the initial login header advertising the preferred encryption."""
     enc = {"none": 0xDC00, "bc": 0xDC01, "aes": 0xDC12}.get(max_encryption, 0xDC12)
     return Header(MSG.LOGIN, 0, channel_id, 0, msg_num, enc, MSG_CLASS.LEGACY).pack()
 
 
 def recv_exact(sock: socket.socket, size: int, *, idle_timeout: float | None = None, cancel_event=None) -> bytes:
     """Receive exactly ``size`` bytes, tolerating short idle gaps when requested."""
-
     chunks = []
     remaining = size
     last_progress = time.monotonic()
@@ -229,6 +240,16 @@ def recv_message(
     recover_invalid_magic: bool = False,
     cancel_event=None,
 ) -> Message:
+    """Read and decode one frame from the socket or compatible UDP transport.
+
+    Only the session's designated reader should call this function. ``timeout``
+    sets the socket read timeout, not a whole-message deadline; short gaps
+    within a frame are tolerated. Binary routing applies only to this session.
+
+    :raises InterruptedMessageError: An incomplete frame requires reconnect.
+    :raises TimeoutError: No initial data arrives within the socket timeout.
+    :raises EOFError: The peer closes the connection.
+    """
     if timeout is not None:
         sock.settimeout(timeout)
     first = recv_exact(sock, 20, cancel_event=cancel_event)
@@ -317,6 +338,7 @@ def _resync_header(
 
 
 def find_text(root: ET.Element | None, tag: str) -> str | None:
+    """Return the first matching descendant's text, or None if unavailable."""
     if root is None:
         return None
     found = root.find(f".//{tag}")
