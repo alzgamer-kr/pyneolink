@@ -5,6 +5,25 @@
 Cloud push notifications, shared SQLite state, download metadata, and reliability
 improvements. Release notes prepared on 2026-11-14.
 
+### Release Highlights
+
+This release includes both the push/SQLite work and the reliability integration:
+
+- **Push and state storage:** optional cloud notification reception without a
+  persistent camera session, a complete subscription lifecycle, typed events,
+  consistent CLI read/watch output, and automatically migrated per-camera SQLite
+  state with configurable storage location.
+- **Reliability:** bounded reconnect login, dispatcher and message-route cleanup,
+  recoverable download transport failures, rejection of incomplete SD listings,
+  and corrected HLS timing, discontinuities, worker shutdown, and registration
+  retry pacing. Existing public camera calls and single-session dispatch remain.
+- **Download metadata:** recording-time file modification dates and optional
+  filename templates for single and batch downloads.
+
+SQLAlchemy is a core dependency; FCM reception uses the optional `[push]` extra.
+No manual database migration is required. Default download names are unchanged;
+the intentional `mtime` change and legacy-state import behavior are detailed below.
+
 ### Added
 
 - Optional `filename_template` for single and batch SD-card downloads, with

@@ -17,6 +17,53 @@ This project was developed with OpenAI Codex as an AI-assisted implementation ef
 
 Neolink and Reolink protocol support are reverse engineered. This project is not affiliated with Reolink.
 
+## What's New in 0.6.0
+
+This release combines cloud push support and the reliability integration into
+one update, while preserving existing camera calls and the single-session
+dispatcher architecture.
+
+### Push and SQLite Storage
+
+- Separate `init`, `subscribe`, `status`, `unsubscribe`, `watch`, and `read`
+  operations. Watching and reading notifications do not connect to the camera.
+- Typed SDK events retain the full response and expose classification helpers;
+  CLI read/watch share compact text or JSONL output, with optional full responses.
+- Indefinite watch with reconnection, bounded in-memory queues, and unread-only
+  read backed by SQLite. Stopping a watcher does not cancel its subscription.
+- Per-camera connection and push state in `~/pyneolink/{camera}.db`, configurable
+  through `storage_dir` or CLI `--storage-dir`, with automatic schema upgrades.
+
+See [Cloud Push](#cloud-push) for installation, the subscription cycle, observed
+event types, and SDK examples.
+
+### Connection, Download, and Streaming Reliability
+
+- Bounded dispatcher reads prevent reconnect login from waiting indefinitely
+  for missing replies. Closed readers and stale message routes are cleaned up.
+- Downloads recover from interrupted frames, connection resets, and queue
+  overflow through the existing retry settings. Incomplete paginated SD lists
+  raise an error instead of appearing to be complete results.
+- HLS uses video timestamps for segment durations, restarts at a keyframe after
+  reconnect, and signals discontinuities in both playlists and MPEG-TS packets.
+- HLS registration failures use a randomized 2-5 minute retry delay; ordinary
+  stream failures retain shorter retries. Server shutdown stops camera workers.
+- Downloads gain recording-time `mtime` and optional filename templates; see
+  [Download Timestamps and Filenames](#download-timestamps-and-filenames).
+
+Recovery can still introduce playback gaps; it does not remove camera-side
+session limits or guarantee uninterrupted delivery over an unavailable network.
+
+### Upgrade Notes
+
+Use pip to install dependencies: SQLAlchemy is now required for SDK state;
+FCM reception remains optional through `pyneolink[push]`. Matching legacy state
+files are imported once and retained, and database migrations run automatically.
+User configuration, media, and diagnostic logs remain files. Default download
+names are unchanged, but completed and skipped downloads use the recording start
+time as `mtime` when available; timezone-free dates use the downloading host's
+local timezone. See [SQLite State and Upgrades](#sqlite-state-and-upgrades).
+
 ## Status
 
 PyNeolink is experimental alpha software. It works against a limited set of real cameras, but Reolink firmware and model behavior can differ. APIs may change before `1.0.0`.
